@@ -43,6 +43,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/novels/:id/chapters/:idx/polish", post(polish_chapter))
         .route("/api/novels/:id/chapters/:idx/review", post(review_chapter))
         .route("/api/novels/:id/chapters/:idx/move", axum::routing::put(move_chapter))
+        .route("/api/novels/:id/chapters/:idx/continue", post(continue_chapter))
+        .route("/api/novels/:id/chapters/:idx/rewrite", post(rewrite_chapter))
+        .route("/api/novels/:id/chapters/:idx/extract", post(extract_chapter))
+        .route("/api/novels/:id/health", get(novel_health))
         .route("/api/novels/:id/run", post(run_novel))
         .route("/api/novels/:id/events", get(events))
         .route("/api/novels/:id/export", get(export_novel))
@@ -238,6 +242,7 @@ async fn get_chapter(
         "goal": ch.goal,
         "beats": ch.beats,
         "content": ch.content,
+        "summary": ch.summary,
         "words": ch.content.chars().count(),
         "status": ch.status,
         "review": ch.review_json,
@@ -485,6 +490,246 @@ async fn review_chapter(
         issues: review.issues.len(),
     });
     Ok(Json(json!({"ok": true, "review": review})))
+}
+
+#[derive(Deserialize)]
+struct ContinueBody {
+    before: String,
+    #[serde(default = "default_continue_chars")]
+    chars: i64,
+    #[serde(default)]
+    instruction: String,
+}
+
+fn default_continue_chars() -> i64 {
+    600
+}
+
+/// 光标续写：把光标前文交给模型接着写（只返回文本，由编辑器插入）
+async fn continue_chapter(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx)): Path<(String, i64)>,
+    Json(b): Json<ContinueBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let ch = e
+        .db
+        .get_chapter(&id, idx)
+        .map_err(err)?
+        .ok_or_else(|| not_found("chapter"))?;
+    let chars = b.chars.clamp(100, 2000);
+    let text = b.before.trim();
+    if text.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "光标前面还没有内容，无法续写".to_string()));
+    }
+    let before: String = {
+        let n = text.chars().count();
+        if n > 1500 {
+            text.chars().skip(n - 1500).collect()
+        } else {
+            text.to_string()
+        }
+    };
+    let settings = e.db.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings);
+    let (sys, usr) = crate::prompts::continue_prompt(&ch.title, &before, chars, &b.instruction);
+    let out = llm.complete(&sys, &usr).await.map_err(err)?;
+    Ok(Json(json!({"text": out.trim(), "chars": chars})))
+}
+
+#[derive(Deserialize)]
+struct RewriteBody {
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    instruction: String,
+}
+
+/// 章节重写：regenerate=按章纲重新生成整章；revise=按意见改写现有正文（只返回新稿）
+async fn rewrite_chapter(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx)): Path<(String, i64)>,
+    Json(b): Json<RewriteBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let ch = e
+        .db
+        .get_chapter(&id, idx)
+        .map_err(err)?
+        .ok_or_else(|| not_found("chapter"))?;
+    let mode = match b.mode.as_str() {
+        "regenerate" => "regenerate",
+        "revise" => "revise",
+        _ => {
+            if ch.content.trim().is_empty() {
+                "regenerate"
+            } else {
+                "revise"
+            }
+        }
+    };
+    if mode == "revise" && ch.content.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "本章还没有正文，请选择「重新生成」".to_string()));
+    }
+    let settings = e.db.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings);
+    let (sys, usr) = crate::prompts::rewrite_prompt(mode, &ch.title, &ch.goal, &ch.content, &b.instruction);
+    let out = llm.complete(&sys, &usr).await.map_err(err)?;
+    Ok(Json(json!({"text": out.trim(), "mode": mode})))
+}
+
+/// 单章资料整理（补摘要 / 补台账）；书籍体检的「补齐资料」逐章调用
+async fn extract_chapter(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx)): Path<(String, i64)>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let ch = e
+        .db
+        .get_chapter(&id, idx)
+        .map_err(err)?
+        .ok_or_else(|| not_found("chapter"))?;
+    if ch.content.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "本章还没有正文，无法整理资料".to_string()));
+    }
+    let settings = e.db.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings);
+    let (sys, usr) = crate::prompts::extract_prompt(idx, &ch.content);
+    let raw = llm.complete(&sys, &usr).await.map_err(err)?;
+    let j = crate::llm::extract_json_object(&raw).ok_or_else(|| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "整理输出不是 JSON".to_string())
+    })?;
+    let (chars, fores) = pipeline::apply_extraction(&e.db, &id, idx, &j);
+    e.hub.publish(pipeline::EngineEvent::LedgerUpdated {
+        chapter_idx: idx,
+        characters: chars,
+        foreshadowings: fores,
+    });
+    let summary = j["summary"].as_str().unwrap_or("").trim().to_string();
+    Ok(Json(json!({
+        "ok": true,
+        "characters": chars,
+        "foreshadowings": fores,
+        "summary": summary,
+    })))
+}
+
+fn join_idx(list: &[i64]) -> String {
+    let head: Vec<String> = list.iter().take(8).map(|i| format!("第{i}章")).collect();
+    if list.len() > 8 {
+        format!("{} 等", head.join("、"))
+    } else {
+        head.join("、")
+    }
+}
+
+/// 书籍体检：结构 / 摘要 / 审校 / 伏笔 / 运行状态汇总 + 行动建议
+async fn novel_health(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let novel = e
+        .db
+        .get_novel(&id)
+        .map_err(err)?
+        .ok_or_else(|| not_found("novel"))?;
+    let chapters = e.db.list_chapters(&id).map_err(err)?;
+    let characters = e.db.list_characters(&id).map_err(err)?;
+    let fores = e.db.list_foreshadowings(&id).map_err(err)?;
+    let run = e.db.latest_run(&id).map_err(err)?;
+
+    let total = chapters.len() as i64;
+    let done = chapters
+        .iter()
+        .filter(|c| c.status == "done" && !c.content.trim().is_empty())
+        .count() as i64;
+    let missing_content: Vec<i64> = chapters
+        .iter()
+        .filter(|c| c.content.trim().is_empty())
+        .map(|c| c.idx)
+        .collect();
+    let missing_summary: Vec<i64> = chapters
+        .iter()
+        .filter(|c| !c.content.trim().is_empty() && c.summary.trim().is_empty())
+        .map(|c| c.idx)
+        .collect();
+
+    let mut review_warnings = 0usize;
+    let mut review_chapters: Vec<i64> = Vec::new();
+    for c in &chapters {
+        if let Some(raw) = c.review_json.as_deref() {
+            if let Ok(r) = serde_json::from_str::<crate::models::Review>(raw) {
+                if !r.ok || !r.issues.is_empty() {
+                    review_warnings += r.issues.len().max(1);
+                    review_chapters.push(c.idx);
+                }
+            }
+        }
+    }
+
+    let open: Vec<&crate::models::Foreshadowing> = fores.iter().filter(|f| f.status == "open").collect();
+    let oldest_open = open
+        .iter()
+        .filter(|f| f.planted_chapter > 0)
+        .map(|f| f.planted_chapter)
+        .min();
+
+    let mut suggestions: Vec<String> = Vec::new();
+    if !missing_content.is_empty() {
+        suggestions.push(format!(
+            "还有 {} 章尚未完成正文：{}",
+            missing_content.len(),
+            join_idx(&missing_content)
+        ));
+    }
+    if !missing_summary.is_empty() {
+        suggestions.push(format!(
+            "有 {} 章缺摘要，可点「补齐资料」自动生成：{}",
+            missing_summary.len(),
+            join_idx(&missing_summary)
+        ));
+    }
+    if review_warnings > 0 {
+        suggestions.push(format!(
+            "有 {} 章共 {} 条审校意见待处理：{}",
+            review_chapters.len(),
+            review_warnings,
+            join_idx(&review_chapters)
+        ));
+    }
+    if let Some(oldest) = oldest_open {
+        if total > 0 && oldest + 5 <= total {
+            suggestions.push(format!(
+                "最早埋于第 {} 章的伏笔已经 {} 章未回收，建议安排回收",
+                oldest,
+                total - oldest
+            ));
+        }
+    }
+    if let Some(r) = &run {
+        if r.status == "failed" {
+            suggestions.push(format!("上次运行中断：{}", r.error.clone().unwrap_or_default()));
+        }
+        if r.status == "paused" {
+            suggestions.push("有运行在等待确认（章节规划），到工作台点「确认并继续」".to_string());
+        }
+    }
+    if suggestions.is_empty() {
+        suggestions.push("没有发现明显风险，继续推进即可。".to_string());
+    }
+
+    Ok(Json(json!({
+        "novel_id": novel.id,
+        "mode": novel.mode,
+        "chapters_total": total,
+        "chapters_done": done,
+        "missing_content": missing_content,
+        "missing_summary": missing_summary,
+        "review_warnings": review_warnings,
+        "review_chapters": review_chapters,
+        "characters": characters.len(),
+        "open_foreshadowings": open.len(),
+        "oldest_open_chapter": oldest_open,
+        "last_run_status": run.as_ref().map(|r| r.status.clone()),
+        "suggestions": suggestions,
+    })))
 }
 
 // ---------- 创作运行 ----------

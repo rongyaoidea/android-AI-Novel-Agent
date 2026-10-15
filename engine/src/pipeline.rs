@@ -240,7 +240,9 @@ async fn run_inner(
             beats: ch.beats.clone(),
         };
         let ledger = ledger_context(&engine.db, novel_id).unwrap_or_default();
-        let (sys, usr) = crate::prompts::chapter_prompt(&brief, &novel.book_outline, &plan, &prev_tail, &ledger);
+        let recent = recent_summaries_context(&engine.db, novel_id, idx).unwrap_or_default();
+        let context = format!("{recent}{ledger}");
+        let (sys, usr) = crate::prompts::chapter_prompt(&brief, &novel.book_outline, &plan, &prev_tail, &context);
         // 流式输出按 ~80 字聚合后再推送，降低 SSE 事件与前端渲染压力
         let mut buf = String::new();
         let hub = engine.hub.clone();
@@ -305,13 +307,12 @@ async fn run_inner(
             Err(e) => tracing::warn!("chapter {idx} review failed: {e:#}"),
         }
 
-        // 写后资料整理：抽取角色 / 伏笔台账（非阻塞，失败仅记录日志）
+        // 写后资料整理：抽取角色 / 伏笔台账与章节摘要（非阻塞，失败仅记录日志）
         let (xsys, xusr) = crate::prompts::extract_prompt(idx, &content);
         match llm.complete(&xsys, &xusr).await {
             Ok(raw) => {
                 if let Some(j) = extract_json_object(&raw) {
-                    let chars = engine.db.absorb_characters(novel_id, &j).unwrap_or(0);
-                    let fores = engine.db.absorb_foreshadowings(novel_id, idx, &j).unwrap_or(0);
+                    let (chars, fores) = apply_extraction(&engine.db, novel_id, idx, &j);
                     engine.hub.publish(EngineEvent::LedgerUpdated {
                         chapter_idx: idx,
                         characters: chars,
@@ -349,6 +350,40 @@ fn tail_chars(s: &str, n: usize) -> String {
     } else {
         s.chars().skip(total - n).collect()
     }
+}
+
+/// 统一的「写后资料整理」应用：角色 / 伏笔 / 章节摘要（流水线与单章接口共用）
+pub fn apply_extraction(
+    db: &crate::db::Db,
+    novel_id: &str,
+    chapter_idx: i64,
+    j: &serde_json::Value,
+) -> (usize, usize) {
+    let chars = db.absorb_characters(novel_id, j).unwrap_or(0);
+    let fores = db.absorb_foreshadowings(novel_id, chapter_idx, j).unwrap_or(0);
+    if let Some(s) = j["summary"].as_str() {
+        let s = s.trim();
+        if !s.is_empty() {
+            let _ = db.set_chapter_summary(novel_id, chapter_idx, s);
+        }
+    }
+    (chars, fores)
+}
+
+/// 最近章节回顾：取当前章之前、带摘要的最近 5 章拼成上下文
+fn recent_summaries_context(db: &crate::db::Db, novel_id: &str, current_idx: i64) -> anyhow::Result<String> {
+    let chapters = db.list_chapters(novel_id)?;
+    let mut lines: Vec<String> = chapters
+        .iter()
+        .filter(|c| c.idx < current_idx && !c.summary.trim().is_empty())
+        .map(|c| format!("第{}章 {}：{}", c.idx, c.title, c.summary.trim()))
+        .collect();
+    if lines.is_empty() {
+        return Ok(String::new());
+    }
+    let keep = lines.len().saturating_sub(5);
+    lines.drain(0..keep);
+    Ok(format!("最近章节回顾：\n{}\n", lines.join("\n")))
 }
 
 /// 组装台账上下文：活跃角色事实（最近 6 人 × 3 条）+ 未回收伏笔（最多 8 条）

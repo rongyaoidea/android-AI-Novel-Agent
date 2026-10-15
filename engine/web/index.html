@@ -56,6 +56,9 @@
     <path d="M6.4 19.7 Q6.4 12.4 6.4 4.8"/>
     <path d="M6.6 5.6 Q10.5 4.4 13.5 5.6 Q16.1 6.6 18.6 5.4 Q18.5 8.6 18.4 11.6 Q16 12.8 13.4 11.8 Q10.4 10.6 6.6 11.6 Z"/>
   </symbol>
+  <symbol id="i-pulse" viewBox="0 0 24 24">
+    <path d="M3.6 12.4 Q6 12.3 7.6 12.3 L9.4 8.2 Q11 14.6 12.6 16.4 Q14 18 15.2 12.3 L16.6 12.3 Q18.6 12.3 20.4 12.3"/>
+  </symbol>
 </svg>
 
 <div class="layout">
@@ -152,6 +155,7 @@
           <div class="novel-head-actions">
             <input id="novel-target" class="input-sm" type="number" min="1" max="50" title="目标章节数" />
             <button class="btn btn-primary" id="novel-run">继续创作</button>
+            <button class="btn btn-outline" id="novel-health"><svg class="ic"><use href="#i-pulse"/></svg>书籍体检</button>
             <a class="btn btn-outline" id="novel-export" href="#"><svg class="ic"><use href="#i-download"/></svg>导出 TXT</a>
             <button class="btn btn-ghost btn-danger" id="novel-delete">删除</button>
           </div>
@@ -298,8 +302,11 @@
     </div>
     <div class="chips" id="reader-review"></div>
     <p class="muted" id="reader-goal" style="margin:0;"></p>
+    <p class="muted" id="reader-summary" style="margin:0;"></p>
     <div class="reader-toolbar">
       <button class="btn btn-primary btn-sm" id="reader-save" disabled><svg class="ic"><use href="#i-check"/></svg>保存修改</button>
+      <button class="btn btn-outline btn-sm" id="reader-continue"><svg class="ic"><use href="#i-pen"/></svg>光标续写</button>
+      <button class="btn btn-outline btn-sm" id="reader-rewrite"><svg class="ic"><use href="#i-refresh"/></svg>重写本章</button>
       <button class="btn btn-outline btn-sm" id="reader-recheck"><svg class="ic"><use href="#i-refresh"/></svg>重新审校</button>
       <span class="muted">AI 修文（先选中一段）：</span>
       <button class="btn btn-outline btn-sm" data-polish="rewrite">改写</button>
@@ -340,7 +347,7 @@
   </div>
 </div>
 
-<!-- 通用表单弹层（角色 / 伏笔 / 章纲 / 插入章节） -->
+<!-- 通用表单弹层（角色 / 伏笔 / 章纲 / 插入章节 / 续写 / 重写） -->
 <div class="dialog-backdrop" id="form-backdrop" hidden>
   <div class="dialog" style="width:min(560px,94vw);">
     <div class="dialog-head">
@@ -351,6 +358,38 @@
     <div class="row">
       <button class="btn btn-primary" id="form-save"><svg class="ic"><use href="#i-check"/></svg>保存</button>
       <button class="btn btn-outline" id="form-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 生成稿预览（续写 / 重写：确认后应用到正文） -->
+<div class="dialog-backdrop" id="gen-backdrop" hidden>
+  <div class="dialog" style="width:min(760px,94vw);">
+    <div class="dialog-head">
+      <h3 id="gen-title">生成结果</h3>
+      <span class="chips"><span class="chip chip-info" id="gen-mode"></span></span>
+    </div>
+    <pre class="gen-preview" id="gen-text"></pre>
+    <div class="row">
+      <button class="btn btn-primary" id="gen-apply"><svg class="ic"><use href="#i-check"/></svg>应用到正文</button>
+      <button class="btn btn-outline" id="gen-retry"><svg class="ic"><use href="#i-refresh"/></svg>再来一版</button>
+      <button class="btn btn-outline" id="gen-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 书籍体检 -->
+<div class="dialog-backdrop" id="health-backdrop" hidden>
+  <div class="dialog" style="width:min(660px,94vw);">
+    <div class="dialog-head">
+      <h3>书籍体检</h3>
+      <button class="btn btn-ghost" id="health-close">关闭</button>
+    </div>
+    <div class="chips" id="health-stats"></div>
+    <div id="health-suggestions"></div>
+    <div class="row">
+      <button class="btn btn-primary" id="health-fill"><svg class="ic"><use href="#i-refresh"/></svg>补齐资料</button>
+      <span class="muted" id="health-status"></span>
     </div>
   </div>
 </div>

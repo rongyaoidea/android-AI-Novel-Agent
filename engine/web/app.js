@@ -25,6 +25,8 @@ const state = {
   polishRange: null,
   polishResult: null,
   polishLast: null,
+  gen: null,
+  health: null,
   foreshadowings: [],
 };
 
@@ -138,6 +140,7 @@ async function route() {
   closeReader();
   closeDiff();
   closeForm();
+  closeGen();
 
   const r = parseRoute();
   const activeNav = r.kind === "novel" ? "#/shelf" : r.path;
@@ -453,6 +456,51 @@ async function refreshInsights() {
     `<span class="chip chip-filter ${issues ? "chip-warning" : ""}" data-insight="chapters" title="点击查看章节">${ic("i-flag")}审校提醒 ${issues} 章</span>`;
 }
 
+/* ---------------- 书籍体检 ---------------- */
+
+async function openHealth() {
+  const h = await api(`/api/novels/${state.novelId}/health`);
+  state.health = h;
+  $("#health-stats").innerHTML = [
+    `<span class="chip">章节 ${h.chapters_done}/${h.chapters_total}</span>`,
+    `<span class="chip">角色 ${h.characters}</span>`,
+    `<span class="chip ${h.open_foreshadowings ? "chip-warning" : ""}">未回收伏笔 ${h.open_foreshadowings}</span>`,
+    `<span class="chip ${h.review_warnings ? "chip-warning" : ""}">审校意见 ${h.review_warnings}</span>`,
+    `<span class="chip ${h.missing_summary.length ? "chip-warning" : ""}">缺摘要 ${h.missing_summary.length}</span>`,
+    `<span class="chip ${h.missing_content.length ? "chip-warning" : ""}">未完正文 ${h.missing_content.length}</span>`,
+  ].join("");
+  $("#health-suggestions").innerHTML = (h.suggestions || [])
+    .map((s) => `<p class="health-line">${ic("i-flag")}<span>${esc(s)}</span></p>`)
+    .join("");
+  $("#health-status").textContent = "";
+  $("#health-backdrop").hidden = false;
+}
+
+async function fillMissing() {
+  const h = state.health;
+  if (!h) return;
+  const ids = (h.missing_summary || []).slice();
+  if (!ids.length) {
+    $("#health-status").textContent = "没有需要补齐的章节";
+    return;
+  }
+  const btn = $("#health-fill");
+  btn.disabled = true;
+  try {
+    for (let i = 0; i < ids.length; i++) {
+      $("#health-status").textContent = `补齐资料 ${i + 1}/${ids.length}…`;
+      await api(`/api/novels/${state.novelId}/chapters/${ids[i]}/extract`, { method: "POST" });
+    }
+    toast("资料已补齐");
+    await refreshNovel();
+    await openHealth();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function renderChapters() {
   const chs = (state.novel?.chapters || []);
   const tbody = $("#chapter-rows");
@@ -670,6 +718,9 @@ function bindNovel() {
       toast(err.message, true);
     }
   };
+  $("#novel-health").onclick = () => openHealth().catch((err) => toast(err.message, true));
+  $("#health-close").onclick = () => { $("#health-backdrop").hidden = true; };
+  $("#health-fill").onclick = () => fillMissing().catch((err) => toast(err.message, true));
   $("#stream-clear").onclick = () => {
     state.stream = { chapter: null, text: "" };
     const pre = $("#stream-pre");
@@ -761,6 +812,7 @@ async function openEditor(idx) {
     c.goal ? `本章目标：${c.goal}` : "",
     c.words ? `字数：${c.words}` : "",
   ].filter(Boolean).join(" · ");
+  $("#reader-summary").textContent = c.summary ? `本章摘要：${c.summary}` : "";
 
   const ta = $("#reader-content");
   ta.value = c.content || "";
@@ -887,6 +939,11 @@ function bindEditor() {
   $("#diff-cancel").onclick = closeDiff;
   $("#diff-apply").onclick = applyPolish;
   $("#diff-reroll").onclick = () => rerollPolish().catch((err) => toast(err.message, true));
+  $("#reader-continue").onclick = () => continueFlow();
+  $("#reader-rewrite").onclick = () => rewriteFlow();
+  $("#gen-cancel").onclick = closeGen;
+  $("#gen-apply").onclick = applyGen;
+  $("#gen-retry").onclick = () => retryGen().catch((err) => toast(err.message, true));
 }
 
 async function runPolish(mode) {
@@ -1007,6 +1064,102 @@ async function rerollPolish() {
   if (!r.revised) return;
   state.polishResult = r.revised;
   showDiff(last.mode, last.selection, r.revised);
+}
+
+/* ---------------- 写作工具：光标续写 / 重写本章 ---------------- */
+
+function continueFlow() {
+  const ta = $("#reader-content");
+  const pos = ta.selectionStart;
+  const before = ta.value.slice(0, pos);
+  if (before.trim().length < 4) {
+    toast("请先把光标放到要续写的位置", true);
+    return;
+  }
+  openForm({
+    title: "光标续写",
+    fields: [
+      { name: "chars", label: "续写字数（100–2000）", value: "600" },
+      { name: "instruction", label: "续写要求（可选）", placeholder: "如：加一段对话 / 收束场景" },
+    ],
+    onSubmit: async (v) => {
+      const chars = Math.min(2000, Math.max(100, parseInt(v.chars || "600", 10) || 600));
+      toast("续写中…");
+      const payload = { before, chars, instruction: (v.instruction || "").trim() };
+      const r = await apiSend(`/api/novels/${state.novelId}/chapters/${ta.dataset.idx}/continue`, "POST", payload);
+      state.gen = { kind: "continue", payload, cursorPos: pos, text: r.text };
+      showGen("光标续写", `${chars} 字`, r.text);
+    },
+  });
+}
+
+function rewriteFlow() {
+  const ta = $("#reader-content");
+  const idx = ta.dataset.idx;
+  if (!idx) return;
+  const hasContent = ta.value.trim().length > 0;
+  openForm({
+    title: "重写本章",
+    fields: [
+      {
+        name: "mode",
+        label: "重写方式",
+        type: "select",
+        value: hasContent ? "revise" : "regenerate",
+        options: [
+          { value: "revise", label: "按意见改写现有正文" },
+          { value: "regenerate", label: "按章纲重新生成整章" },
+        ],
+      },
+      { name: "instruction", label: "改写要求（可选）", placeholder: "如：节奏再快一点 / 强化悬念" },
+    ],
+    onSubmit: async (v) => {
+      toast("重写中…");
+      const payload = { mode: v.mode, instruction: (v.instruction || "").trim() };
+      const r = await apiSend(`/api/novels/${state.novelId}/chapters/${idx}/rewrite`, "POST", payload);
+      state.gen = { kind: "rewrite", payload: { ...payload, mode: r.mode }, text: r.text };
+      showGen("重写结果", r.mode === "regenerate" ? "按章纲重新生成" : "按意见改写", r.text);
+    },
+  });
+}
+
+function showGen(title, badge, text) {
+  $("#gen-title").textContent = title;
+  $("#gen-mode").textContent = badge;
+  $("#gen-text").textContent = text;
+  $("#gen-backdrop").hidden = false;
+}
+
+function closeGen() {
+  $("#gen-backdrop").hidden = true;
+}
+
+function applyGen() {
+  const gen = state.gen;
+  if (!gen) return;
+  const ta = $("#reader-content");
+  if (gen.kind === "continue") {
+    const pos = Math.min(gen.cursorPos ?? ta.selectionStart, ta.value.length);
+    ta.setRangeText(gen.text, pos, pos, "end");
+  } else {
+    ta.value = gen.text;
+    ta.setSelectionRange(0, 0);
+  }
+  state.editorDirty = true;
+  $("#reader-save").disabled = false;
+  closeGen();
+  toast("已应用到正文，记得点「保存修改」");
+}
+
+async function retryGen() {
+  const gen = state.gen;
+  if (!gen) return;
+  toast("再来一版中…");
+  const ta = $("#reader-content");
+  const path = gen.kind === "continue" ? "continue" : "rewrite";
+  const r = await apiSend(`/api/novels/${state.novelId}/chapters/${ta.dataset.idx}/${path}`, "POST", gen.payload);
+  state.gen = { ...gen, text: r.text };
+  $("#gen-text").textContent = r.text;
 }
 
 /** 极简 diff：公共前缀/后缀定位变动区，中间高亮 */

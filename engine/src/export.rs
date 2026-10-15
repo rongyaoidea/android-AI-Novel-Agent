@@ -51,6 +51,7 @@ mod tests {
             goal: "".into(),
             beats: vec![],
             content: "正文内容。".into(),
+            summary: String::new(),
             status: "done".into(),
             review_json: None,
             created_at: "t".into(),

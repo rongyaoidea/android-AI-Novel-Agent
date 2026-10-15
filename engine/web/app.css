@@ -10,23 +10,25 @@
    ============================================================ */
 
 :root {
-  --background: 0 0% 100%;
-  --foreground: 222.2 84% 4.9%;
-  --card: 0 0% 100%;
-  --primary: 222.2 47.4% 11.2%;
-  --primary-foreground: 210 40% 98%;
-  --secondary: 210 40% 96.1%;
-  --muted: 210 40% 96.1%;
-  --muted-foreground: 215.4 16.3% 46.9%;
-  --accent: 210 40% 96.1%;
-  --border: 214.3 31.8% 91.4%;
-  --input: 214.3 31.8% 91.4%;
-  --ring: 222.2 84% 4.9%;
-  --success: 142 60% 32%;
-  --warning: 32 92% 38%;
-  --info: 199 78% 36%;
-  --destructive: 0 72% 45%;
-  --radius: 0.75rem;
+  /* 自研「纸」主题：宣纸底 + 墨字 + 朱砂主色（区别于通用冷灰 SaaS 观感） */
+  --background: 39 33% 96%;
+  --foreground: 28 18% 14%;
+  --card: 40 40% 98%;
+  --primary: 14 62% 42%;
+  --primary-foreground: 40 50% 97%;
+  --secondary: 36 22% 90%;
+  --muted: 36 20% 91%;
+  --muted-foreground: 28 10% 42%;
+  --accent: 34 32% 88%;
+  --border: 34 18% 82%;
+  --input: 34 18% 80%;
+  --ring: 14 62% 42%;
+  --success: 158 32% 34%;
+  --warning: 33 78% 40%;
+  --info: 201 36% 36%;
+  --destructive: 355 60% 40%;
+  --radius: 0.6rem;
+  --font-display: Georgia, "Nimbus Roman", "Songti SC", "SimSun", serif;
 
   /* 动效令牌 */
   --ease-out: cubic-bezier(0.2, 0.8, 0.25, 1);
@@ -36,22 +38,23 @@
 }
 
 :root.dark {
-  --background: 222.2 47.4% 11.2%;
-  --foreground: 210 40% 98%;
-  --card: 222.2 47.4% 13.5%;
-  --primary: 210 40% 98%;
-  --primary-foreground: 222.2 47.4% 11.2%;
-  --secondary: 217.2 32.6% 20%;
-  --muted: 217.2 32.6% 20%;
-  --muted-foreground: 215 20.2% 70%;
-  --accent: 217.2 32.6% 23%;
-  --border: 217.2 32.6% 26%;
-  --input: 217.2 32.6% 26%;
-  --ring: 212.7 26.8% 83.9%;
-  --success: 142 55% 48%;
-  --warning: 38 92% 55%;
-  --info: 199 80% 58%;
-  --destructive: 0 70% 60%;
+  /* 自研「墨」主题：夜墨底 + 暖字 + 亮朱砂 */
+  --background: 28 14% 10%;
+  --foreground: 38 22% 90%;
+  --card: 28 14% 13%;
+  --primary: 18 68% 58%;
+  --primary-foreground: 26 20% 10%;
+  --secondary: 30 12% 19%;
+  --muted: 30 12% 18%;
+  --muted-foreground: 34 14% 66%;
+  --accent: 30 14% 22%;
+  --border: 30 12% 26%;
+  --input: 30 12% 26%;
+  --ring: 18 68% 58%;
+  --success: 158 32% 48%;
+  --warning: 36 80% 56%;
+  --info: 200 45% 56%;
+  --destructive: 355 62% 56%;
 }
 
 * { box-sizing: border-box; }
@@ -471,6 +474,34 @@ mark.add { background: hsl(var(--success) / .2); color: inherit; border-radius: 
 .dot { width: 7px; height: 7px; }
 .content::-webkit-scrollbar, .stream::-webkit-scrollbar, .log::-webkit-scrollbar,
 .table-wrap::-webkit-scrollbar, .dialog::-webkit-scrollbar { width: 8px; height: 8px; }
+
+/* ---------- 自研「纸·墨」主题收口（覆盖层） ---------- */
+.chip { border-radius: 6px; }
+.step-num { border-radius: 6px; }
+.progress-fill { border-radius: 3px; }
+
+.brand-icon {
+  width: 34px; height: 34px; justify-content: center;
+  background: hsl(var(--primary) / .1);
+  border: 1px solid hsl(var(--primary) / .22);
+  border-radius: 9px;
+  color: hsl(var(--primary));
+}
+.brand-title, .page-head h1, .panel-title, .novel-card-head h3, .novel-head-main h2, h3 {
+  font-family: var(--font-display);
+  letter-spacing: .015em;
+}
+
+.gen-preview {
+  margin: 0; white-space: pre-wrap; word-break: break-word;
+  font-family: inherit; font-size: 13.5px; line-height: 1.85;
+  background: hsl(var(--muted) / .4);
+  border-radius: calc(var(--radius) - 2px);
+  padding: 12px 14px; max-height: 46vh; overflow: auto;
+}
+#health-suggestions { display: flex; flex-direction: column; }
+.health-line { display: flex; gap: 8px; align-items: flex-start; margin: 0 0 8px; font-size: 13.5px; line-height: 1.7; }
+.health-line .ic { margin-top: 4px; color: hsl(var(--warning)); }
 
 /* ---------- 移动端 ---------- */
 @media (max-width: 900px) {

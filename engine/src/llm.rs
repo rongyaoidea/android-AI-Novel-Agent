@@ -194,6 +194,7 @@ fn mock_complete(user: &str) -> anyhow::Result<String> {
             planted = vec![serde_json::json!({ "title": "第1章留下的悬念" })];
         }
         return Ok(serde_json::json!({
+            "summary": format!("第{idx}章：林深继续寻找姐姐，线索推进，章末留悬念。"),
             "characters": [
                 { "name": "林深", "role": "主角", "status": "active",
                   "facts": [format!("第{idx}章：继续寻找姐姐")] }
@@ -202,6 +203,27 @@ fn mock_complete(user: &str) -> anyhow::Result<String> {
             "foreshadowings_resolved": resolved
         })
         .to_string());
+    }
+    if user.contains("TASK:continue") {
+        let chars = extract_number_after(user, "chars=").unwrap_or(600).clamp(100, 2000);
+        let unit = "（续写）雨声更密了些，他把书合上，向巷口走去。路灯把影子拉得很长。";
+        let mut out = String::new();
+        while (out.chars().count() as i64) < chars.min(600) {
+            out.push_str(unit);
+        }
+        return Ok(out);
+    }
+    if user.contains("TASK:rewrite") {
+        let mode = extract_token_after(user, "mode=").unwrap_or_else(|| "revise".into());
+        let title = extract_after(user, "title=").unwrap_or_else(|| "第X章".into());
+        if mode == "regenerate" {
+            return Ok(format!(
+                "第X章 {title}\n\n（重新生成）风从长街尽头卷来，带着雨后的潮气。\n\n他站在门口，没有立刻进去——有些决定，一旦迈出就没有回头路。"
+            ));
+        }
+        return Ok(format!(
+            "第X章 {title}\n\n（修订版）雨停的时候，他终于推开了那扇门。\n\n屋里的人抬起头，谁也没有先开口。"
+        ));
     }
     Ok("（模拟模式）未识别的任务。".to_string())
 }
@@ -242,6 +264,20 @@ fn extract_between(text: &str, start: &str, end: &str) -> Option<String> {
     let rest = &text[s..];
     let e = rest.find(end)?;
     Some(rest[..e].trim().to_string())
+}
+
+/// 取 marker 之后的连续字母/数字 token（不受同行后续内容影响）
+fn extract_token_after(text: &str, marker: &str) -> Option<String> {
+    let pos = text.find(marker)? + marker.len();
+    let token: String = text[pos..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
 }
 
 /// 从可能带 markdown 围栏 / 前后缀的 LLM 文本里抽出第一个 JSON 对象。

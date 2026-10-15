@@ -129,19 +129,63 @@ pub fn polish_prompt(mode: &str, selection: &str, chapter_title: &str, instructi
     (system, user)
 }
 
-/// 写后资料整理：抽取角色状态变化与伏笔埋设/回收
+/// 写后资料整理：抽取角色状态变化、伏笔埋设/回收与章节摘要
 pub fn extract_prompt(chapter_idx: i64, text: &str) -> (String, String) {
     let system = "你是小说资料整理助手。只输出一个 JSON 对象，不要输出其他文字、不要使用 Markdown 代码块。".to_string();
     let excerpt: String = text.chars().take(6000).collect();
     let user = format!(
         "TASK:extract chapter_index={chapter_idx}\n以下是第 {chapter_idx} 章正文：\n---\n{excerpt}\n---\n\n\
 请抽取本章相关的资料，输出 JSON，字段：\n\
+- summary: 本章剧情摘要（80 字以内，供后续章节回顾使用）\n\
 - characters: 本章有变化或首次出场的角色，每项 {{\"name\": \"\", \"role\": \"主角/配角/反派等\", \
 \"status\": \"active|dead|leave\", \"facts\": [\"关键事实，最多 2 条，每条 30 字以内\"]}}\n\
 - foreshadowings_planted: 本章新埋下的伏笔，每项 {{\"title\": \"一句话概括\"}}\n\
 - foreshadowings_resolved: 本章回收的已有伏笔（用已埋伏笔的标题，可省略）\n\
-没有的字段返回空数组。只统计确实发生的信息，不要臆造。\n",
+没有的字段返回空数组；只统计确实发生的信息，不要臆造。\n",
         chapter_idx = chapter_idx,
+        excerpt = excerpt,
+    );
+    (system, user)
+}
+
+/// 光标续写：从前文末尾继续写 chars 字左右
+pub fn continue_prompt(chapter_title: &str, context_before: &str, chars: i64, instruction: &str) -> (String, String) {
+    let system = "你是中文网文写手。只输出续写的正文本身，不要重复已有文字、不要解释、不要加标题。".to_string();
+    let extra = if instruction.trim().is_empty() {
+        String::new()
+    } else {
+        format!("续写要求：{}\n", instruction.trim())
+    };
+    let user = format!(
+        "TASK:continue chapter=\"{} chars={chars}\"\n以下是本章已有正文的末尾部分：\n---\n{before}\n---\n{extra}\n\
+请无缝续写约 {chars} 字：延续语气、场景与人物状态，不要复述上文，直接接下去写。\n",
+        chapter_title,
+        chars = chars,
+        before = context_before,
+        extra = extra,
+    );
+    (system, user)
+}
+
+/// 章节重写：regenerate=按章纲重新生成整章；revise=按意见改写现有正文
+pub fn rewrite_prompt(mode: &str, chapter_title: &str, goal: &str, current: &str, instruction: &str) -> (String, String) {
+    let system = "你是中文网文写手。直接输出完整章节正文：第一行写章节标题，不要任何说明性文字、不要 Markdown 标题符号。".to_string();
+    if mode == "regenerate" {
+        let user = format!(
+            "TASK:rewrite mode=regenerate title={chapter_title}\n本章目标：{goal}\n{extra}\n\
+请按本章目标重新写一整章（1500~2500 字），第一行为「{chapter_title}」，章末留悬念。\n",
+            chapter_title = chapter_title,
+            goal = goal,
+            extra = if instruction.trim().is_empty() { String::new() } else { format!("额外要求：{}\n", instruction.trim()) },
+        );
+        return (system, user);
+    }
+    let excerpt: String = current.chars().take(4000).collect();
+    let user = format!(
+        "TASK:rewrite mode=revise title={chapter_title}\n改写要求：{instruction}\n以下是现有正文：\n---\n{excerpt}\n---\n\
+请在保留剧情事实与人物的前提下按改写要求输出完整新稿，第一行为「{chapter_title}」。\n",
+        chapter_title = chapter_title,
+        instruction = if instruction.trim().is_empty() { "在保留剧情的前提下优化表达、节奏与画面感".to_string() } else { instruction.trim().to_string() },
         excerpt = excerpt,
     );
     (system, user)

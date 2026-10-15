@@ -45,7 +45,7 @@ pub struct Foreshadowing {
     pub updated_at: String,
 }
 
-/// 一章（规划 + 正文 + 审校）
+/// 一章（规划 + 正文 + 摘要 + 审校）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chapter {
     pub id: String,
@@ -55,6 +55,8 @@ pub struct Chapter {
     pub goal: String,
     pub beats: Vec<String>,
     pub content: String,
+    /// 章节摘要（写后自动生成，供后续章节回顾）
+    pub summary: String,
     pub status: String,
     pub review_json: Option<String>,
     pub created_at: String,

@@ -18,7 +18,7 @@ fn now() -> String {
 }
 
 const NOVEL_COLS: &str = "id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at";
-const CHAPTER_COLS: &str = "id,novel_id,idx,title,goal,beats_json,content,status,review_json,created_at,updated_at";
+const CHAPTER_COLS: &str = "id,novel_id,idx,title,goal,beats_json,content,summary,status,review_json,created_at,updated_at";
 const RUN_COLS: &str = "id,novel_id,status,stage,chapter_cursor,chapters_target,error,created_at,updated_at";
 
 impl Db {
@@ -68,6 +68,7 @@ impl Db {
                 goal        TEXT NOT NULL DEFAULT '',
                 beats_json  TEXT NOT NULL DEFAULT '[]',
                 content     TEXT NOT NULL DEFAULT '',
+                summary     TEXT NOT NULL DEFAULT '',
                 status      TEXT NOT NULL DEFAULT 'planned',
                 review_json TEXT,
                 created_at  TEXT NOT NULL,
@@ -115,6 +116,8 @@ impl Db {
         )?;
         // 旧库升级：补 novels.mode 列
         Self::ensure_column(&conn, "novels", "mode", "mode TEXT NOT NULL DEFAULT 'auto'")?;
+        // 旧库升级：补 chapters.summary 列
+        Self::ensure_column(&conn, "chapters", "summary", "summary TEXT NOT NULL DEFAULT ''")?;
         // 章节结构编辑的中断兜底：把负区占位 idx 还原
         conn.execute_batch("UPDATE chapters SET idx = -idx - 1 WHERE idx < 0;")?;
         Ok(())
@@ -289,7 +292,7 @@ impl Db {
 
     fn map_chapter(row: &Row<'_>) -> rusqlite::Result<Chapter> {
         // 列顺序: id(0) novel_id(1) idx(2) title(3) goal(4) beats_json(5)
-        //          content(6) status(7) review_json(8) created_at(9) updated_at(10)
+        //          content(6) summary(7) status(8) review_json(9) created_at(10) updated_at(11)
         let beats_json: String = row.get(5)?;
         Ok(Chapter {
             id: row.get(0)?,
@@ -299,10 +302,11 @@ impl Db {
             goal: row.get(4)?,
             beats: serde_json::from_str(&beats_json).unwrap_or_default(),
             content: row.get(6)?,
-            status: row.get(7)?,
-            review_json: row.get(8)?,
-            created_at: row.get(9)?,
-            updated_at: row.get(10)?,
+            summary: row.get(7)?,
+            status: row.get(8)?,
+            review_json: row.get(9)?,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
         })
     }
 
@@ -355,6 +359,15 @@ impl Db {
         conn.execute(
             "UPDATE chapters SET review_json=?3, updated_at=?4 WHERE novel_id=?1 AND idx=?2",
             params![novel_id, idx, serde_json::to_string(review)?, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_chapter_summary(&self, novel_id: &str, idx: i64, summary: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chapters SET summary=?3, updated_at=?4 WHERE novel_id=?1 AND idx=?2",
+            params![novel_id, idx, summary, now()],
         )?;
         Ok(())
     }
