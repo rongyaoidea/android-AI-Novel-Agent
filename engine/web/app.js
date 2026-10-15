@@ -28,6 +28,7 @@ const state = {
   gen: null,
   health: null,
   foreshadowings: [],
+  styles: null,
 };
 
 /* ---------------- 工具 ---------------- */
@@ -196,7 +197,7 @@ async function route() {
   $(page.view).hidden = false;
 
   if (r.path === "#/shelf") await loadShelf();
-  if (r.path === "#/create") renderCreate();
+  if (r.path === "#/create") await renderCreate();
   if (r.path === "#/runs") {
     await loadRuns();
     state.pollTimer = setInterval(() => loadRuns().catch(() => {}), 5000);
@@ -319,10 +320,21 @@ function bindShelf() {
 
 /* ---------------- 新建作品 ---------------- */
 
-function renderCreate() {
+async function renderCreate() {
   const provider = state.settings?.provider;
   const model = provider === "mock" ? "离线演示（mock）" : state.settings?.model || "未配置";
   $("#create-hint").textContent = `当前模型：${model}（可在「模型设置」中调整）`;
+  try {
+    await loadStyles();
+  } catch {
+    /* 目录拉取失败时静默：不影响建书 */
+  }
+  mountStylePicker(
+    $("#create-style-grid"),
+    $("#create-style-groups"),
+    getStylePick(),
+    (id) => setStylePick(id),
+  );
 }
 
 function bindCreate() {
@@ -332,11 +344,12 @@ function bindCreate() {
     if (!idea) { toast("请先写一句灵感", true); return; }
     const chapters = Math.min(50, Math.max(1, parseInt($("#create-chapters").value || "3", 10) || 3));
     const mode = $("#create-mode").value;
+    const style_preset = getStylePick();
     const btn = $("#create-submit");
     btn.disabled = true;
     btn.textContent = "正在创建…";
     try {
-      const r = await apiSend("/api/novels", "POST", { idea, chapters, mode });
+      const r = await apiSend("/api/novels", "POST", { idea, chapters, mode, style_preset });
       toast(mode === "staged" ? "已开始：规划完成后会暂停等你确认" : "已开始创作，进入工作台查看进度");
       location.hash = `#/novel/${r.novel_id}`;
     } catch (err) {
@@ -348,12 +361,122 @@ function bindCreate() {
   });
 }
 
+/* ---------------- 文风预设 ---------------- */
+
+const STYLE_GROUPS = ["全部", "男频", "女频", "通用"];
+const STYLE_PICK_KEY = "ainovel.style";
+
+async function loadStyles() {
+  if (!state.styles) {
+    const r = await api("/api/styles");
+    state.styles = r.items || [];
+  }
+  return state.styles;
+}
+
+function styleById(id) {
+  return (state.styles || []).find((s) => s.id === id) || null;
+}
+
+function styleName(id) {
+  const s = styleById(id);
+  return s ? s.name : "不限";
+}
+
+function getStylePick() {
+  try {
+    return localStorage.getItem(STYLE_PICK_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function setStylePick(id) {
+  try {
+    localStorage.setItem(STYLE_PICK_KEY, id);
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/**
+ * 渲染文风选择器（新建页与工作台弹层共用）：
+ * grid/groups 为容器；selectedId 为空串表示「不限」；onPick(id) 在点选后回调。
+ */
+function mountStylePicker(grid, groups, selectedId, onPick) {
+  let group = "全部";
+  const draw = () => {
+    groups.innerHTML = STYLE_GROUPS.map(
+      (g) => `<span class="chip chip-filter ${g === group ? "chip-dark" : ""}" data-sgroup="${g}">${g}</span>`,
+    ).join("");
+    const list = state.styles || [];
+    const card = (id, name, badge, tagline, genres, traits) => `
+      <div class="style-card ${id === selectedId ? "selected" : ""}" data-style="${id}">
+        <div class="style-card-head">
+          <h4>${esc(name)}</h4>
+          ${badge ? `<span class="chip">${esc(badge)}</span>` : ""}
+        </div>
+        <p class="style-tagline">${esc(tagline)}</p>
+        ${genres ? `<p class="style-genres">${esc(genres)}</p>` : ""}
+        <div class="chips">${(traits || []).slice(0, 3).map((t) => `<span class="chip">${esc(t[0])} · ${esc(t[1])}</span>`).join("")}</div>
+      </div>`;
+    const cards = [card("", "不限", "", "跟随模型自由发挥（默认写法）", "", [])];
+    for (const s of list) {
+      if (group !== "全部" && s.group !== group) continue;
+      cards.push(card(s.id, s.name, s.group, s.tagline, s.genres, s.traits));
+    }
+    grid.innerHTML = cards.join("");
+  };
+  groups.onclick = (e) => {
+    const g = e.target.closest("[data-sgroup]");
+    if (!g) return;
+    group = g.dataset.sgroup;
+    draw();
+  };
+  grid.onclick = (e) => {
+    const c = e.target.closest("[data-style]");
+    if (!c) return;
+    selectedId = c.dataset.style;
+    draw();
+    if (onPick) onPick(selectedId);
+  };
+  draw();
+}
+
+/** 工作台：更换文风预设（选择即 PATCH 保存） */
+async function openStylePicker() {
+  try {
+    await loadStyles();
+  } catch (err) {
+    toast(err.message, true);
+    return;
+  }
+  const current = state.novel?.novel?.style_preset || "";
+  mountStylePicker($("#style-grid"), $("#style-groups"), current, async (id) => {
+    try {
+      await apiSend(`/api/novels/${state.novelId}`, "PATCH", { style_preset: id });
+      if (state.novel?.novel) state.novel.novel.style_preset = id;
+      renderNovel();
+      toast(id ? `已切换文风：${styleName(id)}（对之后生成的内容生效）` : "已改为不限文风");
+      $("#style-backdrop").hidden = true;
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+  $("#style-backdrop").hidden = false;
+}
+
 /* ---------------- 本书工作台 ---------------- */
 
 async function loadNovel(id) {
   const data = await api(`/api/novels/${id}`);
   state.novelId = id;
   state.novel = data;
+  try {
+    await loadStyles();
+  } catch {
+    /* 目录拉取失败时静默：文风 chip 显示为「不限」 */
+  }
   renderNovel();
   subscribe(id);
 }
@@ -396,6 +519,7 @@ function renderNovel() {
     n.genre ? `<span class="chip">${esc(n.genre)}</span>` : "",
     statusChip(n.status),
     run ? `<span class="chip ${run.status === "failed" ? "chip-danger" : run.status === "paused" ? "chip-warning" : run.status === "done" ? "chip-success" : "chip-info"}">${esc(RUN_STATUS[run.status] || run.status)}</span>` : "",
+    `<span class="chip chip-filter ${n.style_preset ? "" : "muted-chip"}" id="novel-style-chip" title="点击更换文风预设">${ic("i-pen")}文风：${esc(styleName(n.style_preset))}</span>`,
   ].join("");
   $("#novel-meta").textContent = [n.logline, n.protagonist && `主角：${n.protagonist}`, n.style].filter(Boolean).join(" · ") || n.idea || "";
 
@@ -754,6 +878,10 @@ function bindNovel() {
     state.tab = chip.dataset.insight;
     renderNovel();
   });
+  $("#novel-chips").addEventListener("click", (e) => {
+    if (e.target.closest("#novel-style-chip")) openStylePicker();
+  });
+  $("#style-close").onclick = () => { $("#style-backdrop").hidden = true; };
   $("#insert-chapter").onclick = () => {
     const count = (state.novel?.chapters || []).length;
     openForm({

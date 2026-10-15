@@ -111,7 +111,7 @@ async fn upsert_does_not_clobber_written_chapters() {
         .as_nanos();
     let dir = std::env::temp_dir().join(format!("ainovel-test-upsert-{stamp}"));
     let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
-    let novel = engine.db.create_novel("测试", "auto").unwrap();
+    let novel = engine.db.create_novel("测试", "auto", "").unwrap();
 
     let plan = |idx: i64, title: &str| ChapterPlan {
         idx,
@@ -148,7 +148,7 @@ async fn staged_mode_pauses_after_outline() {
     let dir = std::env::temp_dir().join(format!("ainovel-test-staged-{stamp}"));
     let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
     engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
-    let novel = engine.db.create_novel("阶段确认测试", "staged").unwrap();
+    let novel = engine.db.create_novel("阶段确认测试", "staged", "").unwrap();
 
     ainovel_engine::pipeline::spawn(engine.clone(), &novel.id, 2).unwrap();
 
@@ -895,7 +895,7 @@ async fn backup_and_restore_endpoints() {
     let app = api::build_router(engine.clone());
 
     // 造一本带正文的书 → 导出备份
-    let novel = engine.db.create_novel("备份的书", "auto").unwrap();
+    let novel = engine.db.create_novel("备份的书", "auto", "").unwrap();
     engine
         .db
         .upsert_chapter_plan(
@@ -926,7 +926,7 @@ async fn backup_and_restore_endpoints() {
     assert_eq!(&backup_bytes[..2], b"PK", "备份应为 zip 格式");
 
     // 再建一本新书（恢复后应被覆盖掉）
-    engine.db.create_novel("将被覆盖的书", "auto").unwrap();
+    engine.db.create_novel("将被覆盖的书", "auto", "").unwrap();
     assert_eq!(engine.db.list_novels().unwrap().len(), 2);
 
     // 非 zip → 400
@@ -1039,6 +1039,197 @@ async fn api_key_is_encrypted_at_rest() {
     )
     .unwrap();
     assert_eq!(other.llm_settings().unwrap().api_key, "");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 文风预设：目录接口 + 建书绑定 + 工作台更换（含非法值拒绝与清除）
+#[tokio::test]
+async fn style_presets_endpoints() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-style-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    // 1) 目录：数量、字段齐全、id 唯一
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/styles")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let items = v["items"].as_array().unwrap();
+    assert!(items.len() >= 8, "预设数量不足: {}", items.len());
+    let mut ids: Vec<String> = items
+        .iter()
+        .map(|p| p["id"].as_str().unwrap().to_string())
+        .collect();
+    let n = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), n, "预设 id 必须唯一");
+    for p in items {
+        for key in ["id", "name", "group", "tagline", "genres", "rules", "avoid"] {
+            assert!(!p[key].is_null(), "预设缺字段 {key}: {p}");
+        }
+        assert!(!p["rules"].as_array().unwrap().is_empty());
+    }
+    // 每组频道至少有一套
+    for group in ["男频", "女频", "通用"] {
+        assert!(
+            items.iter().any(|p| p["group"] == group),
+            "缺少 {group} 频道预设"
+        );
+    }
+
+    // 2) 建书时绑定预设 → 落库并在详情回显
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "文风预设测试", "chapters": 1, "style_preset": "gufeng"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["novel"]["style_preset"], "gufeng");
+
+    // 流水线照常完成（风格块不应污染 Mock 解析）
+    let mut status = String::new();
+    for _ in 0..400 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        status = v["run"]["status"].as_str().unwrap_or("").to_string();
+        if status == "done" {
+            break;
+        }
+        assert_ne!(status, "failed", "run failed: {}", v["run"]["error"]);
+    }
+    assert_eq!(status, "done");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/chapters/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert!(v["content"].as_str().unwrap().contains("第1章"), "正文章节标题应正常");
+
+    // 3) 更换预设 → 200；清除 → 空串；非法值 → 400 且不改变现状
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/novels/{novel_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"style_preset": "rexue"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        engine.db.get_novel(&novel_id).unwrap().unwrap().style_preset,
+        "rexue"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/novels/{novel_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"style_preset": "no-such-style"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        engine.db.get_novel(&novel_id).unwrap().unwrap().style_preset,
+        "rexue",
+        "非法值不应改变现状"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/novels/{novel_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"style_preset": ""}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        engine.db.get_novel(&novel_id).unwrap().unwrap().style_preset,
+        ""
+    );
+
+    // 4) 建书时传非法预设 → 静默按「不限」处理（不阻断建书）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "非法预设", "chapters": 1, "style_preset": "xxx"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let nid2 = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    assert_eq!(engine.db.get_novel(&nid2).unwrap().unwrap().style_preset, "");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

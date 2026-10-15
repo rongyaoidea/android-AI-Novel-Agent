@@ -17,7 +17,7 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-const NOVEL_COLS: &str = "id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at";
+const NOVEL_COLS: &str = "id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at,style_preset";
 const CHAPTER_COLS: &str = "id,novel_id,idx,title,goal,beats_json,content,summary,status,review_json,created_at,updated_at";
 const RUN_COLS: &str = "id,novel_id,status,stage,chapter_cursor,chapters_target,error,created_at,updated_at";
 
@@ -132,6 +132,12 @@ impl Db {
         )?;
         // 旧库升级：补 novels.mode 列
         Self::ensure_column(&conn, "novels", "mode", "mode TEXT NOT NULL DEFAULT 'auto'")?;
+        Self::ensure_column(
+            &conn,
+            "novels",
+            "style_preset",
+            "style_preset TEXT NOT NULL DEFAULT ''",
+        )?;
         // 旧库升级：补 chapters.summary 列
         Self::ensure_column(&conn, "chapters", "summary", "summary TEXT NOT NULL DEFAULT ''")?;
         // 章节结构编辑的中断兜底：把负区占位 idx 还原
@@ -192,7 +198,7 @@ impl Db {
 
     // ---------- novels ----------
 
-    pub fn create_novel(&self, idea: &str, mode: &str) -> anyhow::Result<Novel> {
+    pub fn create_novel(&self, idea: &str, mode: &str, style_preset: &str) -> anyhow::Result<Novel> {
         let n = Novel {
             id: uuid::Uuid::new_v4().to_string(),
             title: String::new(),
@@ -206,12 +212,13 @@ impl Db {
             mode: if mode == "staged" { "staged".into() } else { "auto".into() },
             created_at: now(),
             updated_at: now(),
+            style_preset: style_preset.trim().to_string(),
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO novels(id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            params![n.id, n.title, n.genre, n.idea, n.logline, n.protagonist, n.style, n.book_outline, n.status, n.mode, n.created_at, n.updated_at],
+            "INSERT INTO novels(id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at,style_preset)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![n.id, n.title, n.genre, n.idea, n.logline, n.protagonist, n.style, n.book_outline, n.status, n.mode, n.created_at, n.updated_at, n.style_preset],
         )?;
         Ok(n)
     }
@@ -230,6 +237,7 @@ impl Db {
             mode: row.get(9)?,
             created_at: row.get(10)?,
             updated_at: row.get(11)?,
+            style_preset: row.get(12)?,
         })
     }
 
@@ -256,12 +264,12 @@ impl Db {
         let rows = stmt.query_map([], |row| {
             Ok(NovelListItem {
                 novel: Self::map_novel(row)?,
-                chapters_done: row.get(12)?,
-                words: row.get(13)?,
-                run_status: row.get(14)?,
-                run_stage: row.get(15)?,
-                chapters_target: row.get(16)?,
-                last_error: row.get(17)?,
+                chapters_done: row.get(13)?,
+                words: row.get(14)?,
+                run_status: row.get(15)?,
+                run_stage: row.get(16)?,
+                chapters_target: row.get(17)?,
+                last_error: row.get(18)?,
             })
         })?;
         let mut out = Vec::new();
@@ -476,6 +484,16 @@ impl Db {
         conn.execute(
             "UPDATE novels SET mode=?2, updated_at=?3 WHERE id=?1",
             params![id, mode, now()],
+        )?;
+        Ok(())
+    }
+
+    /// 设置/清除文风预设（空串 = 不限）
+    pub fn set_novel_style(&self, id: &str, style_preset: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE novels SET style_preset=?2, updated_at=?3 WHERE id=?1",
+            params![id, style_preset.trim(), now()],
         )?;
         Ok(())
     }

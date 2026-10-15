@@ -40,6 +40,7 @@ mod tests {
             book_outline: "走向".into(),
             status: "drafted".into(),
             mode: "auto".into(),
+            style_preset: String::new(),
             created_at: "t".into(),
             updated_at: "t".into(),
         };

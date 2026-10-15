@@ -89,7 +89,7 @@ mod tests {
     fn backup_and_restore_roundtrip() {
         let dir_a = tmp_dir("a");
         let engine_a = Engine::new(AppConfig::for_data_dir(dir_a.clone())).unwrap();
-        let novel = engine_a.db.create_novel("备份测试书", "auto").unwrap();
+        let novel = engine_a.db.create_novel("备份测试书", "auto", "").unwrap();
         engine_a
             .db
             .upsert_chapter_plan(
@@ -114,7 +114,7 @@ mod tests {
         // 目标库：先放一本别的书，恢复后应只剩备份里的内容
         let dir_b = tmp_dir("b");
         let engine_b = Engine::new(AppConfig::for_data_dir(dir_b.clone())).unwrap();
-        engine_b.db.create_novel("将被覆盖的书", "auto").unwrap();
+        engine_b.db.create_novel("将被覆盖的书", "auto", "").unwrap();
 
         let db_path = extract_backup_zip(&zip_path, &dir_b).unwrap();
         engine_b.db.restore_from_file(&db_path).unwrap();

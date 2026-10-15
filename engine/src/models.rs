@@ -14,6 +14,8 @@ pub struct Novel {
     pub status: String,
     /// "auto"（全自动）| "staged"（按阶段确认）
     pub mode: String,
+    /// 文风预设 id（见 styles.rs；空串 = 不限）
+    pub style_preset: String,
     pub created_at: String,
     pub updated_at: String,
 }

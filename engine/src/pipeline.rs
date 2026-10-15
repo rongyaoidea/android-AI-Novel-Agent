@@ -92,7 +92,7 @@ async fn run_inner(
             stage: "brief".into(),
             message: "生成立项方案…".into(),
         });
-        let (sys, usr) = crate::prompts::brief_prompt(&novel.idea);
+        let (sys, usr) = crate::prompts::brief_prompt(&novel.idea, crate::styles::find(&novel.style_preset));
         let out = llm.complete(&sys, &usr).await?;
         record_usage(&engine.db, Some(novel_id), None, "brief", &settings, &out.usage);
         let raw = out.text;
@@ -139,7 +139,13 @@ async fn run_inner(
             .map(|c| (c.idx, c.title.clone()))
             .collect();
         let prev_tail = &prev_all[prev_all.len().saturating_sub(5)..];
-        let (sys, usr) = crate::prompts::outline_prompt(&brief, from, to, prev_tail);
+        let (sys, usr) = crate::prompts::outline_prompt(
+            &brief,
+            from,
+            to,
+            prev_tail,
+            crate::styles::find(&novel.style_preset),
+        );
         let out = llm.complete(&sys, &usr).await?;
         record_usage(&engine.db, Some(novel_id), None, "outline", &settings, &out.usage);
         let raw = out.text;
@@ -246,7 +252,14 @@ async fn run_inner(
         let ledger = ledger_context(&engine.db, novel_id).unwrap_or_default();
         let recent = recent_summaries_context(&engine.db, novel_id, idx).unwrap_or_default();
         let context = format!("{recent}{ledger}");
-        let (sys, usr) = crate::prompts::chapter_prompt(&brief, &novel.book_outline, &plan, &prev_tail, &context);
+        let (sys, usr) = crate::prompts::chapter_prompt(
+            &brief,
+            &novel.book_outline,
+            &plan,
+            &prev_tail,
+            &context,
+            crate::styles::find(&novel.style_preset),
+        );
         // 流式输出按 ~80 字聚合后再推送，降低 SSE 事件与前端渲染压力
         let mut buf = String::new();
         let hub = engine.hub.clone();
@@ -283,7 +296,10 @@ async fn run_inner(
         });
 
         // 审校：非阻塞 —— 失败只记录日志，不中断生产链
-        let (rsys, rusr) = crate::prompts::review_prompt(&content);
+        let (rsys, rusr) = crate::prompts::review_prompt(
+            &content,
+            crate::styles::find(&novel.style_preset),
+        );
         match llm.complete(&rsys, &rusr).await {
             Ok(out) => {
                 record_usage(&engine.db, Some(novel_id), Some(idx), "review", &settings, &out.usage);

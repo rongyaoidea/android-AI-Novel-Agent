@@ -140,6 +140,11 @@
               </select>
             </div>
           </div>
+          <div class="field">
+            <label>文风预设 <span class="muted">（可选：决定写法、节奏与爽点密度；创建后仍可更换）</span></label>
+            <div class="chips" id="create-style-groups"></div>
+            <div class="style-grid" id="create-style-grid"></div>
+          </div>
           <div class="row">
             <button class="btn btn-primary" type="submit" id="create-submit">开始创作</button>
             <span class="muted" id="create-hint">当前模型：—（可在「模型设置」中调整）</span>
@@ -434,6 +439,19 @@
         <tbody id="usage-chapter-rows"></tbody>
       </table>
     </div>
+  </div>
+</div>
+
+<!-- 文风预设选择（工作台内更换） -->
+<div class="dialog-backdrop" id="style-backdrop" hidden>
+  <div class="dialog" style="width:min(860px,95vw);">
+    <div class="dialog-head">
+      <h3>选择文风预设</h3>
+      <button class="btn btn-ghost" id="style-close">关闭</button>
+    </div>
+    <div class="chips" id="style-groups"></div>
+    <div class="style-grid" id="style-grid"></div>
+    <p class="muted" style="margin:0;">选择后立即生效：后续生成的章节、续写与修文都会按该风格执行；已完成的章节不受影响。</p>
   </div>
 </div>
 

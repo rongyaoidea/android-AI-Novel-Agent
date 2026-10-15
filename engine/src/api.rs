@@ -97,6 +97,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/app.css", get(app_css))
         .route("/app.js", get(app_js))
         .route("/api/health", get(health))
+        .route("/api/styles", get(list_styles))
         .route("/api/settings/llm", get(get_llm).put(put_llm))
         .route("/api/settings/llm/test", post(test_llm))
         .route("/api/novels", get(list_novels).post(create_novel))
@@ -179,6 +180,11 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({"ok": true, "name": "ainovel-engine", "version": env!("CARGO_PKG_VERSION")}))
 }
 
+/// 文风预设目录（UI 选择器数据源；含规则/反例，便于前端展示与自检）
+async fn list_styles() -> Json<serde_json::Value> {
+    Json(json!({"items": crate::styles::PRESETS}))
+}
+
 async fn get_llm(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, ApiErr> {
     let s = e.llm_settings().map_err(err)?;
     Ok(Json(serde_json::to_value(s).map_err(err)?))
@@ -216,6 +222,9 @@ struct CreateNovelBody {
     chapters: i64,
     #[serde(default)]
     mode: Option<String>,
+    /// 文风预设 id（可选；非法值自动忽略）
+    #[serde(default)]
+    style_preset: Option<String>,
 }
 
 fn default_chapters() -> i64 {
@@ -231,7 +240,13 @@ async fn create_novel(
         return Err((StatusCode::BAD_REQUEST, "idea 不能为空".to_string()));
     }
     let mode = b.mode.as_deref().unwrap_or("auto");
-    let novel = e.db.create_novel(idea, mode).map_err(err)?;
+    let style = b
+        .style_preset
+        .as_deref()
+        .and_then(crate::styles::find)
+        .map(|p| p.id)
+        .unwrap_or("");
+    let novel = e.db.create_novel(idea, mode, style).map_err(err)?;
     let run_id = pipeline::spawn(e.clone(), &novel.id, b.chapters.clamp(1, 50)).map_err(err)?;
     Ok(Json(json!({"novel_id": novel.id, "run_id": run_id})))
 }
@@ -274,6 +289,9 @@ async fn get_novel(
 struct PatchNovelBody {
     #[serde(default)]
     mode: Option<String>,
+    /// 文风预设 id（空串 = 不限；非法值返回 400）
+    #[serde(default)]
+    style_preset: Option<String>,
 }
 
 async fn patch_novel(
@@ -287,6 +305,17 @@ async fn patch_novel(
     if let Some(mode) = b.mode.as_deref() {
         let m = if mode == "staged" { "staged" } else { "auto" };
         e.db.set_novel_mode(&id, m).map_err(err)?;
+    }
+    if let Some(style) = b.style_preset.as_deref() {
+        let trimmed = style.trim();
+        let normalized = if trimmed.is_empty() {
+            ""
+        } else {
+            crate::styles::find(trimmed).map(|p| p.id).ok_or_else(|| {
+                (StatusCode::BAD_REQUEST, format!("未知的文风预设: {trimmed}"))
+            })?
+        };
+        e.db.set_novel_style(&id, normalized).map_err(err)?;
     }
     Ok(Json(json!({"ok": true})))
 }
@@ -433,7 +462,12 @@ async fn polish_chapter(
     };
     let settings = e.llm_settings().map_err(err)?;
     let llm = crate::llm::Llm::new(settings.clone());
-    let (sys, usr) = crate::prompts::polish_prompt(&mode, sel, &ch.title, &b.instruction);
+    let style = e
+        .db
+        .get_novel(&id)
+        .map_err(err)?
+        .and_then(|n| crate::styles::find(&n.style_preset));
+    let (sys, usr) = crate::prompts::polish_prompt(&mode, sel, &ch.title, &b.instruction, style);
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, Some(&id), Some(idx), "polish", &settings, &out.usage);
     Ok(Json(json!({"revised": out.text.trim(), "mode": mode})))
@@ -541,7 +575,12 @@ async fn review_chapter(
     }
     let settings = e.llm_settings().map_err(err)?;
     let llm = crate::llm::Llm::new(settings.clone());
-    let (sys, usr) = crate::prompts::review_prompt(&ch.content);
+    let style = e
+        .db
+        .get_novel(&id)
+        .map_err(err)?
+        .and_then(|n| crate::styles::find(&n.style_preset));
+    let (sys, usr) = crate::prompts::review_prompt(&ch.content, style);
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, Some(&id), Some(idx), "review", &settings, &out.usage);
     let raw = out.text;
@@ -611,7 +650,12 @@ async fn continue_chapter(
     };
     let settings = e.llm_settings().map_err(err)?;
     let llm = crate::llm::Llm::new(settings.clone());
-    let (sys, usr) = crate::prompts::continue_prompt(&ch.title, &before, chars, &b.instruction);
+    let style = e
+        .db
+        .get_novel(&id)
+        .map_err(err)?
+        .and_then(|n| crate::styles::find(&n.style_preset));
+    let (sys, usr) = crate::prompts::continue_prompt(&ch.title, &before, chars, &b.instruction, style);
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, Some(&id), Some(idx), "continue", &settings, &out.usage);
     Ok(Json(json!({"text": out.text.trim(), "chars": chars})))
@@ -652,7 +696,13 @@ async fn rewrite_chapter(
     }
     let settings = e.llm_settings().map_err(err)?;
     let llm = crate::llm::Llm::new(settings.clone());
-    let (sys, usr) = crate::prompts::rewrite_prompt(mode, &ch.title, &ch.goal, &ch.content, &b.instruction);
+    let style = e
+        .db
+        .get_novel(&id)
+        .map_err(err)?
+        .and_then(|n| crate::styles::find(&n.style_preset));
+    let (sys, usr) =
+        crate::prompts::rewrite_prompt(mode, &ch.title, &ch.goal, &ch.content, &b.instruction, style);
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, Some(&id), Some(idx), "rewrite", &settings, &out.usage);
     Ok(Json(json!({"text": out.text.trim(), "mode": mode})))
