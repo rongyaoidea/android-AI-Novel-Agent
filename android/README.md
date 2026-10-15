@@ -56,7 +56,7 @@ gradle assembleRelease             # 发布包（无 keystore 时自动回退 de
 - **前台服务**：`dataSync` 类型；生成任务在服务进程内跑，退出界面不中断。
 - **数据目录**：`filesDir/ainovel.db`（SQLite，覆盖安装保留）。
 - **手机适配**：Web UI 在窄屏下自动切换为顶部导航（sticky）+ 单列布局；表格横向滚动、导航横滑条隐藏。
-- **系统栏适配**：Android 15（targetSdk 35）强制 edge-to-edge，`MainActivity` 把系统栏 / 输入法 insets 转为 WebView 内边距，避免顶部导航被状态栏压住点不到；窗口底色取 Web UI 的「纸」色，状态栏区域自然过渡。
+- **系统栏适配**：全版本统一 edge-to-edge（`setDecorFitsSystemWindows(false)`），insets 监听挂在 **WebView 的外层 FrameLayout**（不能挂 WebView 自身——Chromium 会自行消费系统 insets，监听器收不到回调），padding 容器并返回 `CONSUMED`；顶部导航因此完整落在状态栏下方（Android 15/16 强制 edge-to-edge 场景已在 API 35 模拟器复现并验证）。
 - **应用图标**：自适应图标（白底 + 手绘墨线书 + 朱砂印 + 一笔墨扫），含 Android 13+ 单色（主题图标）版本。
 - **下载/上传**：WebView 默认不处理下载与文件选择，壳已补 `DownloadListener`（MediaStore → 系统「下载」）与 `onShowFileChooser`（ACTION_GET_CONTENT，用于选备份 zip）。
 
