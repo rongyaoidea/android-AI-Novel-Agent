@@ -55,7 +55,9 @@ gradle assembleRelease             # 发布包（无 keystore 时自动回退 de
 - **敏感数据落库加密**：API Key 以 AES-256-GCM 密文存储；数据密钥随机生成、由 Android Keystore 主密钥（不可导出）包裹后持久化，卸载即失效。
 - **前台服务**：`dataSync` 类型；生成任务在服务进程内跑，退出界面不中断。
 - **数据目录**：`filesDir/ainovel.db`（SQLite，覆盖安装保留）。
-- **手机适配**：Web UI 在窄屏下自动切换为顶部导航 + 单列布局；表格横向滚动。
+- **手机适配**：Web UI 在窄屏下自动切换为顶部导航（sticky）+ 单列布局；表格横向滚动、导航横滑条隐藏。
+- **系统栏适配**：Android 15（targetSdk 35）强制 edge-to-edge，`MainActivity` 把系统栏 / 输入法 insets 转为 WebView 内边距，避免顶部导航被状态栏压住点不到；窗口底色取 Web UI 的「纸」色，状态栏区域自然过渡。
+- **应用图标**：自适应图标（白底 + 手绘墨线书 + 朱砂印 + 一笔墨扫），含 Android 13+ 单色（主题图标）版本。
 - **下载/上传**：WebView 默认不处理下载与文件选择，壳已补 `DownloadListener`（MediaStore → 系统「下载」）与 `onShowFileChooser`（ACTION_GET_CONTENT，用于选备份 zip）。
 
 ## 已知事项（下一步）

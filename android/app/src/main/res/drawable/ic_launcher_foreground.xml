@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  手绘「纸·墨」图标前景：翻开的手写书（墨线）+ 右侧朱砂印 + 底部一笔墨扫。
+  设计：白底、单色墨线（#2A2622）、唯一彩色点缀为朱砂红（#B5432E）。
+  取景：内容限制在 108dp 画布中央约 56dp 安全区内，适配自适应图标各种遮罩。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 书本（手绘墨线） -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#2A2622"
+        android:strokeWidth="3.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M54,40.5 C47.8,36.8 40.5,36.2 34.2,37.4 C31.2,38 28.4,38.9 26.2,40.3 L25.8,65.7 C30.6,64.2 36.2,64.3 41.8,65.6 C46.2,66.6 50.4,68 54,70.3 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#2A2622"
+        android:strokeWidth="3.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M54,40.5 C60.2,36.6 67.4,36 73.8,37.6 C76.8,38.3 79.7,39.4 81.9,40.8 L82.3,66.2 C77.5,64.6 71.9,64.7 66.3,66 C61.9,66.9 57.6,68.3 54,70.6 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#2A2622"
+        android:strokeWidth="3.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M54,41 C53.6,50.7 53.6,60.3 54,70.3" />
+
+    <!-- 页面字迹 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#2A2622"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeAlpha="0.78"
+        android:pathData="M32.6,45.2 C38,44.4 44.4,44.5 49.4,45.3" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#2A2622"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeAlpha="0.78"
+        android:pathData="M32.2,50.6 C37.4,49.8 43.4,50 48.8,50.8" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#2A2622"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeAlpha="0.78"
+        android:pathData="M58.8,45.4 C63.8,44.6 69.4,44.5 74.6,45.3" />
+
+    <!-- 底部一笔墨扫（手绘收尾） -->
+    <path
+        android:fillColor="#2A2622"
+        android:fillAlpha="0.9"
+        android:pathData="M31.5,75.2 C41,73.4 52,73.2 62,74.6 C67,75.4 71.6,76.6 75.2,78.4 C69,79.4 61.6,79.4 53.6,78.6 C44.2,77.6 36.6,76.8 31.5,75.2 Z" />
+
+    <!-- 朱砂印（唯一彩色元素） -->
+    <group
+        android:rotation="-8"
+        android:pivotX="72.5"
+        android:pivotY="63.5">
+        <path
+            android:fillColor="#B5432E"
+            android:pathData="M68.3,56.5 L77.5,56.5 A2.8,2.8 0 0 1 80.3,59.3 L80.3,67.7 A2.8,2.8 0 0 1 77.5,70.5 L68.3,70.5 A2.8,2.8 0 0 1 65.5,67.7 L65.5,59.3 A2.8,2.8 0 0 1 68.3,56.5 Z" />
+    </group>
+</vector>

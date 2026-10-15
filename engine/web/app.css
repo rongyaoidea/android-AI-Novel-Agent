@@ -546,7 +546,13 @@ mark.add { background: hsl(var(--success) / .2); color: inherit; border-radius: 
 /* ---------- 移动端 ---------- */
 @media (max-width: 900px) {
   .layout { flex-direction: column; }
-  .sidebar { width: 100%; flex-direction: row; align-items: center; gap: 4px; overflow-x: auto; border-right: 0; border-bottom: 1px solid hsl(var(--border)); padding: 8px 10px; }
+  .sidebar {
+    width: 100%; flex-direction: row; align-items: center; gap: 4px; overflow-x: auto;
+    border-right: 0; border-bottom: 1px solid hsl(var(--border)); padding: 8px 10px;
+    position: sticky; top: 0; z-index: 30; background: hsl(var(--background));
+    scrollbar-width: none; -webkit-overflow-scrolling: touch;
+  }
+  .sidebar::-webkit-scrollbar { display: none; }
   .brand { padding: 0 10px 0 4px; flex: none; }
   .brand-title { font-size: 13px; }
   .brand-sub, .nav-group-label, .sidebar-foot { display: none; }

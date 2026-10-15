@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 图标底：白色（手绘墨线风格） -->
+    <color name="ic_launcher_background">#FFFFFF</color>
+    <!-- 窗口底色：与 Web UI「纸」色一致，用于状态栏 / 导航栏透出的区域 -->
+    <color name="window_background">#FBF8F3</color>
+</resources>

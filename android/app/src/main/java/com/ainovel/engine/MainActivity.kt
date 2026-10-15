@@ -18,6 +18,8 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -45,6 +47,20 @@ class MainActivity : AppCompatActivity() {
 
         web = WebView(this)
         setContentView(web)
+        // Android 15（targetSdk 35）起系统强制 edge-to-edge：页面会绘制到状态栏 / 导航栏之下，
+        // 导致顶部导航被系统栏压住、点不到。这里把系统栏 insets 转为 WebView 内边距；
+        // 35+ 再叠加输入法 insets（edge-to-edge 下 adjustResize 不再生效）。
+        ViewCompat.setOnApplyWindowInsetsListener(web) { view, insets ->
+            val sys = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+            var bottom = sys.bottom
+            if (Build.VERSION.SDK_INT >= 35) {
+                bottom = maxOf(bottom, insets.getInsets(WindowInsetsCompat.Type.ime()).bottom)
+            }
+            view.setPadding(sys.left, sys.top, sys.right, bottom)
+            insets
+        }
         web.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
