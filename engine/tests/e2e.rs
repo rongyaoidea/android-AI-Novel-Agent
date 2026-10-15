@@ -697,3 +697,348 @@ async fn writing_tools_continue_rewrite_extract_health() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 数据安全 ①：token 用量统计口径（缓存命中 / 未命中 / 合计必须自洽）
+#[tokio::test]
+async fn usage_accounting_is_correct() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-usage-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    // 建书跑完整流水线（mock 上报确定性用量）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "用量统计测试", "chapters": 2}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    for _ in 0..400 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        let status = v["run"]["status"].as_str().unwrap_or("");
+        if status == "done" {
+            break;
+        }
+        assert_ne!(status, "failed");
+    }
+
+    // 再补一次选段修文，验证不同任务都入账
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/chapters/1/polish"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"mode": "rewrite", "selection": "他走了过去，看了看窗户。"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/usage"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let t = &v["totals"];
+
+    let calls = t["calls"].as_i64().unwrap();
+    // 立项 + 规划 + 2 章正文 + 2 次审校 + 2 次抽取 + 1 次修文 = 9
+    assert!(calls >= 9, "calls = {calls}, payload: {v}");
+
+    let input = t["input"].as_i64().expect("mock 必须上报 input");
+    let output = t["output"].as_i64().expect("mock 必须上报 output");
+    let hit = t["cache_hit"].as_i64().expect("mock 必须上报 cache_hit");
+    let miss = t["cache_miss"].as_i64().expect("mock 必须上报 cache_miss");
+    let total = t["total"].as_i64().expect("mock 必须上报 total");
+
+    assert_eq!(hit + miss, input, "命中 + 未命中必须等于输入总量");
+    assert_eq!(input + output, total, "输入 + 输出必须等于合计");
+    assert!(hit > 0, "mock 应产生缓存命中");
+    assert!(miss > 0, "mock 应产生未命中部分");
+
+    // 分组：任务维度含正文生成与修文；章节维度含第 1、2 章
+    let tasks: Vec<String> = v["by_task"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["key"].as_str().unwrap().to_string())
+        .collect();
+    for want in ["brief", "outline", "chapter", "review", "extract", "polish"] {
+        assert!(tasks.contains(&want.to_string()), "缺少任务分组 {want}: {tasks:?}");
+    }
+    let chapter_keys: Vec<String> = v["by_chapter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["key"].as_str().unwrap().to_string())
+        .collect();
+    assert!(chapter_keys.contains(&"第1章".to_string()), "{chapter_keys:?}");
+    assert!(chapter_keys.contains(&"第2章".to_string()), "{chapter_keys:?}");
+
+    // 每行分组同样自洽
+    for g in v["by_task"].as_array().unwrap() {
+        let gi = g["input"].as_i64().unwrap();
+        let gh = g["cache_hit"].as_i64().unwrap();
+        let gm = g["cache_miss"].as_i64().unwrap();
+        assert_eq!(gh + gm, gi, "分组口径不自洽: {g}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 数据安全 ②：本地服务令牌（无令牌 401；头 / Bearer / 查询参数三种方式放行；health 放行）
+#[tokio::test]
+async fn auth_token_protects_api() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-auth-{stamp}"));
+    let config = AppConfig::for_data_dir(dir.clone())
+        .with_security(Some("test-token-123456".into()), None);
+    let engine = Engine::new(config).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    let call = |app: axum::Router, uri: &str, token: Option<&str>| {
+        let uri = uri.to_string();
+        let token = token.map(|t| t.to_string());
+        async move {
+            let mut req = Request::builder().uri(uri);
+            if let Some(t) = token {
+                req = req.header("x-ainovel-token", t);
+            }
+            app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap()
+        }
+    };
+
+    // 无令牌 → 401
+    let resp = call(app.clone(), "/api/novels", None).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // 错误令牌 → 401
+    let resp = call(app.clone(), "/api/novels", Some("wrong")).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // 正确令牌（头）→ 200
+    let resp = call(app.clone(), "/api/novels", Some("test-token-123456")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // 正确令牌（查询参数，EventSource 场景）→ 200
+    let resp = call(app.clone(), "/api/novels?token=test-token-123456", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Authorization: Bearer → 200
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/novels")
+                .header("authorization", "Bearer test-token-123456")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // health 与静态资源无需令牌
+    let resp = call(app.clone(), "/api/health", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = call(app.clone(), "/", None).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 数据安全 ③：备份导出 / 恢复覆盖（HTTP 全链路）
+#[tokio::test]
+async fn backup_and_restore_endpoints() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-backup-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    let app = api::build_router(engine.clone());
+
+    // 造一本带正文的书 → 导出备份
+    let novel = engine.db.create_novel("备份的书", "auto").unwrap();
+    engine
+        .db
+        .upsert_chapter_plan(
+            &novel.id,
+            &ChapterPlan {
+                idx: 1,
+                title: "首章".into(),
+                goal: String::new(),
+                beats: vec![],
+            },
+        )
+        .unwrap();
+    engine.db.save_chapter_content(&novel.id, 1, "备份前的正文", "done").unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/backup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let backup_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(backup_bytes.len() > 100, "备份包太小: {}", backup_bytes.len());
+    assert_eq!(&backup_bytes[..2], b"PK", "备份应为 zip 格式");
+
+    // 再建一本新书（恢复后应被覆盖掉）
+    engine.db.create_novel("将被覆盖的书", "auto").unwrap();
+    assert_eq!(engine.db.list_novels().unwrap().len(), 2);
+
+    // 非 zip → 400
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/restore")
+                .header("content-type", "application/zip")
+                .body(Body::from("not a zip"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 恢复备份 → 只剩备份里的书
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/restore")
+                .header("content-type", "application/zip")
+                .body(Body::from(backup_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let restore_status = resp.status();
+    let restore_body = json_body(resp).await;
+    assert_eq!(restore_status, StatusCode::OK, "restore body: {restore_body}");
+    let items = engine.db.list_novels().unwrap();
+    assert_eq!(items.len(), 1, "恢复后应只剩备份中的作品");
+    assert_eq!(items[0].novel.idea, "备份的书");
+    let ch = engine.db.get_chapter(&items[0].novel.id, 1).unwrap().unwrap();
+    assert_eq!(ch.content, "备份前的正文", "正文应随备份恢复");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 数据安全 ④：API Key 落库加密（明文不出现在数据库中；换密钥后无法解密）
+#[tokio::test]
+async fn api_key_is_encrypted_at_rest() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-crypt-{stamp}"));
+    let secret_hex = "ab".repeat(32);
+    let config = AppConfig::for_data_dir(dir.clone())
+        .with_security(None, Some(secret_hex.clone()));
+    let engine = Engine::new(config).unwrap();
+    let app = api::build_router(engine.clone());
+
+    // 通过 API 保存 Key
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/settings/llm")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "provider": "openai",
+                        "base_url": "https://api.deepseek.com/v1",
+                        "api_key": "sk-plaintext-secret",
+                        "model": "deepseek-chat",
+                        "temperature": 0.8
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 原始落库值：必须是密文前缀，且不含明文
+    let raw = engine.db.llm_settings().unwrap();
+    assert!(
+        raw.api_key.starts_with("enc:v1:"),
+        "落库应为密文: {}",
+        raw.api_key
+    );
+    assert!(!raw.api_key.contains("sk-plaintext-secret"));
+
+    // 读取接口：自动解密
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/settings/llm")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["api_key"], "sk-plaintext-secret");
+
+    // 引擎层读取同样解密
+    assert_eq!(engine.llm_settings().unwrap().api_key, "sk-plaintext-secret");
+
+    // 换一把密钥（模拟 Keystore 丢失/换机）：解密失败 → 置空并告警，不会泄漏乱码
+    let other = Engine::new(
+        AppConfig::for_data_dir(dir.clone())
+            .with_security(None, Some("cd".repeat(32))),
+    )
+    .unwrap();
+    assert_eq!(other.llm_settings().unwrap().api_key, "");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -503,6 +503,12 @@ mark.add { background: hsl(var(--success) / .2); color: inherit; border-radius: 
 .health-line { display: flex; gap: 8px; align-items: flex-start; margin: 0 0 8px; font-size: 13.5px; line-height: 1.7; }
 .health-line .ic { margin-top: 4px; color: hsl(var(--warning)); }
 
+/* ---------- AI 用量 ---------- */
+.usage-block { display: flex; flex-direction: column; gap: 2px; }
+.usage-sub { margin: 6px 0 2px; font-size: 12.5px; font-weight: 500; color: hsl(var(--muted-foreground)); letter-spacing: .04em; }
+#usage-backdrop .table { font-size: 12.5px; }
+#usage-backdrop .table th, #usage-backdrop .table td { padding: 6px; }
+
 /* ---------- 移动端 ---------- */
 @media (max-width: 900px) {
   .layout { flex-direction: column; }

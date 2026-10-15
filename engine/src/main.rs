@@ -39,6 +39,18 @@ async fn main() -> anyhow::Result<()> {
         host: "127.0.0.1".into(),
         port,
         data_dir,
-    };
+        auth_token: std::env::var("AI_NOVEL_AUTH_TOKEN").ok(),
+        secret_hex: std::env::var("AI_NOVEL_SECRET_HEX").ok(),
+    }
+    .with_security(
+        std::env::var("AI_NOVEL_AUTH_TOKEN").ok(),
+        std::env::var("AI_NOVEL_SECRET_HEX").ok(),
+    );
+    if config.auth_token.is_some() {
+        println!("已启用访问令牌：/api 需要 x-ainovel-token 头或 ?token= 参数");
+    }
+    if config.secret_hex.is_some() {
+        println!("已启用敏感字段加密（AES-256-GCM）");
+    }
     ainovel_engine::run_server(config).await
 }

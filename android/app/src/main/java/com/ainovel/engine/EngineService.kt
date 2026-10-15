@@ -46,11 +46,15 @@ class EngineService : Service() {
 
     // ---------- 引擎启动 ----------
 
+    /** 服务令牌（与 MainActivity 共用同一份；引擎要求 /api 请求携带） */
+    private val authToken: String by lazy { SecretStore.getOrCreateAuthToken(applicationContext) }
+
     private fun startEngine() {
         Thread {
             try {
                 System.loadLibrary("ainovel_engine")
-                val code = nativeStart(filesDir.absolutePath, PORT)
+                val secret = SecretStore.getOrCreateSecretHex(applicationContext)
+                val code = nativeStart(filesDir.absolutePath, PORT, authToken, secret)
                 Log.i(TAG, "nativeStart returned $code")
             } catch (t: Throwable) {
                 Log.e(TAG, "engine start failed", t)
@@ -59,7 +63,12 @@ class EngineService : Service() {
     }
 
     /** Rust 侧: Java_com_ainovel_engine_EngineService_nativeStart */
-    private external fun nativeStart(dataDir: String, port: Int): Int
+    private external fun nativeStart(
+        dataDir: String,
+        port: Int,
+        authToken: String,
+        secretHex: String,
+    ): Int
 
     // ---------- 状态轮询 → 本地通知 ----------
 
@@ -85,6 +94,7 @@ class EngineService : Service() {
         val conn = URL("http://127.0.0.1:$PORT/api/novels").openConnection() as HttpURLConnection
         conn.connectTimeout = 3_000
         conn.readTimeout = 5_000
+        conn.setRequestProperty("x-ainovel-token", authToken)
         val body = conn.inputStream.bufferedReader().use { it.readText() }
         conn.disconnect()
 

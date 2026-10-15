@@ -20,11 +20,23 @@ pub extern "system" fn Java_com_ainovel_engine_EngineService_nativeStart(
     _class: JClass,
     data_dir: JString,
     port: jint,
+    auth_token: JString,
+    secret_hex: JString,
 ) -> jint {
     let dir: String = match env.get_string(&data_dir) {
         Ok(s) => s.into(),
         Err(_) => return -1,
     };
+    let token: Option<String> = env
+        .get_string(&auth_token)
+        .ok()
+        .map(|s| String::from(s))
+        .filter(|s| !s.trim().is_empty());
+    let secret: Option<String> = env
+        .get_string(&secret_hex)
+        .ok()
+        .map(|s| String::from(s))
+        .filter(|s| !s.trim().is_empty());
     let port = if port <= 0 || port > 65535 {
         8787u16
     } else {
@@ -41,6 +53,8 @@ pub extern "system" fn Java_com_ainovel_engine_EngineService_nativeStart(
             host: "127.0.0.1".into(),
             port,
             data_dir: dir.into(),
+            auth_token: token,
+            secret_hex: secret,
         };
         if let Err(e) = crate::run_server(cfg).await {
             tracing::error!("engine exited: {e:#}");

@@ -2,26 +2,42 @@ package com.ainovel.engine
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.URL
 
 /**
  * 壳：启动前台服务（Rust 引擎），轮询就绪后把内嵌 Web UI 载入 WebView。
- * 引擎只监听 127.0.0.1，与 UI 同进程，无任何外部运行时依赖。
+ * 引擎只监听 127.0.0.1，与 UI 同进程；/api 请求用本机令牌（?token=）鉴权，
+ * 防止同机其它 App 通过 8787 端口读取作品数据。
+ *
+ * 另补齐 WebView 两个缺口：
+ * - DownloadListener：导出 TXT / 备份 zip 保存到系统「下载」
+ * - onShowFileChooser：恢复备份时选 zip 文件
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var web: WebView
+    private var pendingFilePathCallback: ValueCallback<Array<Uri>>? = null
+
+    private val authToken: String by lazy { SecretStore.getOrCreateAuthToken(applicationContext) }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -35,6 +51,34 @@ class MainActivity : AppCompatActivity() {
             cacheMode = WebSettings.LOAD_DEFAULT
         }
         web.webViewClient = WebViewClient()
+        web.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?,
+            ): Boolean {
+                pendingFilePathCallback?.onReceiveValue(null)
+                pendingFilePathCallback = filePathCallback
+                return try {
+                    val accept = fileChooserParams?.acceptTypes?.firstOrNull { it.isNotEmpty() } ?: "*/*"
+                    val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = if (accept.startsWith(".")) "*/*" else accept
+                    }
+                    startActivityForResult(intent, REQUEST_FILE)
+                    true
+                } catch (_: Exception) {
+                    pendingFilePathCallback = null
+                    false
+                }
+            }
+        }
+        web.setDownloadListener { url, _, contentDisposition, mimeType, _ ->
+            // 只放行本机引擎的下载（导出 TXT / 备份 zip）
+            if (url.startsWith("http://127.0.0.1:${EngineService.PORT}/")) {
+                Thread { saveToDownloads(url, contentDisposition, mimeType) }.start()
+            }
+        }
 
         requestNotificationPermission()
         startForegroundService(Intent(this, EngineService::class.java))
@@ -50,6 +94,66 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ---------- 下载（导出 / 备份） ----------
+
+    private fun saveToDownloads(url: String, contentDisposition: String?, mimeType: String?) {
+        try {
+            val conn = URL(url).openConnection() as HttpURLConnection
+            conn.connectTimeout = 5_000
+            conn.readTimeout = 120_000
+            conn.setRequestProperty("x-ainovel-token", authToken)
+            val disposition = contentDisposition ?: conn.getHeaderField("Content-Disposition")
+            val name = filenameFrom(disposition) ?: "ainovel-download.bin"
+            val type = mimeType?.takeIf { it.isNotBlank() }
+                ?: conn.getHeaderField("Content-Type")?.substringBefore(';')?.trim()
+                ?: "application/octet-stream"
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE, type)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("无法创建下载条目")
+            conn.inputStream.use { input ->
+                contentResolver.openOutputStream(uri)?.use { output -> input.copyTo(output) }
+            }
+            conn.disconnect()
+            toast("已保存到「下载」：$name")
+        } catch (t: Throwable) {
+            toast("下载失败：${t.message}")
+        }
+    }
+
+    private fun filenameFrom(disposition: String?): String? {
+        val m = Regex("filename=\"?([^\";]+)\"?", RegexOption.IGNORE_CASE).find(disposition ?: "")
+            ?: return null
+        return m.groupValues[1].trim().takeIf { it.isNotEmpty() }
+    }
+
+    private fun toast(msg: String) {
+        runOnUiThread { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+    }
+
+    // ---------- 文件选择（恢复备份） ----------
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == REQUEST_FILE) {
+            val cb = pendingFilePathCallback
+            pendingFilePathCallback = null
+            val uris = if (resultCode == RESULT_OK && data?.data != null) {
+                arrayOf(data.data!!)
+            } else {
+                null
+            }
+            cb?.onReceiveValue(uris)
+            return
+        }
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    // ---------- 加载 UI ----------
+
     private fun pollAndLoad(attempt: Int) {
         Thread {
             val ok = try {
@@ -62,16 +166,20 @@ class MainActivity : AppCompatActivity() {
             }
             runOnUiThread {
                 when {
-                    ok -> web.loadUrl("http://127.0.0.1:${EngineService.PORT}/")
+                    ok -> web.loadUrl(uiUrl())
                     attempt < 150 -> web.postDelayed({ pollAndLoad(attempt + 1) }, 400)
                     else -> {
                         // 超时也加载：至少显示错误页面，不白屏
-                        web.loadUrl("http://127.0.0.1:${EngineService.PORT}/")
+                        web.loadUrl(uiUrl())
                     }
                 }
             }
         }.start()
     }
+
+    /** 令牌走查询参数：页面 JS 会暂存后从地址栏清掉，之后改为请求头 */
+    private fun uiUrl(): String =
+        "http://127.0.0.1:${EngineService.PORT}/?token=$authToken#/shelf"
 
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
@@ -81,5 +189,9 @@ class MainActivity : AppCompatActivity() {
             @Suppress("DEPRECATION")
             super.onBackPressed()
         }
+    }
+
+    companion object {
+        private const val REQUEST_FILE = 2001
     }
 }

@@ -38,8 +38,13 @@ android-AI-Novel-Agent/
 | 导出 TXT | ✅ |
 | 模型接入：mock（离线）/ OpenAI 兼容（含 DeepSeek、通义、GLM、Ollama 等） | ✅ |
 | 界面：书架卡片 / 开书流程 / 工作台（进度步骤条 + 跟随生成 + 章节表）/ 运行记录 / 模型设置（浅色 & 深色主题） | ✅ |
-| Android 壳（前台服务 + WebView + JNI） | ✅ 脚手架（见 `android/README.md` 构建步骤） |
-| 阅测/EPUB/伏笔账本/角色库/多卷结构 | ⏳ 路线图 |
+| 角色台账 / 伏笔台账（写后自动抽取 + 上下文注入） | ✅ |
+| 选段 AI 修文（改写/扩写/精简/去 AI 味，diff 预览 + 换一版） | ✅ |
+| 写作工具：光标续写 / 章节重写 / 摘要链（近 5 章注入） / 书籍体检 | ✅ |
+| 数据安全：全量备份导出 & 恢复（zip 快照）、本地服务访问令牌、API Key 落库加密（Android Keystore 包裹密钥 + AES-256-GCM） | ✅ |
+| AI 用量统计：按任务/章节记账，输入 / 输出 / 缓存命中 / 未命中（多厂商字段已归一化，未知不按 0 计） | ✅ |
+| Android 壳（前台服务 + WebView + JNI，下载/选文件已接系统） | ✅ 脚手架（见 `android/README.md` 构建步骤） |
+| 阅测/EPUB/多卷结构 | ⏳ 路线图 |
 
 ## 桌面运行（开发/验证）
 
@@ -60,6 +65,25 @@ cargo run -- --port 8899 --data-dir ./devdata
 cd engine
 cargo test
 ```
+
+## 数据安全
+
+- **备份 / 恢复**：模型设置页「数据备份」→「导出备份」下载 `ainovel-backup-*.zip`（内含 `VACUUM INTO` 一致性快照），「恢复备份」选 zip 覆盖当前数据（128 MB 上限，恢复前二次确认）。Android 上导出文件保存到系统「下载」。
+- **本地服务令牌**：`/api/*` 需要 `x-ainovel-token` 头或 `?token=`；`/api/health` 与静态资源放行。Android 壳首次启动生成 40 位 hex 令牌（私有 SharedPreferences），注入 WebView 与通知轮询。桌面开发默认不设防；需要时可设：
+
+```bash
+# PowerShell
+$env:AI_NOVEL_AUTH_TOKEN = "your-token"; cargo run
+```
+
+- **API Key 加密**：提供 64 位 hex 密钥后，Key 以 `enc:v1:` 前缀的 AES-256-GCM 密文落库（换密钥后解不开会被置空并提示重填）：
+
+```bash
+# PowerShell（桌面开发用随机密钥即可；Android 上由 Keystore 包裹的密钥自动提供）
+$env:AI_NOVEL_SECRET_HEX = "abababababababababababababababababababababababababababababababab"; cargo run
+```
+
+- **AI 用量**：工作台「AI 用量」弹窗查看：调用次数、输入 / 输出、缓存命中与未命中（OpenAI `prompt_tokens_details.cached_tokens`、DeepSeek `prompt_cache_hit/miss_tokens`、Anthropic `cache_read/creation_input_tokens` 已归一化），按任务与章节分组；厂商未上报的口径显示「—」而不是 0。
 
 ## Android 构建（概要）
 
@@ -89,7 +113,7 @@ gradle assembleDebug               # 产物 app/build/outputs/apk/debug/app-debu
 - **P0（本仓库现状）**：垂直切片跑通（桌面 + mock + 真模型）。
 - **P1**：Android 真机跑通；通知（完成/失败）；章节继续写与重写；提示词工程化（模板文件化、按书覆盖）。
 - **P2**：角色/伏笔最小台账；阅读器体验；EPUB 导出；模型路由（规划/正文/审校分模型）。
-- **P3**：多卷结构；RAG（本地向量，可选）；数据导入导出。
+- **P3**：多卷结构；RAG（本地向量，可选）；单书导入导出（整库备份/恢复已提供）。
 
 ## 发版与签名（GitHub Actions）
 

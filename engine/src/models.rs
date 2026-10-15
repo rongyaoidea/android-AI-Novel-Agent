@@ -154,3 +154,52 @@ pub struct RunListItem {
     pub run: Run,
     pub novel_title: String,
 }
+
+/// 一次 LLM 调用的 token 用量。
+/// None = 厂商未提供（不得当作 0）；input/output 为计费口径的输入输出总量，
+/// cache_hit / cache_miss 是 input 的两个组成部分（不同厂商字段语义已归一化）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TokenUsage {
+    pub input: Option<i64>,
+    pub output: Option<i64>,
+    pub cache_hit: Option<i64>,
+    pub cache_miss: Option<i64>,
+    pub total: Option<i64>,
+}
+
+/// 用量记录（持久化）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageRecord {
+    pub id: String,
+    pub novel_id: Option<String>,
+    pub chapter_idx: Option<i64>,
+    pub task: String,
+    pub provider: String,
+    pub model: String,
+    pub input: Option<i64>,
+    pub output: Option<i64>,
+    pub cache_hit: Option<i64>,
+    pub cache_miss: Option<i64>,
+    pub total: Option<i64>,
+    pub created_at: String,
+}
+
+/// 用量汇总（None = 该口径全部记录都未知，不得显示为 0）
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct UsageTotals {
+    pub calls: i64,
+    pub known_input: i64,
+    pub input: Option<i64>,
+    pub output: Option<i64>,
+    pub cache_hit: Option<i64>,
+    pub cache_miss: Option<i64>,
+    pub total: Option<i64>,
+}
+
+/// 用量分组行（key 为任务名或章节号）
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageGroup {
+    pub key: String,
+    #[serde(flatten)]
+    pub totals: UsageTotals,
+}

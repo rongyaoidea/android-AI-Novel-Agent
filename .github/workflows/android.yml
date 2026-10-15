@@ -50,6 +50,11 @@ jobs:
         with:
           workspaces: engine
 
+      - name: Run engine tests (unit + e2e, offline mock)
+        run: |
+          cd engine
+          cargo test --all-targets
+
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 

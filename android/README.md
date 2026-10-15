@@ -2,8 +2,9 @@
 
 结构：
 
-- `app/src/main/java/com/ainovel/engine/MainActivity.kt` — WebView 容器；启动服务 → 轮询 `127.0.0.1:8787` 就绪 → 加载本地 UI。
-- `app/src/main/java/com/ainovel/engine/EngineService.kt` — 前台服务；`System.loadLibrary("ainovel_engine")` + `nativeStart(filesDir, 8787)`。
+- `app/src/main/java/com/ainovel/engine/MainActivity.kt` — WebView 容器；启动服务 → 轮询 `127.0.0.1:8787` 就绪 → 带令牌加载本地 UI；接管下载（导出 TXT / 备份 zip → 系统「下载」）与文件选择（恢复备份）。
+- `app/src/main/java/com/ainovel/engine/EngineService.kt` — 前台服务；`System.loadLibrary("ainovel_engine")` + `nativeStart(filesDir, 8787, token, secretHex)`；轮询运行状态推「完成 / 中断 / 待确认」通知。
+- `app/src/main/java/com/ainovel/engine/SecretStore.kt` — 本机密钥：Android Keystore 主密钥包裹 32 字节数据密钥（供引擎加密 API Key）；生成并持久化本地服务访问令牌。
 - `app/src/main/jniLibs/arm64-v8a/` — Rust 引擎产物（构建生成，不入库）。
 
 ## 本地构建
@@ -50,14 +51,15 @@ gradle assembleRelease             # 发布包（无 keystore 时自动回退 de
 ## 设计要点
 
 - **零外部运行时**：APK 内没有 Node/Termux/PRoot；引擎是单个自研 `.so`。
-- **仅回环**：引擎只绑定 `127.0.0.1`；`usesCleartextTraffic` 仅为回环服务（后续可换 `networkSecurityConfig` 白名单收紧）。
+- **仅回环 + 访问令牌**：引擎只绑定 `127.0.0.1`，且 `/api/*` 需要 `x-ainovel-token`（壳生成的 40 位 hex，存私有 SharedPreferences），防止同机其它 App 通过 8787 读取作品与设置；`/api/health` 与静态资源放行。WebView 首次加载 URL 带 `?token=`，页面 JS 暂存后自动从地址栏清除。
+- **敏感数据落库加密**：API Key 以 AES-256-GCM 密文存储；数据密钥随机生成、由 Android Keystore 主密钥（不可导出）包裹后持久化，卸载即失效。
 - **前台服务**：`dataSync` 类型；生成任务在服务进程内跑，退出界面不中断。
 - **数据目录**：`filesDir/ainovel.db`（SQLite，覆盖安装保留）。
 - **手机适配**：Web UI 在窄屏下自动切换为顶部导航 + 单列布局；表格横向滚动。
+- **下载/上传**：WebView 默认不处理下载与文件选择，壳已补 `DownloadListener`（MediaStore → 系统「下载」）与 `onShowFileChooser`（ACTION_GET_CONTENT，用于选备份 zip）。
 
 ## 已知事项（下一步）
 
-- [ ] 通知：生成完成/失败的通知（服务内监听引擎事件 → 本地通知）。
 - [ ] `networkSecurityConfig` 收紧 cleartext（仅 127.0.0.1）。
 - [ ] 图标为矢量占位，正式版替换。
 - [ ] 若要在 x86_64 模拟器跑：`rustup target add x86_64-linux-android` 并按 ABI 追加编译。

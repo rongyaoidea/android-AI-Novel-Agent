@@ -59,6 +59,10 @@
   <symbol id="i-pulse" viewBox="0 0 24 24">
     <path d="M3.6 12.4 Q6 12.3 7.6 12.3 L9.4 8.2 Q11 14.6 12.6 16.4 Q14 18 15.2 12.3 L16.6 12.3 Q18.6 12.3 20.4 12.3"/>
   </symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24">
+    <path d="M4.8 19.3 Q12 19.1 19.2 19.2"/>
+    <path d="M7.4 19.1 Q7.35 15.6 7.4 12.8 M12 19.1 Q11.95 11.2 12 7.7 M16.6 19.1 Q16.55 13.8 16.6 10.1"/>
+  </symbol>
 </svg>
 
 <div class="layout">
@@ -156,6 +160,7 @@
             <input id="novel-target" class="input-sm" type="number" min="1" max="50" title="目标章节数" />
             <button class="btn btn-primary" id="novel-run">继续创作</button>
             <button class="btn btn-outline" id="novel-health"><svg class="ic"><use href="#i-pulse"/></svg>书籍体检</button>
+            <button class="btn btn-outline" id="novel-usage"><svg class="ic"><use href="#i-chart"/></svg>AI 用量</button>
             <a class="btn btn-outline" id="novel-export" href="#"><svg class="ic"><use href="#i-download"/></svg>导出 TXT</a>
             <button class="btn btn-ghost btn-danger" id="novel-delete">删除</button>
           </div>
@@ -287,6 +292,18 @@
           <button class="btn btn-outline btn-sm" data-preset="glm">智谱 GLM</button>
           <button class="btn btn-outline btn-sm" data-preset="ollama">Ollama 本地</button>
         </div>
+        <div class="panel" style="max-width:700px;">
+          <div class="panel-head">
+            <h3 class="panel-title">数据备份</h3>
+          </div>
+          <p class="muted" style="margin:0;">备份包含全部作品、章节、台账与用量记录（zip 快照，纯本地生成）；恢复会覆盖当前全部数据，请谨慎操作。</p>
+          <div class="row">
+            <a class="btn btn-primary" id="set-backup" href="/api/backup" download><svg class="ic"><use href="#i-download"/></svg>导出备份</a>
+            <button class="btn btn-outline" id="set-restore"><svg class="ic"><use href="#i-refresh"/></svg>恢复备份</button>
+            <input type="file" id="set-restore-file" accept=".zip,application/zip" hidden />
+            <span class="muted" id="set-backup-status"></span>
+          </div>
+        </div>
       </section>
 
     </main>
@@ -390,6 +407,32 @@
     <div class="row">
       <button class="btn btn-primary" id="health-fill"><svg class="ic"><use href="#i-refresh"/></svg>补齐资料</button>
       <span class="muted" id="health-status"></span>
+    </div>
+  </div>
+</div>
+
+<!-- AI 用量 -->
+<div class="dialog-backdrop" id="usage-backdrop" hidden>
+  <div class="dialog" style="width:min(740px,94vw);">
+    <div class="dialog-head">
+      <h3>AI 用量</h3>
+      <button class="btn btn-ghost" id="usage-close">关闭</button>
+    </div>
+    <div class="chips" id="usage-stats"></div>
+    <p class="muted" style="margin:0;">「命中」是输入中被厂商计为缓存读取的部分；「—」表示厂商未上报该口径，按未知处理而不是 0。</p>
+    <div class="usage-block">
+      <h4 class="usage-sub">按任务</h4>
+      <table class="table">
+        <thead><tr><th>任务</th><th class="num">调用</th><th class="num">输入</th><th class="num">命中</th><th class="num">未命中</th><th class="num">输出</th><th class="num">合计</th></tr></thead>
+        <tbody id="usage-task-rows"></tbody>
+      </table>
+    </div>
+    <div class="usage-block">
+      <h4 class="usage-sub">按章节</h4>
+      <table class="table">
+        <thead><tr><th>位置</th><th class="num">调用</th><th class="num">输入</th><th class="num">命中</th><th class="num">未命中</th><th class="num">输出</th><th class="num">合计</th></tr></thead>
+        <tbody id="usage-chapter-rows"></tbody>
+      </table>
     </div>
   </div>
 </div>

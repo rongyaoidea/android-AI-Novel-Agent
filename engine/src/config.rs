@@ -7,6 +7,10 @@ pub struct AppConfig {
     pub host: String,
     pub port: u16,
     pub data_dir: PathBuf,
+    /// 本地服务访问令牌：Some 时 /api 接口需要 x-ainovel-token 头或 ?token=
+    pub auth_token: Option<String>,
+    /// 敏感字段加密密钥（64 位 hex）；None 时明文存储（仅本地开发）
+    pub secret_hex: Option<String>,
 }
 
 impl AppConfig {
@@ -15,7 +19,15 @@ impl AppConfig {
             host: "127.0.0.1".into(),
             port: 8787,
             data_dir: dir.into(),
+            auth_token: None,
+            secret_hex: None,
         }
+    }
+
+    pub fn with_security(mut self, auth_token: Option<String>, secret_hex: Option<String>) -> Self {
+        self.auth_token = auth_token.filter(|t| !t.trim().is_empty());
+        self.secret_hex = secret_hex.filter(|t| !t.trim().is_empty());
+        self
     }
 
     pub fn db_path(&self) -> PathBuf {

@@ -1,15 +1,17 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::llm::record_usage;
 use crate::models::LlmSettings;
 use crate::pipeline;
 use crate::Engine;
@@ -22,6 +24,71 @@ fn err(e: impl std::fmt::Display) -> ApiErr {
 
 fn not_found(what: &str) -> ApiErr {
     (StatusCode::NOT_FOUND, format!("{what} not found"))
+}
+
+// ---------- 本地访问令牌 ----------
+
+/// 常量时间比较（避免时序侧信道）
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 令牌校验：`/api/*` 需要 `x-ainovel-token` 头、`Authorization: Bearer` 或 `?token=`
+/// （EventSource 与下载链接无法加请求头，只能走查询参数）。
+/// `/api/health` 与静态资源放行（就绪探测、页面加载）。
+/// 未配置令牌（本地开发）时不设防。
+async fn auth_middleware(State(e): State<Arc<Engine>>, req: Request, next: Next) -> Response {
+    let Some(expected) = e.auth_token() else {
+        return next.run(req).await;
+    };
+    let path = req.uri().path().to_string();
+    if !path.starts_with("/api/") || path == "/api/health" {
+        return next.run(req).await;
+    }
+    let header_ok = req
+        .headers()
+        .get("x-ainovel-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|t| constant_time_eq(t, expected))
+        .unwrap_or(false)
+        || req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|t| constant_time_eq(t, expected))
+            .unwrap_or(false);
+    let query_ok = req
+        .uri()
+        .query()
+        .map(|q| {
+            q.split('&').any(|kv| {
+                let mut it = kv.splitn(2, '=');
+                it.next() == Some("token")
+                    && it
+                        .next()
+                        .map(|v| constant_time_eq(v, expected))
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if header_ok || query_ok {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            "缺少或错误的访问令牌（x-ainovel-token / ?token=）".to_string(),
+        )
+            .into_response()
+    }
 }
 
 pub fn build_router(engine: Arc<Engine>) -> Router {
@@ -63,8 +130,15 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/api/novels/:id/foreshadowings/:fid",
             axum::routing::put(update_foreshadowing).delete(delete_foreshadowing),
         )
+        .route("/api/novels/:id/usage", get(usage_summary))
         .route("/api/runs", get(list_runs))
-        .with_state(engine)
+        .route("/api/backup", get(backup_db))
+        .route(
+            "/api/restore",
+            post(restore_db).layer(DefaultBodyLimit::max(256 * 1024 * 1024)),
+        )
+        .with_state(engine.clone())
+        .layer(middleware::from_fn_with_state(engine, auth_middleware))
 }
 
 // ---------- 静态资源 ----------
@@ -106,7 +180,7 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 async fn get_llm(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, ApiErr> {
-    let s = e.db.llm_settings().map_err(err)?;
+    let s = e.llm_settings().map_err(err)?;
     Ok(Json(serde_json::to_value(s).map_err(err)?))
 }
 
@@ -114,18 +188,21 @@ async fn put_llm(
     State(e): State<Arc<Engine>>,
     Json(s): Json<LlmSettings>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
-    e.db.set_llm_settings(&s).map_err(err)?;
+    e.save_llm_settings(&s).map_err(err)?;
     Ok(Json(json!({"ok": true})))
 }
 
 async fn test_llm(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, ApiErr> {
-    let settings = e.db.llm_settings().map_err(err)?;
-    let llm = crate::llm::Llm::new(settings);
+    let settings = e.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings.clone());
     match llm.complete("你是一个连通性测试助手。", "只回复两个字：正常").await {
-        Ok(text) => Ok(Json(json!({
-            "ok": true,
-            "message": text.chars().take(80).collect::<String>(),
-        }))),
+        Ok(out) => {
+            record_usage(&e.db, None, None, "test", &settings, &out.usage);
+            Ok(Json(json!({
+                "ok": true,
+                "message": out.text.chars().take(80).collect::<String>(),
+            })))
+        }
         Err(e2) => Ok(Json(json!({"ok": false, "message": format!("{e2}")}))),
     }
 }
@@ -354,11 +431,12 @@ async fn polish_chapter(
         "expand" | "shrink" | "depolish" | "rewrite" => b.mode.clone(),
         _ => "rewrite".to_string(),
     };
-    let settings = e.db.llm_settings().map_err(err)?;
-    let llm = crate::llm::Llm::new(settings);
+    let settings = e.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings.clone());
     let (sys, usr) = crate::prompts::polish_prompt(&mode, sel, &ch.title, &b.instruction);
-    let revised = llm.complete(&sys, &usr).await.map_err(err)?;
-    Ok(Json(json!({"revised": revised.trim(), "mode": mode})))
+    let out = llm.complete(&sys, &usr).await.map_err(err)?;
+    record_usage(&e.db, Some(&id), Some(idx), "polish", &settings, &out.usage);
+    Ok(Json(json!({"revised": out.text.trim(), "mode": mode})))
 }
 
 /// 结构编辑类操作的保护：运行中不允许改章节结构
@@ -461,10 +539,12 @@ async fn review_chapter(
     if ch.content.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "本章还没有正文，无法复核。".to_string()));
     }
-    let settings = e.db.llm_settings().map_err(err)?;
-    let llm = crate::llm::Llm::new(settings);
+    let settings = e.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings.clone());
     let (sys, usr) = crate::prompts::review_prompt(&ch.content);
-    let raw = llm.complete(&sys, &usr).await.map_err(err)?;
+    let out = llm.complete(&sys, &usr).await.map_err(err)?;
+    record_usage(&e.db, Some(&id), Some(idx), "review", &settings, &out.usage);
+    let raw = out.text;
     let v = crate::llm::extract_json_object(&raw).ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, "复核输出不是 JSON".to_string())
     })?;
@@ -529,11 +609,12 @@ async fn continue_chapter(
             text.to_string()
         }
     };
-    let settings = e.db.llm_settings().map_err(err)?;
-    let llm = crate::llm::Llm::new(settings);
+    let settings = e.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings.clone());
     let (sys, usr) = crate::prompts::continue_prompt(&ch.title, &before, chars, &b.instruction);
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
-    Ok(Json(json!({"text": out.trim(), "chars": chars})))
+    record_usage(&e.db, Some(&id), Some(idx), "continue", &settings, &out.usage);
+    Ok(Json(json!({"text": out.text.trim(), "chars": chars})))
 }
 
 #[derive(Deserialize)]
@@ -569,11 +650,12 @@ async fn rewrite_chapter(
     if mode == "revise" && ch.content.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "本章还没有正文，请选择「重新生成」".to_string()));
     }
-    let settings = e.db.llm_settings().map_err(err)?;
-    let llm = crate::llm::Llm::new(settings);
+    let settings = e.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings.clone());
     let (sys, usr) = crate::prompts::rewrite_prompt(mode, &ch.title, &ch.goal, &ch.content, &b.instruction);
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
-    Ok(Json(json!({"text": out.trim(), "mode": mode})))
+    record_usage(&e.db, Some(&id), Some(idx), "rewrite", &settings, &out.usage);
+    Ok(Json(json!({"text": out.text.trim(), "mode": mode})))
 }
 
 /// 单章资料整理（补摘要 / 补台账）；书籍体检的「补齐资料」逐章调用
@@ -589,10 +671,12 @@ async fn extract_chapter(
     if ch.content.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "本章还没有正文，无法整理资料".to_string()));
     }
-    let settings = e.db.llm_settings().map_err(err)?;
-    let llm = crate::llm::Llm::new(settings);
+    let settings = e.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings.clone());
     let (sys, usr) = crate::prompts::extract_prompt(idx, &ch.content);
-    let raw = llm.complete(&sys, &usr).await.map_err(err)?;
+    let out = llm.complete(&sys, &usr).await.map_err(err)?;
+    record_usage(&e.db, Some(&id), Some(idx), "extract", &settings, &out.usage);
+    let raw = out.text;
     let j = crate::llm::extract_json_object(&raw).ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, "整理输出不是 JSON".to_string())
     })?;
@@ -979,4 +1063,94 @@ async fn export_novel(
         ],
         body,
     ))
+}
+
+// ---------- 用量统计 ----------
+
+/// 书籍用量：总计 + 按任务 + 按章节（None = 该口径未知，前端显示「—」）
+async fn usage_summary(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    let totals = e.db.usage_totals(Some(&id)).map_err(err)?;
+    let by_task = e.db.usage_by_task(&id).map_err(err)?;
+    let by_chapter = e.db.usage_by_chapter(&id).map_err(err)?;
+    Ok(Json(json!({
+        "totals": totals,
+        "by_task": by_task,
+        "by_chapter": by_chapter,
+    })))
+}
+
+// ---------- 备份 / 恢复 ----------
+
+/// 导出全量备份（zip：meta.json + ainovel.db 一致性快照）
+async fn backup_db(State(e): State<Arc<Engine>>) -> Result<impl IntoResponse, ApiErr> {
+    let dir = std::env::temp_dir().join(format!("ainovel-backup-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    let zip_path = dir.join("backup.zip");
+    let size = match crate::backup::build_backup_zip(&e.db, &zip_path) {
+        Ok(s) => s,
+        Err(e2) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(err(e2));
+        }
+    };
+    let bytes = std::fs::read(&zip_path).map_err(err)?;
+    let _ = std::fs::remove_dir_all(&dir);
+    let filename = format!(
+        "ainovel-backup-{}.zip",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    );
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/zip".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (header::CONTENT_LENGTH, size.to_string()),
+        ],
+        bytes,
+    ))
+}
+
+/// 恢复备份：覆盖当前全部数据（换机迁移 / 误删回滚）
+async fn restore_db(
+    State(e): State<Arc<Engine>>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if body.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "备份内容为空".to_string()));
+    }
+    let dir = std::env::temp_dir().join(format!("ainovel-restore-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    let zip_path = dir.join("restore.zip");
+    let outcome = (|| -> anyhow::Result<usize> {
+        std::fs::write(&zip_path, &body)?;
+        let db_path = crate::backup::extract_backup_zip(&zip_path, &dir)?;
+        e.db.restore_from_file(&db_path)?;
+        Ok(e.db.list_novels()?.len())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    let novels = outcome.map_err(|e2| (StatusCode::BAD_REQUEST, format!("{e2}")))?;
+    Ok(Json(json!({"ok": true, "novels": novels})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_time_eq_works() {
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "abcd"));
+        assert!(!constant_time_eq("", "a"));
+        assert!(constant_time_eq("", ""));
+        assert!(constant_time_eq("a1b2c3", "a1b2c3"));
+    }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
-use crate::llm::{extract_json_object, Llm};
+use crate::llm::{extract_json_object, record_usage, Llm};
 use crate::models::*;
 use crate::Engine;
 
@@ -79,8 +79,8 @@ async fn run_inner(
     run_id: &str,
     chapters: i64,
 ) -> anyhow::Result<()> {
-    let settings = engine.db.llm_settings()?;
-    let llm = Llm::new(settings);
+    let settings = engine.llm_settings()?;
+    let llm = Llm::new(settings.clone());
 
     // ---- 1) 立项方案 ----
     let mut novel = engine
@@ -93,7 +93,9 @@ async fn run_inner(
             message: "生成立项方案…".into(),
         });
         let (sys, usr) = crate::prompts::brief_prompt(&novel.idea);
-        let raw = llm.complete(&sys, &usr).await?;
+        let out = llm.complete(&sys, &usr).await?;
+        record_usage(&engine.db, Some(novel_id), None, "brief", &settings, &out.usage);
+        let raw = out.text;
         let v = extract_json_object(&raw).ok_or_else(|| {
             anyhow::anyhow!("brief 输出不是 JSON：{}", raw.chars().take(200).collect::<String>())
         })?;
@@ -138,7 +140,9 @@ async fn run_inner(
             .collect();
         let prev_tail = &prev_all[prev_all.len().saturating_sub(5)..];
         let (sys, usr) = crate::prompts::outline_prompt(&brief, from, to, prev_tail);
-        let raw = llm.complete(&sys, &usr).await?;
+        let out = llm.complete(&sys, &usr).await?;
+        record_usage(&engine.db, Some(novel_id), None, "outline", &settings, &out.usage);
+        let raw = out.text;
         let v = extract_json_object(&raw).ok_or_else(|| {
             anyhow::anyhow!("outline 输出不是 JSON：{}", raw.chars().take(200).collect::<String>())
         })?;
@@ -246,7 +250,7 @@ async fn run_inner(
         // 流式输出按 ~80 字聚合后再推送，降低 SSE 事件与前端渲染压力
         let mut buf = String::new();
         let hub = engine.hub.clone();
-        let content = llm
+        let streamed = llm
             .stream(&sys, &usr, |delta: &str| {
                 buf.push_str(delta);
                 if buf.chars().count() >= 80 {
@@ -258,6 +262,8 @@ async fn run_inner(
                 }
             })
             .await?;
+        record_usage(&engine.db, Some(novel_id), Some(idx), "chapter", &settings, &streamed.usage);
+        let content = streamed.text;
         if !buf.is_empty() {
             let chunk = std::mem::take(&mut buf);
             engine.hub.publish(EngineEvent::Token {
@@ -279,7 +285,9 @@ async fn run_inner(
         // 审校：非阻塞 —— 失败只记录日志，不中断生产链
         let (rsys, rusr) = crate::prompts::review_prompt(&content);
         match llm.complete(&rsys, &rusr).await {
-            Ok(raw) => {
+            Ok(out) => {
+                record_usage(&engine.db, Some(novel_id), Some(idx), "review", &settings, &out.usage);
+                let raw = out.text;
                 if let Some(j) = extract_json_object(&raw) {
                     let review = Review {
                         ok: j["ok"].as_bool().unwrap_or(true),
@@ -310,7 +318,9 @@ async fn run_inner(
         // 写后资料整理：抽取角色 / 伏笔台账与章节摘要（非阻塞，失败仅记录日志）
         let (xsys, xusr) = crate::prompts::extract_prompt(idx, &content);
         match llm.complete(&xsys, &xusr).await {
-            Ok(raw) => {
+            Ok(out) => {
+                record_usage(&engine.db, Some(novel_id), Some(idx), "extract", &settings, &out.usage);
+                let raw = out.text;
                 if let Some(j) = extract_json_object(&raw) {
                     let (chars, fores) = apply_extraction(&engine.db, novel_id, idx, &j);
                     engine.hub.publish(EngineEvent::LedgerUpdated {

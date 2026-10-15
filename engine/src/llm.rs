@@ -1,11 +1,17 @@
 use anyhow::{anyhow, Context};
 use futures_util::StreamExt;
 
-use crate::models::LlmSettings;
+use crate::models::{LlmSettings, TokenUsage, UsageRecord};
+
+/// 一次 LLM 调用的返回：文本 + 归一化后的 token 用量
+pub struct LlmOutput {
+    pub text: String,
+    pub usage: TokenUsage,
+}
 
 /// 极简 LLM 客户端：
 /// - provider = "mock"：离线模拟（用于测试 / 无 Key 演示）
-/// - provider = "openai"：任意 OpenAI 兼容 /chat/completions（含流式 SSE）
+/// - provider = "openai"：任意 OpenAI 兼容 /chat/completions（含流式 SSE 与用量解析）
 pub struct Llm {
     settings: LlmSettings,
     http: reqwest::Client,
@@ -25,67 +31,94 @@ impl Llm {
         format!("{}/chat/completions", self.settings.base_url.trim_end_matches('/'))
     }
 
-    pub async fn complete(&self, system: &str, user: &str) -> anyhow::Result<String> {
-        if self.settings.provider == "mock" {
-            return mock_complete(user);
-        }
-        let body = serde_json::json!({
+    fn base_body(&self, system: &str, user: &str, stream: bool) -> serde_json::Value {
+        let mut body = serde_json::json!({
             "model": self.settings.model,
             "temperature": self.settings.temperature,
-            "stream": false,
+            "stream": stream,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user}
             ]
         });
-        let mut req = self.http.post(self.endpoint()).json(&body);
-        if !self.settings.api_key.is_empty() {
-            req = req.bearer_auth(&self.settings.api_key);
+        if stream {
+            // 让兼容实现（OpenAI / DeepSeek 等）在最后一个 chunk 里带回 usage
+            body["stream_options"] = serde_json::json!({"include_usage": true});
         }
-        let resp = req.send().await.context("LLM 请求失败（网络）")?;
+        body
+    }
+
+    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.settings.api_key.is_empty() {
+            req
+        } else {
+            req.bearer_auth(&self.settings.api_key)
+        }
+    }
+
+    /// 非流式补全
+    pub async fn complete(&self, system: &str, user: &str) -> anyhow::Result<LlmOutput> {
+        if self.settings.provider == "mock" {
+            let text = mock_complete(user)?;
+            let usage = mock_usage(system, user, &text);
+            return Ok(LlmOutput { text, usage });
+        }
+        let body = self.base_body(system, user, false);
+        let resp = self
+            .auth(self.http.post(self.endpoint()).json(&body))
+            .send()
+            .await
+            .context("LLM 请求失败（网络）")?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
             return Err(anyhow!("LLM HTTP {}: {}", status, truncate(&text, 300)));
         }
-        let v: serde_json::Value =
-            serde_json::from_str(&text).context("LLM 响应不是 JSON")?;
-        v["choices"][0]["message"]["content"]
+        let v: serde_json::Value = serde_json::from_str(&text).context("LLM 响应不是 JSON")?;
+        let usage = parse_usage(&v);
+        let out = v["choices"][0]["message"]["content"]
             .as_str()
             .map(|s| s.trim().to_string())
-            .ok_or_else(|| anyhow!("LLM 响应缺少 content 字段: {}", truncate(&text, 300)))
+            .ok_or_else(|| anyhow!("LLM 响应缺少 content 字段: {}", truncate(&text, 300)))?;
+        Ok(LlmOutput { text: out, usage })
     }
 
-    /// 流式生成：逐片回调 delta，返回完整文本
+    /// 流式生成：逐片回调 delta，返回完整文本与用量
     pub async fn stream(
         &self,
         system: &str,
         user: &str,
         mut on_delta: impl FnMut(&str) + Send,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<LlmOutput> {
         if self.settings.provider == "mock" {
-            return mock_stream(user, &mut on_delta).await;
+            let text = mock_stream(user, &mut on_delta).await?;
+            let usage = mock_usage(system, user, &text);
+            return Ok(LlmOutput { text, usage });
         }
-        let body = serde_json::json!({
-            "model": self.settings.model,
-            "temperature": self.settings.temperature,
-            "stream": true,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user}
-            ]
-        });
-        let mut req = self.http.post(self.endpoint()).json(&body);
-        if !self.settings.api_key.is_empty() {
-            req = req.bearer_auth(&self.settings.api_key);
+
+        // 部分兼容实现不认 stream_options：遇到 400 去掉该字段重试一次
+        let mut body = self.base_body(system, user, true);
+        let mut resp = self
+            .auth(self.http.post(self.endpoint()).json(&body))
+            .send()
+            .await
+            .context("LLM 流式请求失败（网络）")?;
+        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            body.as_object_mut().map(|m| m.remove("stream_options"));
+            resp = self
+                .auth(self.http.post(self.endpoint()).json(&body))
+                .send()
+                .await
+                .context("LLM 流式重试失败（网络）")?;
         }
-        let resp = req.send().await.context("LLM 流式请求失败（网络）")?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             return Err(anyhow!("LLM HTTP {}: {}", status, truncate(&text, 300)));
         }
+
         let mut acc = String::new();
+        let mut usage = TokenUsage::default();
         let mut buf = String::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -106,17 +139,119 @@ impl Llm {
                             on_delta(delta);
                         }
                     }
+                    // 末尾 chunk 通常 choices 为空、只带 usage
+                    let u = parse_usage(&v);
+                    if u != TokenUsage::default() {
+                        usage = u;
+                    }
                 }
             }
         }
         if acc.trim().is_empty() {
             return Err(anyhow!("LLM 流式输出为空（模型未返回内容）"));
         }
-        Ok(acc)
+        Ok(LlmOutput { text: acc, usage })
+    }
+}
+
+/// 把不同厂商的 usage 结构归一化为 TokenUsage。
+/// - OpenAI 系：`prompt_tokens` 已包含缓存命中部分（`prompt_tokens_details.cached_tokens`）；
+///   DeepSeek 额外提供 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`。
+/// - Anthropic 系：`input_tokens` 不含缓存读写，需加上 `cache_read_*` / `cache_creation_*`。
+/// 不变量：input = cache_hit + cache_miss（两者已知时）；total = input + output。
+pub fn parse_usage(v: &serde_json::Value) -> TokenUsage {
+    let u = &v["usage"];
+    if !u.is_object() {
+        return TokenUsage::default();
+    }
+    let n = |p: &str| u[p].as_i64();
+
+    // ① OpenAI / DeepSeek 形态：prompt_tokens 为输入总量
+    if let Some(input) = n("prompt_tokens") {
+        let hit = u["prompt_tokens_details"]["cached_tokens"]
+            .as_i64()
+            .or_else(|| n("prompt_cache_hit_tokens"))
+            .map(|h| h.clamp(0, input));
+        let miss = n("prompt_cache_miss_tokens")
+            .or_else(|| hit.map(|h| input - h))
+            .map(|m| m.clamp(0, input));
+        let output = n("completion_tokens");
+        let total = n("total_tokens").or_else(|| output.map(|o| input + o));
+        return TokenUsage {
+            input: Some(input),
+            output,
+            cache_hit: hit,
+            cache_miss: miss,
+            total,
+        };
+    }
+
+    // ② Anthropic 形态：input_tokens 是不含缓存的“新鲜”输入
+    if let Some(fresh) = n("input_tokens") {
+        let read = n("cache_read_input_tokens").unwrap_or(0);
+        let creation = n("cache_creation_input_tokens").unwrap_or(0);
+        let input = fresh + read + creation;
+        let output = n("output_tokens");
+        let total = n("total_tokens").or_else(|| output.map(|o| input + o));
+        return TokenUsage {
+            input: Some(input),
+            output,
+            cache_hit: n("cache_read_input_tokens"),
+            cache_miss: Some(fresh + creation),
+            total,
+        };
+    }
+
+    // ③ 只有总量
+    TokenUsage {
+        total: n("total_tokens"),
+        ..TokenUsage::default()
+    }
+}
+
+/// 记录一次调用的用量（失败仅记录日志，不阻断创作）
+pub fn record_usage(
+    db: &crate::db::Db,
+    novel_id: Option<&str>,
+    chapter_idx: Option<i64>,
+    task: &str,
+    settings: &LlmSettings,
+    usage: &TokenUsage,
+) {
+    let rec = UsageRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        novel_id: novel_id.map(|s| s.to_string()),
+        chapter_idx,
+        task: task.to_string(),
+        provider: settings.provider.clone(),
+        model: settings.model.clone(),
+        input: usage.input,
+        output: usage.output,
+        cache_hit: usage.cache_hit,
+        cache_miss: usage.cache_miss,
+        total: usage.total,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Err(e) = db.insert_usage(&rec) {
+        tracing::warn!("record usage failed: {e:#}");
     }
 }
 
 // ---------------- mock provider ----------------
+
+/// mock 模式下给出确定性的用量，便于端到端校验统计口径
+fn mock_usage(system: &str, user: &str, text: &str) -> TokenUsage {
+    let input = ((system.chars().count() + user.chars().count()) / 2) as i64;
+    let output = (text.chars().count() / 2) as i64;
+    let hit = input / 2;
+    TokenUsage {
+        input: Some(input),
+        output: Some(output),
+        cache_hit: Some(hit),
+        cache_miss: Some(input - hit),
+        total: Some(input + output),
+    }
+}
 
 fn mock_complete(user: &str) -> anyhow::Result<String> {
     if user.contains("TASK:brief") {
@@ -325,6 +460,7 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn extracts_json_from_fenced_text() {
@@ -338,5 +474,102 @@ mod tests {
     fn mock_brief_has_marker() {
         let out = mock_complete("TASK:brief\n想法：深海与鲸歌\n").unwrap();
         assert!(out.contains("title"));
+    }
+
+    // ---------- 用量解析（核心口径） ----------
+
+    #[test]
+    fn usage_missing_is_unknown_not_zero() {
+        assert_eq!(parse_usage(&json!({})), TokenUsage::default());
+        assert_eq!(parse_usage(&json!({"usage": null})), TokenUsage::default());
+        let u = parse_usage(&json!({"usage": {}}));
+        assert_eq!(u.input, None, "缺字段必须是未知，而不是 0");
+        assert_eq!(u.total, None);
+    }
+
+    #[test]
+    fn usage_openai_basic() {
+        let u = parse_usage(&json!({"usage": {"prompt_tokens": 100, "completion_tokens": 50}}));
+        assert_eq!(u.input, Some(100));
+        assert_eq!(u.output, Some(50));
+        assert_eq!(u.cache_hit, None, "未提供缓存字段 → 未知");
+        assert_eq!(u.total, Some(150), "total = input + output");
+    }
+
+    #[test]
+    fn usage_openai_cached_details() {
+        let u = parse_usage(&json!({"usage": {
+            "prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100,
+            "prompt_tokens_details": {"cached_tokens": 800}
+        }}));
+        assert_eq!(u.input, Some(1000));
+        assert_eq!(u.cache_hit, Some(800));
+        assert_eq!(u.cache_miss, Some(200), "未命中 = 输入总量 - 命中");
+        assert_eq!(u.total, Some(1100));
+        assert_eq!(u.total, Some(u.input.unwrap() + u.output.unwrap()));
+        assert_eq!(u.input, Some(u.cache_hit.unwrap() + u.cache_miss.unwrap()));
+    }
+
+    #[test]
+    fn usage_deepseek_hit_miss_pair() {
+        let u = parse_usage(&json!({"usage": {
+            "prompt_tokens": 1000, "completion_tokens": 80,
+            "prompt_cache_hit_tokens": 900, "prompt_cache_miss_tokens": 100
+        }}));
+        assert_eq!(u.cache_hit, Some(900));
+        assert_eq!(u.cache_miss, Some(100));
+        assert_eq!(u.total, Some(1080));
+    }
+
+    #[test]
+    fn usage_anthropic_normalizes_cache() {
+        // Anthropic：input_tokens 不含缓存读写
+        let u = parse_usage(&json!({"usage": {
+            "input_tokens": 80, "output_tokens": 30,
+            "cache_read_input_tokens": 900, "cache_creation_input_tokens": 20
+        }}));
+        assert_eq!(u.input, Some(1000), "输入总量 = 新鲜 + 读缓存 + 建缓存");
+        assert_eq!(u.cache_hit, Some(900));
+        assert_eq!(u.cache_miss, Some(100), "未命中含新写入缓存");
+        assert_eq!(u.total, Some(1030));
+    }
+
+    #[test]
+    fn usage_clamps_inconsistent_cached() {
+        let u = parse_usage(&json!({"usage": {
+            "prompt_tokens": 500, "completion_tokens": 10,
+            "prompt_tokens_details": {"cached_tokens": 800}
+        }}));
+        assert_eq!(u.cache_hit, Some(500), "命中数不得超过输入总量");
+        assert_eq!(u.cache_miss, Some(0));
+    }
+
+    #[test]
+    fn usage_only_total() {
+        let u = parse_usage(&json!({"usage": {"total_tokens": 42}}));
+        assert_eq!(u.total, Some(42));
+        assert_eq!(u.input, None);
+        assert_eq!(u.output, None);
+    }
+
+    #[test]
+    fn usage_stream_final_chunk() {
+        // 流式结尾 chunk：choices 为空、只带 usage
+        let chunk = json!({"choices": [], "usage": {"prompt_tokens": 300, "completion_tokens": 200,
+            "prompt_tokens_details": {"cached_tokens": 100}}});
+        let u = parse_usage(&chunk);
+        assert_eq!(u.input, Some(300));
+        assert_eq!(u.output, Some(200));
+        assert_eq!(u.cache_hit, Some(100));
+        assert_eq!(u.cache_miss, Some(200));
+        assert_eq!(u.total, Some(500));
+    }
+
+    #[test]
+    fn mock_usage_is_consistent() {
+        let u = mock_usage("sys", "user prompt", "generated text");
+        assert_eq!(u.total, Some(u.input.unwrap() + u.output.unwrap()));
+        assert_eq!(u.input, Some(u.cache_hit.unwrap() + u.cache_miss.unwrap()));
+        assert!(u.cache_hit.unwrap() <= u.input.unwrap());
     }
 }

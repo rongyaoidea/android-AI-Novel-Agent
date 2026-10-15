@@ -112,6 +112,22 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_runs_novel ON runs(novel_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_characters_novel ON characters(novel_id, updated_at);
             CREATE INDEX IF NOT EXISTS idx_foreshadowings_novel ON foreshadowings(novel_id, status);
+            CREATE TABLE IF NOT EXISTS llm_usage (
+                id                TEXT PRIMARY KEY,
+                novel_id          TEXT,
+                chapter_idx       INTEGER,
+                task              TEXT NOT NULL,
+                provider          TEXT NOT NULL,
+                model             TEXT NOT NULL,
+                input_tokens      INTEGER,
+                output_tokens     INTEGER,
+                cache_hit_tokens  INTEGER,
+                cache_miss_tokens INTEGER,
+                total_tokens      INTEGER,
+                created_at        TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_usage_novel ON llm_usage(novel_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_usage_task ON llm_usage(novel_id, task);
             "#,
         )?;
         // 旧库升级：补 novels.mode 列
@@ -877,5 +893,118 @@ impl Db {
         ids.swap(idx as usize - 1, target as usize - 1);
         Self::write_order(&conn, novel_id, &ids)?;
         Ok(true)
+    }
+
+    // ---------- LLM 用量 ----------
+
+    pub fn insert_usage(&self, r: &UsageRecord) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO llm_usage(id, novel_id, chapter_idx, task, provider, model,
+                 input_tokens, output_tokens, cache_hit_tokens, cache_miss_tokens, total_tokens, created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                r.id, r.novel_id, r.chapter_idx, r.task, r.provider, r.model,
+                r.input, r.output, r.cache_hit, r.cache_miss, r.total, r.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn map_usage_totals(row: &Row<'_>, offset: usize) -> rusqlite::Result<UsageTotals> {
+        Ok(UsageTotals {
+            calls: row.get(offset)?,
+            known_input: row.get(offset + 1)?,
+            input: row.get(offset + 2)?,
+            output: row.get(offset + 3)?,
+            cache_hit: row.get(offset + 4)?,
+            cache_miss: row.get(offset + 5)?,
+            total: row.get(offset + 6)?,
+        })
+    }
+
+    /// 汇总（novel_id=None 时统计全部；SUM 为 NULL 表示全部记录都缺该字段 → 未知）
+    pub fn usage_totals(&self, novel_id: Option<&str>) -> anyhow::Result<UsageTotals> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT COUNT(*), COUNT(input_tokens), SUM(input_tokens), SUM(output_tokens),
+                    SUM(cache_hit_tokens), SUM(cache_miss_tokens), SUM(total_tokens)
+             FROM llm_usage WHERE (?1 IS NULL OR novel_id = ?1)",
+            params![novel_id],
+            |r| Self::map_usage_totals(r, 0),
+        )?;
+        Ok(row)
+    }
+
+    pub fn usage_by_task(&self, novel_id: &str) -> anyhow::Result<Vec<UsageGroup>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT task, COUNT(*), COUNT(input_tokens), SUM(input_tokens), SUM(output_tokens),
+                    SUM(cache_hit_tokens), SUM(cache_miss_tokens), SUM(total_tokens)
+             FROM llm_usage WHERE novel_id=?1
+             GROUP BY task ORDER BY COALESCE(SUM(total_tokens), 0) DESC, task ASC",
+        )?;
+        let rows = stmt.query_map([novel_id], |r| {
+            Ok(UsageGroup {
+                key: r.get(0)?,
+                totals: Self::map_usage_totals(r, 1)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for x in rows {
+            out.push(x?);
+        }
+        Ok(out)
+    }
+
+    pub fn usage_by_chapter(&self, novel_id: &str) -> anyhow::Result<Vec<UsageGroup>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chapter_idx, COUNT(*), COUNT(input_tokens), SUM(input_tokens), SUM(output_tokens),
+                    SUM(cache_hit_tokens), SUM(cache_miss_tokens), SUM(total_tokens)
+             FROM llm_usage WHERE novel_id=?1 AND chapter_idx IS NOT NULL
+             GROUP BY chapter_idx ORDER BY chapter_idx ASC",
+        )?;
+        let rows = stmt.query_map([novel_id], |r| {
+            let idx: i64 = r.get(0)?;
+            Ok(UsageGroup {
+                key: format!("第{idx}章"),
+                totals: Self::map_usage_totals(r, 1)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for x in rows {
+            out.push(x?);
+        }
+        Ok(out)
+    }
+
+    // ---------- 备份 / 恢复 ----------
+
+    /// 生成一致性快照（VACUUM INTO）
+    pub fn vacuum_into(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute("VACUUM INTO ?1", [path.to_string_lossy().to_string()])?;
+        Ok(())
+    }
+
+    /// 用备份文件覆盖当前数据库（SQLite backup API，进程内完成，无需重启）
+    pub fn restore_from_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        let src = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        {
+            let mut dst = self.conn.lock().unwrap();
+            let backup = rusqlite::backup::Backup::new(&src, &mut dst)?;
+            backup.run_to_completion(
+                1000,
+                std::time::Duration::from_millis(0),
+                None::<fn(rusqlite::backup::Progress)>,
+            )?;
+        }
+        // 恢复后补跑轻量迁移（兼容更早版本的备份）
+        self.migrate()?;
+        Ok(())
     }
 }

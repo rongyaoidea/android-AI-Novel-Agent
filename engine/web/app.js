@@ -41,8 +41,38 @@ function ic(name, cls = "ic") {
   return `<svg class="${cls}"><use href="#${name}"/></svg>`;
 }
 
+/* ---------------- 本地访问令牌 ----------------
+ * 来源优先级：URL ?token=（Android 壳注入）→ sessionStorage 暂存。
+ * 之后所有 /api 请求带 x-ainovel-token 头；EventSource / 下载链接走 ?token=。
+ * 令牌只在本机会话里流转，不写入 localStorage，也不回写地址栏。
+ */
+const TOKEN_KEY = "ainovel.token";
+const AUTH_TOKEN = (() => {
+  try {
+    const t = new URLSearchParams(location.search).get("token");
+    if (t) {
+      sessionStorage.setItem(TOKEN_KEY, t);
+      const clean = location.pathname + (location.hash || "#/shelf");
+      history.replaceState(null, "", clean);
+      return t;
+    }
+    return sessionStorage.getItem(TOKEN_KEY) || "";
+  } catch {
+    return "";
+  }
+})();
+
+/** 给无法加请求头的 URL 追加令牌（EventSource、a[download]） */
+function withToken(path) {
+  if (!AUTH_TOKEN) return path;
+  return path + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(AUTH_TOKEN);
+}
+
 async function api(path, opts) {
-  const r = await fetch(path, opts);
+  const o = Object.assign({}, opts);
+  o.headers = Object.assign({}, o.headers);
+  if (AUTH_TOKEN) o.headers["x-ainovel-token"] = AUTH_TOKEN;
+  const r = await fetch(path, o);
   if (!r.ok) throw new Error((await r.text()) || r.statusText);
   return r.json();
 }
@@ -373,7 +403,7 @@ function renderNovel() {
   if (!$("#novel-target").dataset.touched) {
     $("#novel-target").value = Math.max(chs.length, target);
   }
-  $("#novel-export").href = `/api/novels/${n.id}/export`;
+  $("#novel-export").href = withToken(`/api/novels/${n.id}/export`);
 
   const running = !!(run && run.status === "running");
   const paused = !!(run && run.status === "paused");
@@ -499,6 +529,58 @@ async function fillMissing() {
   } finally {
     btn.disabled = false;
   }
+}
+
+/* ---------------- AI 用量 ---------------- */
+
+const USAGE_TASK_LABEL = {
+  brief: "立项方案",
+  outline: "章节规划",
+  chapter: "正文生成",
+  review: "章节审校",
+  polish: "选段修文",
+  continue: "光标续写",
+  rewrite: "重写本章",
+  extract: "资料整理",
+  test: "连通测试",
+};
+
+function fmtTokens(v) {
+  if (v === null || v === undefined) return "—";
+  return String(v);
+}
+
+async function openUsage() {
+  const u = await api(`/api/novels/${state.novelId}/usage`);
+  const t = u.totals || {};
+  const hitRate =
+    t.input && t.cache_hit !== null && t.cache_hit !== undefined
+      ? `（${Math.round((t.cache_hit / t.input) * 100)}%）`
+      : "";
+  $("#usage-stats").innerHTML = [
+    `<span class="chip">调用 ${t.calls || 0} 次</span>`,
+    `<span class="chip">输入 ${fmtTokens(t.input)}</span>`,
+    `<span class="chip ${t.cache_hit ? "chip-success" : ""}">缓存命中 ${fmtTokens(t.cache_hit)}${hitRate}</span>`,
+    `<span class="chip">未命中 ${fmtTokens(t.cache_miss)}</span>`,
+    `<span class="chip">输出 ${fmtTokens(t.output)}</span>`,
+    `<span class="chip chip-dark">合计 ${fmtTokens(t.total)}</span>`,
+  ].join("");
+  const row = (key, g) => `
+    <tr>
+      <td>${esc(key)}</td>
+      <td class="num">${g.calls}</td>
+      <td class="num">${fmtTokens(g.input)}</td>
+      <td class="num">${fmtTokens(g.cache_hit)}</td>
+      <td class="num">${fmtTokens(g.cache_miss)}</td>
+      <td class="num">${fmtTokens(g.output)}</td>
+      <td class="num">${fmtTokens(g.total)}</td>
+    </tr>`;
+  const empty = `<tr><td colspan="7" class="muted">暂无记录</td></tr>`;
+  $("#usage-task-rows").innerHTML =
+    (u.by_task || []).map((g) => row(USAGE_TASK_LABEL[g.key] || g.key, g)).join("") || empty;
+  $("#usage-chapter-rows").innerHTML =
+    (u.by_chapter || []).map((g) => row(g.key, g)).join("") || empty;
+  $("#usage-backdrop").hidden = false;
 }
 
 function renderChapters() {
@@ -721,6 +803,8 @@ function bindNovel() {
   $("#novel-health").onclick = () => openHealth().catch((err) => toast(err.message, true));
   $("#health-close").onclick = () => { $("#health-backdrop").hidden = true; };
   $("#health-fill").onclick = () => fillMissing().catch((err) => toast(err.message, true));
+  $("#novel-usage").onclick = () => openUsage().catch((err) => toast(err.message, true));
+  $("#usage-close").onclick = () => { $("#usage-backdrop").hidden = true; };
   $("#stream-clear").onclick = () => {
     state.stream = { chapter: null, text: "" };
     const pre = $("#stream-pre");
@@ -1242,7 +1326,7 @@ function subscribe(id) {
   preStream.textContent = "等待生成…";
   preStream.classList.add("muted");
   $("#stream-live").classList.remove("on");
-  const es = new EventSource(`/api/novels/${id}/events`);
+  const es = new EventSource(withToken(`/api/novels/${id}/events`));
   state.es = es;
   es.addEventListener("engine", (e) => {
     let ev;
@@ -1382,6 +1466,8 @@ async function loadSettingsForm() {
   $("#set-temp").value = typeof s.temperature === "number" ? Math.round(s.temperature * 100) / 100 : 0.8;
   syncProviderFields();
   $("#set-status").textContent = "";
+  const backup = $("#set-backup");
+  if (backup) backup.href = withToken("/api/backup");
 }
 
 function bindSettings() {
@@ -1406,6 +1492,36 @@ function bindSettings() {
   });
 
   $("#set-provider").addEventListener("change", syncProviderFields);
+
+  // 恢复备份：选文件 → 二次确认 → POST 原始 zip → 刷新全量数据
+  $("#set-restore").onclick = () => {
+    $("#set-backup-status").textContent = "";
+    $("#set-restore-file").value = "";
+    $("#set-restore-file").click();
+  };
+  $("#set-restore-file").addEventListener("change", async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (!confirm(`用「${file.name}」恢复？当前全部作品与章节将被覆盖，且无法撤销。`)) return;
+    const status = $("#set-backup-status");
+    status.textContent = "恢复中…";
+    try {
+      const o = { method: "POST", headers: { "content-type": "application/zip" }, body: file };
+      if (AUTH_TOKEN) o.headers["x-ainovel-token"] = AUTH_TOKEN;
+      const r = await fetch("/api/restore", o);
+      const text = await r.text();
+      if (!r.ok) throw new Error(text || r.statusText);
+      const info = JSON.parse(text);
+      status.textContent = `已恢复 ${info.novels} 部作品`;
+      toast("恢复完成");
+      await loadSettings();
+      location.hash = "#/shelf";
+      route().catch((e2) => toast(e2.message, true));
+    } catch (err) {
+      status.textContent = "恢复失败：" + err.message;
+      toast("恢复失败：" + err.message, true);
+    }
+  });
 
   $("#set-test").onclick = async () => {
     $("#set-status").textContent = "测试中…";
