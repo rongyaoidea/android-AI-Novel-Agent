@@ -1,12 +1,17 @@
 package com.ainovel.engine
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import java.net.InetSocketAddress
 import java.net.Socket
 
@@ -31,8 +36,18 @@ class MainActivity : AppCompatActivity() {
         }
         web.webViewClient = WebViewClient()
 
+        requestNotificationPermission()
         startForegroundService(Intent(this, EngineService::class.java))
         pollAndLoad(0)
+    }
+
+    /** Android 13+ 需要运行时授权才能显示「创作进度」通知 */
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
+        }
     }
 
     private fun pollAndLoad(attempt: Int) {

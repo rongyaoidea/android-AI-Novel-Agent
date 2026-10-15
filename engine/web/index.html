@@ -75,13 +75,16 @@
               <input id="create-chapters" type="number" min="1" max="50" value="3" />
             </div>
             <div class="field">
-              <label>当前模型</label>
-              <div class="static-value" id="create-model">—</div>
+              <label for="create-mode">推进方式</label>
+              <select id="create-mode">
+                <option value="auto">全自动推进</option>
+                <option value="staged">按阶段确认（规划后暂停）</option>
+              </select>
             </div>
           </div>
           <div class="row">
             <button class="btn btn-primary" type="submit" id="create-submit">开始创作</button>
-            <span class="muted">AI 会先生成方案与规划，再逐章写作；可在「模型设置」中切换模型。</span>
+            <span class="muted" id="create-hint">当前模型：—（可在「模型设置」中调整）</span>
           </div>
         </form>
       </section>
@@ -105,6 +108,7 @@
         <div class="panel">
           <div class="panel-head">
             <h3 class="panel-title">创作进度</h3>
+            <div class="chips" id="mode-toggle"></div>
             <span class="chips" id="run-chips"></span>
           </div>
           <div class="progress"><div class="progress-fill" id="run-progress"></div></div>
@@ -126,14 +130,45 @@
           </div>
         </div>
 
-        <div class="panel">
-          <div class="panel-head"><h3 class="panel-title">章节</h3></div>
+        <div class="chips" id="novel-tabs">
+          <span class="chip chip-filter chip-dark" data-tab="chapters">章节</span>
+          <span class="chip chip-filter" data-tab="characters">角色</span>
+          <span class="chip chip-filter" data-tab="foreshadowings">伏笔</span>
+        </div>
+
+        <div class="panel" id="tab-chapters">
           <div class="table-wrap">
             <table class="table">
               <thead>
                 <tr><th>#</th><th>标题</th><th>状态</th><th>字数</th><th>审校</th><th></th></tr>
               </thead>
               <tbody id="chapter-rows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel" id="tab-characters" hidden>
+          <div class="panel-head">
+            <h3 class="panel-title">角色台账</h3>
+            <button class="btn btn-outline btn-sm" id="add-character">新增角色</button>
+          </div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>角色</th><th>定位</th><th>状态</th><th>关键事实（写后自动整理）</th><th></th></tr></thead>
+              <tbody id="character-rows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel" id="tab-foreshadowings" hidden>
+          <div class="panel-head">
+            <h3 class="panel-title">伏笔台账</h3>
+            <button class="btn btn-outline btn-sm" id="add-foreshadowing">新增伏笔</button>
+          </div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>伏笔</th><th>状态</th><th>埋下</th><th>回收</th><th>备注</th><th></th></tr></thead>
+              <tbody id="foreshadow-rows"></tbody>
             </table>
           </div>
         </div>
@@ -198,7 +233,7 @@
   </div>
 </div>
 
-<!-- 章节阅读浮层 -->
+<!-- 章节编辑器（阅读 + 编辑 + 选段 AI 修文） -->
 <div class="dialog-backdrop" id="reader-backdrop" hidden>
   <div class="dialog">
     <div class="dialog-head">
@@ -207,7 +242,53 @@
     </div>
     <div class="chips" id="reader-review"></div>
     <p class="muted" id="reader-goal" style="margin:0;"></p>
-    <pre class="reader-content" id="reader-content"></pre>
+    <div class="reader-toolbar">
+      <button class="btn btn-primary btn-sm" id="reader-save" disabled>保存修改</button>
+      <span class="muted">AI 修文（先选中一段）：</span>
+      <button class="btn btn-outline btn-sm" data-polish="rewrite">改写</button>
+      <button class="btn btn-outline btn-sm" data-polish="expand">扩写</button>
+      <button class="btn btn-outline btn-sm" data-polish="shrink">精简</button>
+      <button class="btn btn-outline btn-sm" data-polish="depolish">去 AI 味</button>
+      <input id="polish-instruction" class="input-polish" placeholder="附加要求（可选）" />
+    </div>
+    <textarea id="reader-content" class="editor-area" spellcheck="false"></textarea>
+  </div>
+</div>
+
+<!-- 修文预览（原文 / 修改后对比） -->
+<div class="dialog-backdrop" id="diff-backdrop" hidden>
+  <div class="dialog" style="width:min(760px,94vw);">
+    <div class="dialog-head">
+      <h3 id="diff-title">AI 修文预览</h3>
+      <span class="chips"><span class="chip chip-info" id="diff-mode"></span></span>
+    </div>
+    <div class="diff-pane">
+      <div class="diff-label muted">原文</div>
+      <pre id="diff-original"></pre>
+    </div>
+    <div class="diff-pane">
+      <div class="diff-label muted">修改后</div>
+      <pre id="diff-revised"></pre>
+    </div>
+    <div class="row">
+      <button class="btn btn-primary" id="diff-apply">应用修改</button>
+      <button class="btn btn-outline" id="diff-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 通用表单弹层（角色 / 伏笔 / 章纲） -->
+<div class="dialog-backdrop" id="form-backdrop" hidden>
+  <div class="dialog" style="width:min(560px,94vw);">
+    <div class="dialog-head">
+      <h3 id="form-title">编辑</h3>
+      <button class="btn btn-ghost" id="form-close">关闭</button>
+    </div>
+    <div id="form-fields"></div>
+    <div class="row">
+      <button class="btn btn-primary" id="form-save">保存</button>
+      <button class="btn btn-outline" id="form-cancel">取消</button>
+    </div>
   </div>
 </div>
 

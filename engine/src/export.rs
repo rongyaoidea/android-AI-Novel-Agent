@@ -39,6 +39,7 @@ mod tests {
             style: "基调".into(),
             book_outline: "走向".into(),
             status: "drafted".into(),
+            mode: "auto".into(),
             created_at: "t".into(),
             updated_at: "t".into(),
         };

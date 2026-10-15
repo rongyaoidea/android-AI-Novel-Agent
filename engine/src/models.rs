@@ -12,6 +12,35 @@ pub struct Novel {
     pub style: String,
     pub book_outline: String,
     pub status: String,
+    /// "auto"（全自动）| "staged"（按阶段确认）
+    pub mode: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 角色台账（由每章写后自动抽取，也可手动维护）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Character {
+    pub id: String,
+    pub novel_id: String,
+    pub name: String,
+    pub role: String,
+    pub status: String,
+    pub facts: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 伏笔台账（open：未回收 / resolved：已回收）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Foreshadowing {
+    pub id: String,
+    pub novel_id: String,
+    pub title: String,
+    pub status: String,
+    pub planted_chapter: i64,
+    pub resolved_chapter: Option<i64>,
+    pub notes: String,
     pub created_at: String,
     pub updated_at: String,
 }

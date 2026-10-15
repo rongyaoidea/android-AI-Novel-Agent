@@ -20,6 +20,10 @@ fn err(e: impl std::fmt::Display) -> ApiErr {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
 }
 
+fn not_found(what: &str) -> ApiErr {
+    (StatusCode::NOT_FOUND, format!("{what} not found"))
+}
+
 pub fn build_router(engine: Arc<Engine>) -> Router {
     Router::new()
         .route("/", get(index))
@@ -29,11 +33,26 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/settings/llm", get(get_llm).put(put_llm))
         .route("/api/settings/llm/test", post(test_llm))
         .route("/api/novels", get(list_novels).post(create_novel))
-        .route("/api/novels/:id", get(get_novel).delete(delete_novel))
-        .route("/api/novels/:id/chapters/:idx", get(get_chapter))
+        .route("/api/novels/:id", get(get_novel).patch(patch_novel).delete(delete_novel))
+        .route("/api/novels/:id/chapters/:idx", get(get_chapter).put(edit_chapter))
+        .route("/api/novels/:id/chapters/:idx/plan", axum::routing::put(edit_plan))
+        .route("/api/novels/:id/chapters/:idx/polish", post(polish_chapter))
         .route("/api/novels/:id/run", post(run_novel))
         .route("/api/novels/:id/events", get(events))
         .route("/api/novels/:id/export", get(export_novel))
+        .route("/api/novels/:id/characters", get(list_characters).post(add_character))
+        .route(
+            "/api/novels/:id/characters/:cid",
+            axum::routing::put(update_character).delete(delete_character),
+        )
+        .route(
+            "/api/novels/:id/foreshadowings",
+            get(list_foreshadowings).post(add_foreshadowing),
+        )
+        .route(
+            "/api/novels/:id/foreshadowings/:fid",
+            axum::routing::put(update_foreshadowing).delete(delete_foreshadowing),
+        )
         .route("/api/runs", get(list_runs))
         .with_state(engine)
 }
@@ -108,6 +127,8 @@ struct CreateNovelBody {
     idea: String,
     #[serde(default = "default_chapters")]
     chapters: i64,
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 fn default_chapters() -> i64 {
@@ -122,7 +143,8 @@ async fn create_novel(
     if idea.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "idea 不能为空".to_string()));
     }
-    let novel = e.db.create_novel(idea).map_err(err)?;
+    let mode = b.mode.as_deref().unwrap_or("auto");
+    let novel = e.db.create_novel(idea, mode).map_err(err)?;
     let run_id = pipeline::spawn(e.clone(), &novel.id, b.chapters.clamp(1, 50)).map_err(err)?;
     Ok(Json(json!({"novel_id": novel.id, "run_id": run_id})))
 }
@@ -140,7 +162,7 @@ async fn get_novel(
         .db
         .get_novel(&id)
         .map_err(err)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "novel not found".to_string()))?;
+        .ok_or_else(|| not_found("novel"))?;
     let chapters = e.db.list_chapters(&id).map_err(err)?;
     let run = e.db.latest_run(&id).map_err(err)?;
     let chapters_json: Vec<serde_json::Value> = chapters
@@ -161,16 +183,39 @@ async fn get_novel(
     Ok(Json(json!({"novel": novel, "chapters": chapters_json, "run": run})))
 }
 
+#[derive(Deserialize)]
+struct PatchNovelBody {
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+async fn patch_novel(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(b): Json<PatchNovelBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    if let Some(mode) = b.mode.as_deref() {
+        let m = if mode == "staged" { "staged" } else { "auto" };
+        e.db.set_novel_mode(&id, m).map_err(err)?;
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
 async fn delete_novel(
     State(e): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
     let ok = e.db.delete_novel(&id).map_err(err)?;
     if !ok {
-        return Err((StatusCode::NOT_FOUND, "novel not found".to_string()));
+        return Err(not_found("novel"));
     }
     Ok(Json(json!({"ok": true})))
 }
+
+// ---------- 章节 ----------
 
 async fn get_chapter(
     State(e): State<Arc<Engine>>,
@@ -180,7 +225,7 @@ async fn get_chapter(
         .db
         .get_chapter(&id, idx)
         .map_err(err)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "chapter not found".to_string()))?;
+        .ok_or_else(|| not_found("chapter"))?;
     Ok(Json(json!({
         "idx": ch.idx,
         "title": ch.title,
@@ -194,6 +239,120 @@ async fn get_chapter(
 }
 
 #[derive(Deserialize)]
+struct EditChapterBody {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// 手动编辑正文 / 标题；写入正文即视为定稿（流水线不再覆盖）。
+async fn edit_chapter(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx)): Path<(String, i64)>,
+    Json(b): Json<EditChapterBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if b.content.is_none() && b.title.is_none() {
+        return Err((StatusCode::BAD_REQUEST, "需要提供 content 或 title".to_string()));
+    }
+    let ch = e
+        .db
+        .get_chapter(&id, idx)
+        .map_err(err)?
+        .ok_or_else(|| not_found("chapter"))?;
+    let running = matches!(e.db.latest_run(&id).map_err(err)?, Some(r) if r.status == "running");
+    if running && ch.status != "done" {
+        return Err((
+            StatusCode::CONFLICT,
+            "本章正在生成中，完成后即可编辑。".to_string(),
+        ));
+    }
+    let title = b
+        .title
+        .as_ref()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    e.db.save_chapter_edit(&id, idx, b.content.as_deref(), title.as_deref())
+        .map_err(err)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct PlanBody {
+    title: String,
+    #[serde(default)]
+    goal: String,
+    #[serde(default)]
+    beats: Vec<String>,
+}
+
+/// 编辑章节规划（仅限尚未开写的章节）——供"按阶段确认"时人工调整章纲。
+async fn edit_plan(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx)): Path<(String, i64)>,
+    Json(b): Json<PlanBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let title = b.title.trim();
+    if title.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "标题不能为空".to_string()));
+    }
+    let ch = e
+        .db
+        .get_chapter(&id, idx)
+        .map_err(err)?
+        .ok_or_else(|| not_found("chapter"))?;
+    if ch.status != "planned" {
+        return Err((
+            StatusCode::CONFLICT,
+            "已开写的章节不能修改规划（标题可单独编辑）。".to_string(),
+        ));
+    }
+    e.db.update_chapter_plan(&id, idx, title, b.goal.trim(), &b.beats)
+        .map_err(err)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct PolishBody {
+    mode: String,
+    selection: String,
+    #[serde(default)]
+    instruction: String,
+}
+
+/// 选段修文：rewrite / expand / shrink / depolish。只返回修改稿，由前端确认后自行保存。
+async fn polish_chapter(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx)): Path<(String, i64)>,
+    Json(b): Json<PolishBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let ch = e
+        .db
+        .get_chapter(&id, idx)
+        .map_err(err)?
+        .ok_or_else(|| not_found("chapter"))?;
+    let sel = b.selection.trim();
+    let len = sel.chars().count();
+    if len < 8 {
+        return Err((StatusCode::BAD_REQUEST, "请先选中至少 8 个字的内容".to_string()));
+    }
+    if len > 4000 {
+        return Err((StatusCode::BAD_REQUEST, "选中内容过长（>4000 字），请分段精修".to_string()));
+    }
+    let mode = match b.mode.as_str() {
+        "expand" | "shrink" | "depolish" | "rewrite" => b.mode.clone(),
+        _ => "rewrite".to_string(),
+    };
+    let settings = e.db.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings);
+    let (sys, usr) = crate::prompts::polish_prompt(&mode, sel, &ch.title, &b.instruction);
+    let revised = llm.complete(&sys, &usr).await.map_err(err)?;
+    Ok(Json(json!({"revised": revised.trim(), "mode": mode})))
+}
+
+// ---------- 创作运行 ----------
+
+#[derive(Deserialize)]
 struct RunBody {
     #[serde(default = "default_chapters")]
     chapters: i64,
@@ -205,7 +364,7 @@ async fn run_novel(
     Json(b): Json<RunBody>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
     if e.db.get_novel(&id).map_err(err)?.is_none() {
-        return Err((StatusCode::NOT_FOUND, "novel not found".to_string()));
+        return Err(not_found("novel"));
     }
     if let Some(run) = e.db.latest_run(&id).map_err(err)? {
         if run.status == "running" {
@@ -245,6 +404,154 @@ async fn events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+// ---------- 角色台账 ----------
+
+async fn list_characters(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let items = e.db.list_characters(&id).map_err(err)?;
+    Ok(Json(json!({"items": items})))
+}
+
+#[derive(Deserialize)]
+struct CharacterBody {
+    name: String,
+    #[serde(default)]
+    role: String,
+}
+
+async fn add_character(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(b): Json<CharacterBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let name = b.name.trim();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "角色名不能为空".to_string()));
+    }
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    e.db.add_character(&id, name, b.role.trim()).map_err(err)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct CharacterUpdateBody {
+    #[serde(default)]
+    role: String,
+    #[serde(default = "default_active")]
+    status: String,
+    #[serde(default)]
+    facts: Vec<String>,
+}
+
+fn default_active() -> String {
+    "active".to_string()
+}
+
+async fn update_character(
+    State(e): State<Arc<Engine>>,
+    Path((_id, cid)): Path<(String, String)>,
+    Json(b): Json<CharacterUpdateBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let ok = e
+        .db
+        .update_character(&cid, &b.role, &b.status, &b.facts)
+        .map_err(err)?;
+    if !ok {
+        return Err(not_found("character"));
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn delete_character(
+    State(e): State<Arc<Engine>>,
+    Path((_id, cid)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let ok = e.db.delete_character(&cid).map_err(err)?;
+    if !ok {
+        return Err(not_found("character"));
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
+// ---------- 伏笔台账 ----------
+
+async fn list_foreshadowings(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let items = e.db.list_foreshadowings(&id).map_err(err)?;
+    Ok(Json(json!({"items": items})))
+}
+
+#[derive(Deserialize)]
+struct ForeshadowingBody {
+    title: String,
+    #[serde(default)]
+    notes: String,
+}
+
+async fn add_foreshadowing(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(b): Json<ForeshadowingBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let title = b.title.trim();
+    if title.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "伏笔内容不能为空".to_string()));
+    }
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    e.db.add_foreshadowing(&id, title, b.notes.trim()).map_err(err)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct ForeshadowingUpdateBody {
+    #[serde(default = "default_open")]
+    status: String,
+    #[serde(default)]
+    notes: String,
+    #[serde(default)]
+    resolved_chapter: Option<i64>,
+}
+
+fn default_open() -> String {
+    "open".to_string()
+}
+
+async fn update_foreshadowing(
+    State(e): State<Arc<Engine>>,
+    Path((_id, fid)): Path<(String, String)>,
+    Json(b): Json<ForeshadowingUpdateBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let status = if b.status == "resolved" { "resolved" } else { "open" };
+    let resolved_chapter = if status == "resolved" { b.resolved_chapter } else { None };
+    let ok = e
+        .db
+        .update_foreshadowing(&fid, status, &b.notes, resolved_chapter)
+        .map_err(err)?;
+    if !ok {
+        return Err(not_found("foreshadowing"));
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn delete_foreshadowing(
+    State(e): State<Arc<Engine>>,
+    Path((_id, fid)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let ok = e.db.delete_foreshadowing(&fid).map_err(err)?;
+    if !ok {
+        return Err(not_found("foreshadowing"));
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
 // ---------- 运行记录 ----------
 
 #[derive(Deserialize)]
@@ -275,7 +582,7 @@ async fn export_novel(
         .db
         .get_novel(&id)
         .map_err(err)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "novel not found".to_string()))?;
+        .ok_or_else(|| not_found("novel"))?;
     let chapters = e.db.list_chapters(&id).map_err(err)?;
     let body = crate::export::novel_to_txt(&novel, &chapters);
     let short: String = id.chars().take(8).collect();

@@ -16,6 +16,8 @@ pub enum EngineEvent {
     Token { chapter_idx: i64, delta: String },
     ChapterSaved { chapter_idx: i64, title: String, words: usize },
     ChapterReview { chapter_idx: i64, ok: bool, issues: usize },
+    LedgerUpdated { chapter_idx: i64, characters: usize, foreshadowings: usize },
+    RunPaused { run_id: String, novel_id: String, message: String },
     RunFinished { run_id: String },
     RunFailed { run_id: String, error: String },
 }
@@ -167,6 +169,18 @@ async fn run_inner(
             }
         }
         engine.db.update_run(run_id, "running", "draft", 0, None)?;
+
+        // 按阶段确认：本次做了规划 → 暂停等待人工检查 / 编辑章纲后再继续
+        if novel.mode == "staged" {
+            engine.db.update_run(run_id, "paused", "await_confirm", 0, None)?;
+            engine.db.set_novel_status(novel_id, "await_confirm")?;
+            engine.hub.publish(EngineEvent::RunPaused {
+                run_id: run_id.to_string(),
+                novel_id: novel_id.to_string(),
+                message: "章节规划已生成，确认后可继续写作".into(),
+            });
+            return Ok(());
+        }
     }
     let novel = engine.db.get_novel(novel_id)?.unwrap_or(novel);
 
@@ -225,7 +239,8 @@ async fn run_inner(
             goal: ch.goal.clone(),
             beats: ch.beats.clone(),
         };
-        let (sys, usr) = crate::prompts::chapter_prompt(&brief, &novel.book_outline, &plan, &prev_tail);
+        let ledger = ledger_context(&engine.db, novel_id).unwrap_or_default();
+        let (sys, usr) = crate::prompts::chapter_prompt(&brief, &novel.book_outline, &plan, &prev_tail, &ledger);
         // 流式输出按 ~80 字聚合后再推送，降低 SSE 事件与前端渲染压力
         let mut buf = String::new();
         let hub = engine.hub.clone();
@@ -290,6 +305,23 @@ async fn run_inner(
             Err(e) => tracing::warn!("chapter {idx} review failed: {e:#}"),
         }
 
+        // 写后资料整理：抽取角色 / 伏笔台账（非阻塞，失败仅记录日志）
+        let (xsys, xusr) = crate::prompts::extract_prompt(idx, &content);
+        match llm.complete(&xsys, &xusr).await {
+            Ok(raw) => {
+                if let Some(j) = extract_json_object(&raw) {
+                    let chars = engine.db.absorb_characters(novel_id, &j).unwrap_or(0);
+                    let fores = engine.db.absorb_foreshadowings(novel_id, idx, &j).unwrap_or(0);
+                    engine.hub.publish(EngineEvent::LedgerUpdated {
+                        chapter_idx: idx,
+                        characters: chars,
+                        foreshadowings: fores,
+                    });
+                }
+            }
+            Err(e) => tracing::warn!("chapter {idx} extract failed: {e:#}"),
+        }
+
         engine.db.save_chapter_content(novel_id, idx, &content, "done")?;
         engine.db.update_run(run_id, "running", "draft", idx, None)?;
     }
@@ -317,4 +349,29 @@ fn tail_chars(s: &str, n: usize) -> String {
     } else {
         s.chars().skip(total - n).collect()
     }
+}
+
+/// 组装台账上下文：活跃角色事实（最近 6 人 × 3 条）+ 未回收伏笔（最多 8 条）
+fn ledger_context(db: &crate::db::Db, novel_id: &str) -> anyhow::Result<String> {
+    let mut s = String::new();
+    let chars = db.list_characters(novel_id)?;
+    let active: Vec<_> = chars.iter().filter(|c| c.status != "dead").collect();
+    if !active.is_empty() {
+        s.push_str("角色事实：\n");
+        for c in active.iter().take(6) {
+            let mut facts: Vec<&String> = c.facts.iter().rev().take(3).collect();
+            facts.reverse();
+            let facts = facts.iter().map(|f| f.as_str()).collect::<Vec<_>>().join("；");
+            s.push_str(&format!("- {}（{}·{}）：{}\n", c.name, c.role, c.status, facts));
+        }
+    }
+    let fores = db.list_foreshadowings(novel_id)?;
+    let open: Vec<_> = fores.iter().filter(|f| f.status == "open").collect();
+    if !open.is_empty() {
+        s.push_str("未回收伏笔：\n");
+        for f in open.iter().take(8) {
+            s.push_str(&format!("- {}（第{}章埋下）\n", f.title, f.planted_chapter));
+        }
+    }
+    Ok(s)
 }

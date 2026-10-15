@@ -2,7 +2,9 @@
 
 /* ============================================================
  * android-AI-Novel-Agent · Web UI
- * 参考原桌面项目的交互与信息架构（书架 / 开书 / 工作台 / 运行记录 / 模型设置）
+ * 书架 / 新建作品 / 本书工作台（章节·角色·伏笔） / 运行记录 / 模型设置
+ * 章节编辑器：手动修改 + 选段 AI 修文（改写/扩写/精简/去 AI 味）
+ * 按阶段确认：规划后暂停，可改章纲再继续
  * ============================================================ */
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -17,6 +19,10 @@ const state = {
   pollTimer: null,
   shelfItems: [],
   shelfFilter: "all",
+  tab: "chapters",
+  editorDirty: false,
+  polishRange: null,
+  polishResult: null,
 };
 
 /* ---------------- 工具 ---------------- */
@@ -29,6 +35,14 @@ async function api(path, opts) {
   const r = await fetch(path, opts);
   if (!r.ok) throw new Error((await r.text()) || r.statusText);
   return r.json();
+}
+
+async function apiSend(path, method, body) {
+  return api(path, {
+    method,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 function toast(msg, isError = false) {
@@ -54,11 +68,21 @@ const NOVEL_STATUS = {
   created: { label: "已创建", cls: "chip" },
   outlined: { label: "已规划", cls: "chip-info" },
   writing: { label: "创作中", cls: "chip-info" },
+  await_confirm: { label: "待确认", cls: "chip-warning" },
   drafted: { label: "已完成", cls: "chip-success" },
   failed: { label: "异常", cls: "chip-danger" },
 };
-const RUN_STATUS = { running: "执行中", done: "已完成", failed: "失败" };
-const STAGE_LABEL = { brief: "整理立项", outline: "章节规划", draft: "正文生成", review: "章节审校", done: "全部完成", failed: "已中断" };
+const RUN_STATUS = { running: "执行中", paused: "待确认", done: "已完成", failed: "失败" };
+const STAGE_LABEL = {
+  brief: "整理立项",
+  outline: "章节规划",
+  await_confirm: "待确认",
+  draft: "正文生成",
+  review: "章节审校",
+  done: "全部完成",
+  failed: "已中断",
+};
+const CHARACTER_STATUS = { active: "在场", dead: "死亡", leave: "离场" };
 
 function statusChip(s) {
   const m = NOVEL_STATUS[s] || { label: s || "—", cls: "chip" };
@@ -104,6 +128,8 @@ async function route() {
   state.pollTimer = null;
   closeEvents();
   closeReader();
+  closeDiff();
+  closeForm();
 
   const r = parseRoute();
   const activeNav = r.kind === "novel" ? "#/shelf" : r.path;
@@ -149,7 +175,9 @@ async function loadShelf() {
 
 function shelfFiltered(key) {
   const items = state.shelfItems;
-  if (key === "active") return items.filter((i) => i.run_status === "running" || i.novel.status === "writing");
+  if (key === "active") {
+    return items.filter((i) => i.run_status === "running" || i.novel.status === "writing" || i.novel.status === "await_confirm");
+  }
   if (key === "done") return items.filter((i) => i.novel.status === "drafted");
   if (key === "failed") return items.filter((i) => i.novel.status === "failed" || i.run_status === "failed");
   return items;
@@ -190,6 +218,7 @@ function renderShelf() {
         <h3>${esc(title)}</h3>
         <div class="chips">
           ${n.genre ? `<span class="chip">${esc(n.genre)}</span>` : ""}
+          ${n.mode === "staged" ? `<span class="chip">按阶段确认</span>` : ""}
           ${statusChip(n.status)}
         </div>
       </div>
@@ -197,11 +226,11 @@ function renderShelf() {
       <p class="meta">已完成 ${done} 章 · 共 ${it.words || 0} 字 · 更新于 ${fmtTime(n.updated_at)}</p>
       <div class="status-box">
         <div class="chips">
-          ${it.run_status ? `<span class="chip chip-dark">${esc(RUN_STATUS[it.run_status] || it.run_status)}</span>` : `<span class="chip">尚无运行记录</span>`}
+          ${it.run_status ? `<span class="chip ${it.run_status === "paused" ? "chip-warning" : "chip-dark"}">${esc(RUN_STATUS[it.run_status] || it.run_status)}</span>` : `<span class="chip">尚无运行记录</span>`}
           ${target > 0 ? `<span class="chip">进度 ${pct}%</span>` : ""}
           ${it.run_stage ? `<span class="chip">当前阶段：${esc(STAGE_LABEL[it.run_stage] || it.run_stage)}</span>` : ""}
         </div>
-        <div class="progress"><div class="progress-fill" style="width:${pct}%"></div></div>
+        <div class="progress"><div class="progress-fill ${it.run_status === "running" ? "running" : ""}" style="width:${pct}%"></div></div>
         ${it.last_error ? `<p class="err">${esc(it.last_error)}</p>` : ""}
       </div>
       <div class="row">
@@ -227,7 +256,7 @@ function bindShelf() {
     if (kind === "delete") {
       e.preventDefault();
       const title = card.querySelector("h3").textContent;
-      if (!confirm(`确定删除《${title}》？该操作会删除全部章节与运行记录，且不可恢复。`)) return;
+      if (!confirm(`确定删除《${title}》？该操作会删除全部章节、台账与运行记录，且不可恢复。`)) return;
       try {
         await api(`/api/novels/${id}`, { method: "DELETE" });
         toast("已删除");
@@ -252,7 +281,7 @@ function bindShelf() {
 function renderCreate() {
   const provider = state.settings?.provider;
   const model = provider === "mock" ? "离线演示（mock）" : state.settings?.model || "未配置";
-  $("#create-model").textContent = model;
+  $("#create-hint").textContent = `当前模型：${model}（可在「模型设置」中调整）`;
 }
 
 function bindCreate() {
@@ -261,16 +290,13 @@ function bindCreate() {
     const idea = $("#create-idea").value.trim();
     if (!idea) { toast("请先写一句灵感", true); return; }
     const chapters = Math.min(50, Math.max(1, parseInt($("#create-chapters").value || "3", 10) || 3));
+    const mode = $("#create-mode").value;
     const btn = $("#create-submit");
     btn.disabled = true;
     btn.textContent = "正在创建…";
     try {
-      const r = await api("/api/novels", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ idea, chapters }),
-      });
-      toast("已开始创作，进入工作台查看进度");
+      const r = await apiSend("/api/novels", "POST", { idea, chapters, mode });
+      toast(mode === "staged" ? "已开始：规划完成后会暂停等你确认" : "已开始创作，进入工作台查看进度");
       location.hash = `#/novel/${r.novel_id}`;
     } catch (err) {
       toast(err.message, true);
@@ -281,7 +307,7 @@ function bindCreate() {
   });
 }
 
-/* ---------------- 作品工作台 ---------------- */
+/* ---------------- 本书工作台 ---------------- */
 
 async function loadNovel(id) {
   const data = await api(`/api/novels/${id}`);
@@ -304,6 +330,7 @@ function computeSteps(data) {
   const reviewDone = draftDone && drafted > 0 && reviewed >= drafted;
   const finished = !!(run && run.status === "done");
   const running = !!(run && run.status === "running");
+  const paused = !!(run && run.status === "paused");
 
   const steps = [
     { name: "整理立项方案", done: briefDone },
@@ -312,7 +339,7 @@ function computeSteps(data) {
     { name: "审校并保存", done: reviewDone || finished },
   ];
   let activeIdx = -1;
-  if (running) activeIdx = steps.findIndex((s) => !s.done);
+  if (running || paused) activeIdx = steps.findIndex((s) => !s.done);
   return steps.map((s, i) => ({ ...s, state: s.done ? "done" : i === activeIdx ? "active" : "pending" }));
 }
 
@@ -327,7 +354,7 @@ function renderNovel() {
   $("#novel-chips").innerHTML = [
     n.genre ? `<span class="chip">${esc(n.genre)}</span>` : "",
     statusChip(n.status),
-    run ? `<span class="chip chip-dark">${esc(RUN_STATUS[run.status] || run.status)}</span>` : "",
+    run ? `<span class="chip ${run.status === "failed" ? "chip-danger" : run.status === "paused" ? "chip-warning" : run.status === "done" ? "chip-success" : "chip-info"}">${esc(RUN_STATUS[run.status] || run.status)}</span>` : "",
   ].join("");
   $("#novel-meta").textContent = [n.logline, n.protagonist && `主角：${n.protagonist}`, n.style].filter(Boolean).join(" · ") || n.idea || "";
 
@@ -336,16 +363,24 @@ function renderNovel() {
     $("#novel-target").value = Math.max(chs.length, target);
   }
   $("#novel-export").href = `/api/novels/${n.id}/export`;
+
   const running = !!(run && run.status === "running");
+  const paused = !!(run && run.status === "paused");
   const runBtn = $("#novel-run");
   runBtn.disabled = running;
-  runBtn.textContent = running ? "创作中…" : "继续创作";
+  runBtn.textContent = running ? "创作中…" : paused ? "确认并继续" : "继续创作";
+  runBtn.classList.toggle("attention", paused);
+
+  // 推进方式切换
+  $("#mode-toggle").innerHTML = `
+    <span class="chip chip-filter ${n.mode === "auto" ? "chip-dark" : ""}" data-mode="auto" title="全自动推进">全自动</span>
+    <span class="chip chip-filter ${n.mode === "staged" ? "chip-dark" : ""}" data-mode="staged" title="规划后暂停确认">阶段确认</span>`;
 
   // 进度
   const done = chs.filter((c) => c.status === "done").length;
   const pct = target > 0 ? Math.min(100, Math.round((done / target) * 100)) : 0;
   $("#run-chips").innerHTML = [
-    run ? `<span class="chip ${run.status === "failed" ? "chip-danger" : run.status === "done" ? "chip-success" : "chip-info"}">${esc(RUN_STATUS[run.status] || run.status)}</span>` : `<span class="chip">尚未运行</span>`,
+    run ? `<span class="chip ${run.status === "failed" ? "chip-danger" : run.status === "paused" ? "chip-warning" : run.status === "done" ? "chip-success" : "chip-info"}">${esc(RUN_STATUS[run.status] || run.status)}</span>` : `<span class="chip">尚未运行</span>`,
     `<span class="chip">进度 ${done}/${target} 章</span>`,
     run ? `<span class="chip">当前阶段：${esc(STAGE_LABEL[run.stage] || run.stage)}</span>` : "",
   ].join("");
@@ -353,21 +388,42 @@ function renderNovel() {
   $("#run-progress").classList.toggle("running", running);
   $("#run-note").textContent = run && run.error
     ? "已中断：" + run.error
-    : run && run.status === "running"
-      ? "AI 正在按「立项 → 规划 → 正文 → 审校」推进，可离开本页，任务在后台继续。"
-      : run && run.status === "done"
-        ? `最近一次运行已完成，共 ${done} 章。`
-        : "点击「继续创作」开始或推进本书。";
+    : paused
+      ? "已暂停：章节规划已生成。到下方「章节」里检查/修改章纲，然后点「确认并继续」开始写正文。"
+      : running
+        ? "AI 正在按「立项 → 规划 → 正文 → 审校」推进，可离开本页，任务在后台继续。"
+        : run && run.status === "done"
+          ? `最近一次运行已完成，共 ${done} 章。`
+          : "点击「继续创作」开始或推进本书。";
 
   // 步骤条
   $("#novel-steps").innerHTML = computeSteps(data).map((s, i) => `
     <div class="step ${s.state === "done" ? "step-done" : s.state === "active" ? "step-active" : ""}">
       <span class="step-num">${s.state === "done" ? "✓" : i + 1}</span>
       <span class="step-name">${esc(s.name)}</span>
-      <span class="step-state">${s.state === "done" ? "已完成" : s.state === "active" ? "进行中" : "待推进"}</span>
+      <span class="step-state">${s.state === "done" ? "已完成" : s.state === "active" ? (paused ? "等待确认" : "进行中") : "待推进"}</span>
     </div>`).join("");
 
-  // 章节表
+  // 当前页签内容
+  renderTab();
+
+  // 页签高亮
+  $$("#novel-tabs [data-tab]").forEach((el) => {
+    el.classList.toggle("chip-dark", el.dataset.tab === state.tab);
+  });
+}
+
+function renderTab() {
+  $("#tab-chapters").hidden = state.tab !== "chapters";
+  $("#tab-characters").hidden = state.tab !== "characters";
+  $("#tab-foreshadowings").hidden = state.tab !== "foreshadowings";
+  if (state.tab === "chapters") renderChapters();
+  if (state.tab === "characters") renderCharacters().catch((e) => toast(e.message, true));
+  if (state.tab === "foreshadowings") renderForeshadowings().catch((e) => toast(e.message, true));
+}
+
+function renderChapters() {
+  const chs = (state.novel?.chapters || []);
   const tbody = $("#chapter-rows");
   tbody.innerHTML = chs.length
     ? chs.map((c) => `
@@ -377,29 +433,147 @@ function renderNovel() {
         <td>${c.status === "done" ? `<span class="chip chip-success">已完成</span>` : c.status === "drafted" ? `<span class="chip chip-info">待审校</span>` : `<span class="chip">已规划</span>`}</td>
         <td class="num">${c.words || 0}</td>
         <td>${reviewChip(c.review)}</td>
-        <td><button class="btn btn-outline btn-sm" data-read="${c.idx}">阅读</button></td>
+        <td>
+          ${c.status === "planned" ? `<button class="btn btn-outline btn-sm" data-plan="${c.idx}">改规划</button>` : `<button class="btn btn-outline btn-sm" data-read="${c.idx}">阅读/编辑</button>`}
+        </td>
       </tr>`).join("")
     : `<tr><td colspan="6" class="muted">章节规划生成后会显示在这里。</td></tr>`;
 }
 
+async function renderCharacters() {
+  const data = await api(`/api/novels/${state.novelId}/characters`);
+  const items = data.items || [];
+  $("#character-rows").innerHTML = items.length
+    ? items.map((c) => `
+      <tr>
+        <td>${esc(c.name)}</td>
+        <td>${c.role ? `<span class="chip">${esc(c.role)}</span>` : "—"}</td>
+        <td><span class="chip ${c.status === "dead" ? "chip-danger" : c.status === "leave" ? "chip-warning" : "chip-success"}">${esc(CHARACTER_STATUS[c.status] || c.status)}</span></td>
+        <td class="facts-cell">${c.facts.length ? esc(c.facts.slice(-3).join("；")) : "—"}</td>
+        <td>
+          <button class="btn btn-outline btn-sm" data-char-edit="${c.id}">编辑</button>
+          <button class="btn btn-ghost btn-sm btn-danger" data-char-del="${c.id}">删除</button>
+        </td>
+      </tr>`).join("")
+    : `<tr><td colspan="5" class="muted">写完章节后会自动整理角色；也可以点「新增角色」手动维护。</td></tr>`;
+}
+
+async function renderForeshadowings() {
+  const data = await api(`/api/novels/${state.novelId}/foreshadowings`);
+  const items = data.items || [];
+  $("#foreshadow-rows").innerHTML = items.length
+    ? items.map((f) => `
+      <tr>
+        <td>${esc(f.title)}</td>
+        <td><span class="chip ${f.status === "open" ? "chip-warning" : "chip-success"}">${f.status === "open" ? "未回收" : "已回收"}</span></td>
+        <td class="num">${f.planted_chapter > 0 ? `第${f.planted_chapter}章` : "手动"}</td>
+        <td class="num">${f.resolved_chapter ? `第${f.resolved_chapter}章` : "—"}</td>
+        <td class="facts-cell">${f.notes ? esc(f.notes) : "—"}</td>
+        <td>
+          ${f.status === "open" ? `<button class="btn btn-outline btn-sm" data-fore-resolve="${f.id}" data-title="${esc(f.title)}">标记回收</button>` : ""}
+          <button class="btn btn-outline btn-sm" data-fore-edit="${f.id}">编辑</button>
+          <button class="btn btn-ghost btn-sm btn-danger" data-fore-del="${f.id}">删除</button>
+        </td>
+      </tr>`).join("")
+    : `<tr><td colspan="6" class="muted">写后会自动整理伏笔（埋下/回收）；也可以点「新增伏笔」手动记录。</td></tr>`;
+}
+
 function bindNovel() {
   $("#chapter-rows").addEventListener("click", (e) => {
-    const btn = e.target.closest("[data-read]");
-    if (!btn) return;
-    openReader(parseInt(btn.dataset.read, 10)).catch((err) => toast(err.message, true));
+    const read = e.target.closest("[data-read]");
+    if (read) { openEditor(parseInt(read.dataset.read, 10)).catch((err) => toast(err.message, true)); return; }
+    const plan = e.target.closest("[data-plan]");
+    if (plan) { editPlan(parseInt(plan.dataset.plan, 10)).catch((err) => toast(err.message, true)); }
   });
+  $("#character-rows").addEventListener("click", (e) => {
+    const edit = e.target.closest("[data-char-edit]");
+    if (edit) { editCharacter(edit.dataset.charEdit).catch((err) => toast(err.message, true)); return; }
+    const del = e.target.closest("[data-char-del]");
+    if (del) {
+      if (!confirm("删除该角色及其全部事实记录？")) return;
+      api(`/api/novels/${state.novelId}/characters/${del.dataset.charDel}`, { method: "DELETE" })
+        .then(() => { toast("已删除"); return renderCharacters(); })
+        .catch((err) => toast(err.message, true));
+    }
+  });
+  $("#foreshadow-rows").addEventListener("click", async (e) => {
+    const resolve = e.target.closest("[data-fore-resolve]");
+    if (resolve) {
+      try {
+        await apiSend(`/api/novels/${state.novelId}/foreshadowings/${resolve.dataset.foreResolve}`, "PUT", {
+          status: "resolved",
+          notes: "",
+          resolved_chapter: (state.novel?.chapters || []).length || null,
+        });
+        toast("已标记回收");
+        await renderForeshadowings();
+      } catch (err) { toast(err.message, true); }
+      return;
+    }
+    const edit = e.target.closest("[data-fore-edit]");
+    if (edit) { editForeshadowing(edit.dataset.foreEdit).catch((err) => toast(err.message, true)); return; }
+    const del = e.target.closest("[data-fore-del]");
+    if (del) {
+      if (!confirm("删除该伏笔记录？")) return;
+      api(`/api/novels/${state.novelId}/foreshadowings/${del.dataset.foreDel}`, { method: "DELETE" })
+        .then(() => { toast("已删除"); return renderForeshadowings(); })
+        .catch((err) => toast(err.message, true));
+    }
+  });
+  $("#novel-tabs").addEventListener("click", (e) => {
+    const chip = e.target.closest("[data-tab]");
+    if (!chip) return;
+    state.tab = chip.dataset.tab;
+    renderNovel();
+  });
+  $("#mode-toggle").addEventListener("click", async (e) => {
+    const chip = e.target.closest("[data-mode]");
+    if (!chip) return;
+    try {
+      await apiSend(`/api/novels/${state.novelId}`, "PATCH", { mode: chip.dataset.mode });
+      toast(chip.dataset.mode === "staged" ? "已切换：规划后会暂停等你确认" : "已切换：全自动推进");
+      await refreshNovel();
+    } catch (err) { toast(err.message, true); }
+  });
+  $("#add-character").onclick = () => {
+    openForm({
+      title: "新增角色",
+      fields: [
+        { name: "name", label: "角色名", placeholder: "如：林深" },
+        { name: "role", label: "定位", placeholder: "主角 / 配角 / 反派…" },
+      ],
+      onSubmit: async (v) => {
+        if (!v.name.trim()) throw new Error("角色名不能为空");
+        await apiSend(`/api/novels/${state.novelId}/characters`, "POST", { name: v.name, role: v.role });
+        toast("已新增角色");
+        await renderCharacters();
+      },
+    });
+  };
+  $("#add-foreshadowing").onclick = () => {
+    openForm({
+      title: "新增伏笔",
+      fields: [
+        { name: "title", label: "伏笔内容", placeholder: "一句话概括，如：姐姐留下的鲸歌录音" },
+        { name: "notes", label: "备注", type: "textarea", rows: 3, placeholder: "计划在第几章回收、当前线索…" },
+      ],
+      onSubmit: async (v) => {
+        if (!v.title.trim()) throw new Error("伏笔内容不能为空");
+        await apiSend(`/api/novels/${state.novelId}/foreshadowings`, "POST", { title: v.title, notes: v.notes });
+        toast("已新增伏笔");
+        await renderForeshadowings();
+      },
+    });
+  };
   $("#novel-target").addEventListener("input", (e) => { e.target.dataset.touched = "1"; });
   $("#novel-run").onclick = async () => {
     const chapters = Math.min(50, Math.max(1, parseInt($("#novel-target").value || "3", 10) || 3));
     try {
-      await api(`/api/novels/${state.novelId}/run`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chapters }),
-      });
+      await apiSend(`/api/novels/${state.novelId}/run`, "POST", { chapters });
       toast(`已开始，目标 ${chapters} 章（已完成章节会自动跳过）`);
       $("#novel-run").disabled = true;
       $("#novel-run").textContent = "创作中…";
+      $("#novel-run").classList.remove("attention");
     } catch (err) {
       toast(err.message, true);
       refreshNovel();
@@ -407,7 +581,7 @@ function bindNovel() {
   };
   $("#novel-delete").onclick = async () => {
     const title = $("#novel-title").textContent;
-    if (!confirm(`确定删除《${title}》？全部章节与运行记录都会被删除。`)) return;
+    if (!confirm(`确定删除《${title}》？全部章节、台账与运行记录都会被删除。`)) return;
     try {
       await api(`/api/novels/${state.novelId}`, { method: "DELETE" });
       toast("已删除");
@@ -425,9 +599,81 @@ function bindNovel() {
   };
 }
 
-/* ---------------- 阅读弹层 ---------------- */
+async function editPlan(idx) {
+  const c = (state.novel?.chapters || []).find((x) => x.idx === idx) || {};
+  openForm({
+    title: `编辑第 ${idx} 章规划`,
+    fields: [
+      { name: "title", label: "章节标题", value: c.title || "" },
+      { name: "goal", label: "本章目标", value: c.goal || "", placeholder: "30 字以内" },
+      { name: "beats", label: "关键节拍（每行一条）", type: "textarea", rows: 4, value: (c.beats || []).join("\n") },
+    ],
+    onSubmit: async (v) => {
+      if (!v.title.trim()) throw new Error("标题不能为空");
+      const beats = v.beats.split("\n").map((s) => s.trim()).filter(Boolean);
+      await apiSend(`/api/novels/${state.novelId}/chapters/${idx}/plan`, "PUT", {
+        title: v.title,
+        goal: v.goal,
+        beats,
+      });
+      toast("规划已更新");
+      await refreshNovel();
+    },
+  });
+}
 
-async function openReader(idx) {
+async function editCharacter(id) {
+  const data = await api(`/api/novels/${state.novelId}/characters`);
+  const c = (data.items || []).find((x) => x.id === id);
+  if (!c) throw new Error("角色不存在");
+  openForm({
+    title: `编辑角色：${c.name}`,
+    fields: [
+      { name: "role", label: "定位", value: c.role || "" },
+      { name: "status", label: "状态", type: "select", value: c.status, options: [
+        { value: "active", label: "在场" }, { value: "dead", label: "死亡" }, { value: "leave", label: "离场" },
+      ] },
+      { name: "facts", label: "关键事实（每行一条）", type: "textarea", rows: 6, value: (c.facts || []).join("\n") },
+    ],
+    onSubmit: async (v) => {
+      await apiSend(`/api/novels/${state.novelId}/characters/${id}`, "PUT", {
+        role: v.role,
+        status: v.status,
+        facts: v.facts.split("\n").map((s) => s.trim()).filter(Boolean),
+      });
+      toast("角色已更新");
+      await renderCharacters();
+    },
+  });
+}
+
+async function editForeshadowing(id) {
+  const data = await api(`/api/novels/${state.novelId}/foreshadowings`);
+  const f = (data.items || []).find((x) => x.id === id);
+  if (!f) throw new Error("伏笔不存在");
+  openForm({
+    title: "编辑伏笔",
+    fields: [
+      { name: "status", label: "状态", type: "select", value: f.status, options: [
+        { value: "open", label: "未回收" }, { value: "resolved", label: "已回收" },
+      ] },
+      { name: "notes", label: "备注", type: "textarea", rows: 4, value: f.notes || "" },
+    ],
+    onSubmit: async (v) => {
+      await apiSend(`/api/novels/${state.novelId}/foreshadowings/${id}`, "PUT", {
+        status: v.status,
+        notes: v.notes,
+        resolved_chapter: v.status === "resolved" ? (f.resolved_chapter || (state.novel?.chapters || []).length || null) : null,
+      });
+      toast("伏笔已更新");
+      await renderForeshadowings();
+    },
+  });
+}
+
+/* ---------------- 章节编辑器 ---------------- */
+
+async function openEditor(idx) {
   const c = await api(`/api/novels/${state.novelId}/chapters/${idx}`);
   $("#reader-title").textContent = `第${c.idx}章 ${c.title || ""}`;
   const review = parseReview(c.review);
@@ -440,12 +686,174 @@ async function openReader(idx) {
     c.goal ? `本章目标：${c.goal}` : "",
     c.words ? `字数：${c.words}` : "",
   ].filter(Boolean).join(" · ");
-  $("#reader-content").textContent = c.content || "（本章还没有正文）";
+  const ta = $("#reader-content");
+  ta.value = c.content || "";
+  ta.dataset.idx = String(idx);
+  state.editorDirty = false;
+  $("#reader-save").disabled = true;
   $("#reader-backdrop").hidden = false;
 }
 
 function closeReader() {
   $("#reader-backdrop").hidden = true;
+}
+
+function bindEditor() {
+  const ta = $("#reader-content");
+  ta.addEventListener("input", () => {
+    state.editorDirty = true;
+    $("#reader-save").disabled = false;
+  });
+  $("#reader-close").onclick = () => {
+    if (state.editorDirty && !confirm("有未保存的修改，确定关闭？")) return;
+    closeReader();
+  };
+  $("#reader-backdrop").addEventListener("click", (e) => {
+    if (e.target === $("#reader-backdrop")) {
+      if (state.editorDirty && !confirm("有未保存的修改，确定关闭？")) return;
+      closeReader();
+    }
+  });
+  $("#reader-save").onclick = async () => {
+    const idx = parseInt(ta.dataset.idx || "0", 10);
+    if (!idx) return;
+    try {
+      await apiSend(`/api/novels/${state.novelId}/chapters/${idx}`, "PUT", { content: ta.value });
+      state.editorDirty = false;
+      $("#reader-save").disabled = true;
+      toast("已保存");
+      await refreshNovel();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+  $$("[data-polish]").forEach((btn) => {
+    btn.onclick = () => runPolish(btn.dataset.polish).catch((err) => toast(err.message, true));
+  });
+  $("#diff-cancel").onclick = closeDiff;
+  $("#diff-apply").onclick = applyPolish;
+}
+
+async function runPolish(mode) {
+  const ta = $("#reader-content");
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const text = ta.value.slice(start, end).trim();
+  if (text.length < 8) {
+    toast("请先在正文中选中至少 8 个字", true);
+    return;
+  }
+  const idx = parseInt(ta.dataset.idx || "0", 10);
+  toast("AI 修文中…");
+  const r = await apiSend(`/api/novels/${state.novelId}/chapters/${idx}/polish`, "POST", {
+    mode,
+    selection: text,
+    instruction: $("#polish-instruction").value.trim(),
+  });
+  const revised = r.revised || "";
+  if (!revised || revised === text) {
+    toast("没有产生修改，请调整选中内容或换个模式", true);
+    return;
+  }
+  state.polishRange = { start, end, text };
+  state.polishResult = revised;
+  showDiff(mode, text, revised);
+}
+
+const POLISH_LABELS = { rewrite: "改写", expand: "扩写", shrink: "精简", depolish: "去 AI 味" };
+
+function showDiff(mode, original, revised) {
+  $("#diff-mode").textContent = POLISH_LABELS[mode] || mode;
+  const d = diffParts(original, revised);
+  $("#diff-original").innerHTML = `${esc(d.pre)}<mark class="del">${esc(d.aMid)}</mark>${esc(d.suf)}`;
+  $("#diff-revised").innerHTML = `${esc(d.pre)}<mark class="add">${esc(d.bMid)}</mark>${esc(d.suf)}`;
+  $("#diff-backdrop").hidden = false;
+}
+
+function closeDiff() {
+  $("#diff-backdrop").hidden = true;
+  state.polishResult = null;
+  state.polishRange = null;
+}
+
+function applyPolish() {
+  const ta = $("#reader-content");
+  const range = state.polishRange;
+  const revised = state.polishResult;
+  closeDiff();
+  if (!range || !revised) return;
+  // 若编辑器内容已被改动且选中区间不再匹配原文，则退回“追加提示”
+  if (ta.value.slice(range.start, range.end) !== range.text) {
+    toast("正文已被改动，请重新选中后再应用", true);
+    return;
+  }
+  ta.setRangeText(revised, range.start, range.end, "end");
+  state.editorDirty = true;
+  $("#reader-save").disabled = false;
+  toast("已应用修改，记得点「保存修改」");
+}
+
+/** 极简 diff：公共前缀/后缀定位变动区，中间高亮 */
+function diffParts(a, b) {
+  const maxPre = Math.min(a.length, b.length);
+  let pre = 0;
+  while (pre < maxPre && a[pre] === b[pre]) pre++;
+  let suf = 0;
+  while (suf < maxPre - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
+  return {
+    pre: a.slice(0, pre),
+    aMid: a.slice(pre, a.length - suf),
+    bMid: b.slice(pre, b.length - suf),
+    suf: a.slice(a.length - suf),
+  };
+}
+
+/* ---------------- 通用表单弹层 ---------------- */
+
+let formSubmit = null;
+
+function openForm({ title, fields, onSubmit }) {
+  $("#form-title").textContent = title;
+  $("#form-fields").innerHTML = fields
+    .map((f) => {
+      if (f.type === "textarea") {
+        return `<div class="field"><label>${esc(f.label)}</label><textarea data-field="${esc(f.name)}" rows="${f.rows || 4}" placeholder="${esc(f.placeholder || "")}">${esc(f.value || "")}</textarea></div>`;
+      }
+      if (f.type === "select") {
+        return `<div class="field"><label>${esc(f.label)}</label><select data-field="${esc(f.name)}">${(f.options || [])
+          .map((o) => `<option value="${esc(o.value)}" ${o.value === f.value ? "selected" : ""}>${esc(o.label)}</option>`)
+          .join("")}</select></div>`;
+      }
+      return `<div class="field"><label>${esc(f.label)}</label><input data-field="${esc(f.name)}" value="${esc(f.value || "")}" placeholder="${esc(f.placeholder || "")}" /></div>`;
+    })
+    .join("");
+  formSubmit = onSubmit;
+  $("#form-backdrop").hidden = false;
+}
+
+function closeForm() {
+  $("#form-backdrop").hidden = true;
+  formSubmit = null;
+}
+
+function bindFormDialog() {
+  const submit = async () => {
+    if (!formSubmit) return;
+    const values = {};
+    $$("#form-fields [data-field]").forEach((el) => { values[el.dataset.field] = el.value; });
+    try {
+      await formSubmit(values);
+      closeForm();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+  $("#form-save").onclick = submit;
+  $("#form-close").onclick = closeForm;
+  $("#form-cancel").onclick = closeForm;
+  $("#form-backdrop").addEventListener("click", (e) => {
+    if (e.target === $("#form-backdrop")) closeForm();
+  });
 }
 
 /* ---------------- 实时事件 ---------------- */
@@ -514,6 +922,16 @@ function handleEvent(ev) {
     case "chapter_review":
       novelLog(`第${ev.chapter_idx}章审校：${ev.ok ? "通过" : "有提醒"}（${ev.issues} 条）`);
       break;
+    case "ledger_updated":
+      novelLog(`资料整理：角色 ${ev.characters} 项 / 伏笔 ${ev.foreshadowings} 项`);
+      if (state.tab !== "chapters") renderTab();
+      break;
+    case "run_paused":
+      novelLog(ev.message);
+      toast("已暂停：章节规划待确认");
+      $("#stream-live").classList.remove("on");
+      refreshNovel();
+      break;
     case "run_finished":
       novelLog("本次运行完成");
       $("#stream-live").classList.remove("on");
@@ -550,7 +968,7 @@ async function loadRuns() {
         <td><a href="#/novel/${esc(r.novel_id)}">${esc(it.novel_title || "（未命名）")}</a></td>
         <td class="num">${r.chapters_target} 章</td>
         <td class="num">${r.chapter_cursor || 0} 章 · ${pct}%</td>
-        <td>${r.status === "done" ? `<span class="chip chip-success">已完成</span>` : r.status === "failed" ? `<span class="chip chip-danger">失败</span>` : `<span class="chip chip-info">执行中</span>`}</td>
+        <td>${r.status === "done" ? `<span class="chip chip-success">已完成</span>` : r.status === "failed" ? `<span class="chip chip-danger">失败</span>` : r.status === "paused" ? `<span class="chip chip-warning">待确认</span>` : `<span class="chip chip-info">执行中</span>`}</td>
         <td>${esc(STAGE_LABEL[r.stage] || r.stage)}</td>
         <td class="muted">${r.error ? esc(r.error) : "—"}</td>
       </tr>`;
@@ -608,11 +1026,7 @@ function bindSettings() {
       temperature: parseFloat($("#set-temp").value || "0.8"),
     };
     try {
-      await api("/api/settings/llm", {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
+      await apiSend("/api/settings/llm", "PUT", body);
       state.settings = body;
       renderModelChip();
       $("#set-status").textContent = "已保存";
@@ -641,6 +1055,7 @@ function bindSettings() {
       $("#set-provider").value = "openai";
       $("#set-base").value = p.base;
       $("#set-model").value = p.model;
+      syncProviderFields();
     };
   });
 }
@@ -677,11 +1092,9 @@ function init() {
   bindShelf();
   bindCreate();
   bindNovel();
+  bindEditor();
+  bindFormDialog();
   bindSettings();
-  $("#reader-close").onclick = closeReader;
-  $("#reader-backdrop").addEventListener("click", (e) => {
-    if (e.target === $("#reader-backdrop")) closeReader();
-  });
   loadSettings().catch(() => {});
   loadHealth();
   setInterval(loadHealth, 15000);

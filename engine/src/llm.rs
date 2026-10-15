@@ -170,6 +170,39 @@ fn mock_complete(user: &str) -> anyhow::Result<String> {
         })
         .to_string());
     }
+    if user.contains("TASK:polish") {
+        let selection = extract_between(user, "原段落：\n---\n", "\n---").unwrap_or_default();
+        let mode = extract_after(user, "mode=").unwrap_or_else(|| "rewrite".into());
+        return Ok(match mode.as_str() {
+            "expand" => format!("{selection} 她停了一下，又补了一句：「事情没那么简单。」"),
+            "shrink" => {
+                let keep = selection.chars().count() * 6 / 10;
+                let cut: String = selection.chars().take(keep.max(1)).collect();
+                format!("{cut}……")
+            }
+            "depolish" => selection.replace("不禁", "").replace("仿佛", "像"),
+            _ => format!("（改写）{selection}"),
+        });
+    }
+    if user.contains("TASK:extract") {
+        let idx = extract_number_after(user, "chapter_index=").unwrap_or(1);
+        let mut planted = vec![serde_json::json!({ "title": format!("第{idx}章留下的悬念") })];
+        let mut resolved: Vec<serde_json::Value> = Vec::new();
+        if idx > 1 {
+            resolved.push(serde_json::json!({ "title": format!("第{}章留下的悬念", idx - 1) }));
+        } else {
+            planted = vec![serde_json::json!({ "title": "第1章留下的悬念" })];
+        }
+        return Ok(serde_json::json!({
+            "characters": [
+                { "name": "林深", "role": "主角", "status": "active",
+                  "facts": [format!("第{idx}章：继续寻找姐姐")] }
+            ],
+            "foreshadowings_planted": planted,
+            "foreshadowings_resolved": resolved
+        })
+        .to_string());
+    }
     Ok("（模拟模式）未识别的任务。".to_string())
 }
 
@@ -202,6 +235,13 @@ fn extract_number_after(text: &str, marker: &str) -> Option<i64> {
     let pos = text.find(marker)? + marker.len();
     let digits: String = text[pos..].chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
+}
+
+fn extract_between(text: &str, start: &str, end: &str) -> Option<String> {
+    let s = text.find(start)? + start.len();
+    let rest = &text[s..];
+    let e = rest.find(end)?;
+    Some(rest[..e].trim().to_string())
 }
 
 /// 从可能带 markdown 围栏 / 前后缀的 LLM 文本里抽出第一个 JSON 对象。

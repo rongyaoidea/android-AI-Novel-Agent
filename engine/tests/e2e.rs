@@ -111,7 +111,7 @@ async fn upsert_does_not_clobber_written_chapters() {
         .as_nanos();
     let dir = std::env::temp_dir().join(format!("ainovel-test-upsert-{stamp}"));
     let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
-    let novel = engine.db.create_novel("测试").unwrap();
+    let novel = engine.db.create_novel("测试", "auto").unwrap();
 
     let plan = |idx: i64, title: &str| ChapterPlan {
         idx,
@@ -134,6 +134,240 @@ async fn upsert_does_not_clobber_written_chapters() {
     assert_eq!(c1.title, "旧标题", "已写章节的规划不应被覆盖");
     assert_eq!(c1.content, "正文", "已写章节的正文不应被覆盖");
     assert_eq!(c2.title, "计划标题2", "未写章节的规划应可更新");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 按阶段确认：规划完成后暂停，人工确认（可改章纲）后继续写正文。
+#[tokio::test]
+async fn staged_mode_pauses_after_outline() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-staged-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let novel = engine.db.create_novel("阶段确认测试", "staged").unwrap();
+
+    ainovel_engine::pipeline::spawn(engine.clone(), &novel.id, 2).unwrap();
+
+    let mut status = String::new();
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        status = engine
+            .db
+            .latest_run(&novel.id)
+            .unwrap()
+            .map(|r| r.status)
+            .unwrap_or_default();
+        if status == "paused" {
+            break;
+        }
+        assert_ne!(status, "failed", "staged run failed");
+    }
+    assert_eq!(status, "paused", "规划后应暂停等待确认");
+
+    let chapters = engine.db.list_chapters(&novel.id).unwrap();
+    assert!(!chapters.is_empty(), "暂停时应已生成章节规划");
+    assert!(
+        chapters.iter().all(|c| c.content.trim().is_empty()),
+        "暂停时不应开始写正文"
+    );
+    assert_eq!(
+        engine.db.get_novel(&novel.id).unwrap().unwrap().status,
+        "await_confirm"
+    );
+
+    // 人工修改第一章规划，然后继续
+    engine
+        .db
+        .update_chapter_plan(&novel.id, 1, "人工改过的标题", "人工目标", &["节拍A".to_string()])
+        .unwrap();
+    ainovel_engine::pipeline::spawn(engine.clone(), &novel.id, 2).unwrap();
+    for _ in 0..400 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        status = engine
+            .db
+            .latest_run(&novel.id)
+            .unwrap()
+            .map(|r| r.status)
+            .unwrap_or_default();
+        if status == "done" {
+            break;
+        }
+        assert_ne!(status, "failed", "resume run failed");
+    }
+    assert_eq!(status, "done");
+    let c1 = engine.db.get_chapter(&novel.id, 1).unwrap().unwrap();
+    assert!(!c1.content.trim().is_empty(), "确认后应写入正文");
+    assert_eq!(c1.title, "人工改过的标题", "人工编辑的规划应被保留");
+    assert_eq!(c1.goal, "人工目标");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// API：选段修文 / 手动编辑 / 规划守卫 / 角色与伏笔台账 / 模式切换
+#[tokio::test]
+async fn polish_edit_and_ledger_endpoints() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-api2-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "API 扩展测试", "chapters": 1}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+
+    let mut status = String::new();
+    for _ in 0..400 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        status = v["run"]["status"].as_str().unwrap_or("").to_string();
+        if status == "done" {
+            break;
+        }
+        assert_ne!(status, "failed");
+    }
+    assert_eq!(status, "done");
+
+    // 台账：角色 + 伏笔（写后自动抽取）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/characters"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let chars = json_body(resp).await;
+    assert!(
+        !chars["items"].as_array().unwrap().is_empty(),
+        "角色台账应有数据: {chars}"
+    );
+    assert_eq!(chars["items"][0]["name"], "林深");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/foreshadowings"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let fores = json_body(resp).await;
+    assert!(
+        !fores["items"].as_array().unwrap().is_empty(),
+        "伏笔台账应有数据: {fores}"
+    );
+
+    // 选段修文
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/chapters/1/polish"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"mode": "rewrite", "selection": "他走了过去，看了看窗户。"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert!(v["revised"].as_str().unwrap().contains("改写"));
+
+    // 手动编辑正文
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/novels/{novel_id}/chapters/1"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"content": "手动改写后的正文。"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/chapters/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(resp).await["content"], "手动改写后的正文。");
+
+    // 已开写章节改规划 → 409
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/novels/{novel_id}/chapters/1/plan"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"title": "新标题"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // 切换推进方式
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/novels/{novel_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"mode": "staged"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
