@@ -1,0 +1,115 @@
+name: android-build
+
+# 触发方式：
+#   1. workflow_dispatch —— 手动构建，产物上传为 artifact
+#   2. 推送 v* 标签 —— 同上（用于发版）
+#   3. 发布 Release —— 自动构建并把签名 APK 上传为该 Release 的附件
+#
+# 签名：从仓库 Secrets 注入（长期复用同一套 keystore）：
+#   RELEASE_KEYSTORE_B64 / RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD
+#   keystore 缺失时自动回退 debug 签名（仅自测用）。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Setup Rust (aarch64-linux-android)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Ensure Android SDK 35
+        run: |
+          if [ ! -d "$ANDROID_HOME/platforms/android-35" ]; then
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
+          fi
+
+      - name: Use preinstalled Android NDK
+        run: |
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}" >> "$GITHUB_ENV"
+          echo "NDK = ${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+
+      - name: Build Rust engine (.so, arm64-v8a)
+        run: |
+          cd engine
+          cargo ndk -t arm64-v8a -o ../android/app/src/main/jniLibs build --release --features jni
+
+      - name: Restore release keystore (optional)
+        env:
+          KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > android/app/release.keystore
+            echo "HAS_KEYSTORE=true" >> "$GITHUB_ENV"
+            echo "已注入 release keystore（复用固定密钥）"
+          else
+            echo "HAS_KEYSTORE=false" >> "$GITHUB_ENV"
+            echo "未配置 RELEASE_KEYSTORE_B64，将回退 debug 签名"
+          fi
+
+      - name: Assemble release APK
+        env:
+          RELEASE_KEYSTORE_FILE: ${{ github.workspace }}/android/app/release.keystore
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          cd android
+          gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Collect artifact
+        run: |
+          mkdir -p dist
+          TAG="${{ github.event.release.tag_name || github.ref_name }}"
+          SIGN_KIND=$([ "$HAS_KEYSTORE" = "true" ] && echo "release" || echo "debug-signed")
+          cp android/app/build/outputs/apk/release/app-release.apk "dist/android-AI-Novel-Agent-${TAG}-arm64-${SIGN_KIND}.apk"
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach APK to Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/*.apk --clobber

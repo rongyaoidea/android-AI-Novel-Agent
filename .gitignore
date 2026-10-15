@@ -1,0 +1,18 @@
+# Rust
+/engine/target/
+/engine/data/
+/engine/devdata/
+
+# Android
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/app/src/main/jniLibs/
+*.apk
+*.aab
+*.keystore
+
+# misc
+.DS_Store
+*.log

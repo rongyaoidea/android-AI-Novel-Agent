@@ -1,0 +1,38 @@
+[package]
+name = "ainovel-engine"
+version = "0.1.0"
+edition = "2021"
+description = "本地优先的 AI 小说引擎（Android 本地运行，零 Linux 用户态）"
+license = "MIT"
+
+[lib]
+name = "ainovel_engine"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "ainovel"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = "0.7"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+jni = { version = "0.21", optional = true }
+
+[features]
+default = []
+jni = ["dep:jni"]
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
