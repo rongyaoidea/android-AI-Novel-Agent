@@ -61,6 +61,9 @@ pub struct Chapter {
     pub summary: String,
     pub status: String,
     pub review_json: Option<String>,
+    /// 本地文风检查报告（JSON；空串 = 未检查）
+    #[serde(default)]
+    pub style_report: String,
     pub created_at: String,
     pub updated_at: String,
 }

@@ -416,6 +416,7 @@ async fn get_chapter(
         "words": ch.content.chars().count(),
         "status": ch.status,
         "review": ch.review_json,
+        "style_report": serde_json::from_str::<serde_json::Value>(&ch.style_report).ok(),
     })))
 }
 
@@ -667,7 +668,7 @@ async fn review_chapter(
             .unwrap_or_default(),
     };
     e.db.save_chapter_review(&id, idx, &review).map_err(err)?;
-    e.hub.publish(pipeline::EngineEvent::ChapterReview {
+    e.hub.publish(&id, pipeline::EngineEvent::ChapterReview {
         chapter_idx: idx,
         ok: review.ok,
         issues: review.issues.len(),
@@ -802,7 +803,7 @@ async fn extract_chapter(
         (StatusCode::INTERNAL_SERVER_ERROR, "整理输出不是 JSON".to_string())
     })?;
     let (chars, fores) = pipeline::apply_extraction(&e.db, &id, idx, &j);
-    e.hub.publish(pipeline::EngineEvent::LedgerUpdated {
+    e.hub.publish(&id, pipeline::EngineEvent::LedgerUpdated {
         chapter_idx: idx,
         characters: chars,
         foreshadowings: fores,
@@ -971,10 +972,17 @@ async fn events(
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let mut rx = e.hub.subscribe();
     let snapshot = e.db.latest_run(&id).ok().flatten();
+    // 重连回放：本运行的关键事件（Token 不入缓冲）
+    let history = e.hub.history(&id);
     let stream = async_stream::stream! {
         if let Some(run) = snapshot {
             let payload = json!({"type": "snapshot", "run": run}).to_string();
             yield Ok(Event::default().event("engine").data(payload));
+        }
+        for ev in history {
+            if let Ok(s) = serde_json::to_string(&ev) {
+                yield Ok(Event::default().event("engine").data(s));
+            }
         }
         loop {
             match rx.recv().await {

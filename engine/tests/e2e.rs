@@ -1438,3 +1438,112 @@ async fn prompt_overrides_endpoints() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 本地文风检查 + 自动重写：报告落库、意见并入审校、重写计入用量且只重试一次
+#[tokio::test]
+async fn style_report_and_auto_retry() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-stylecheck-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    // 建书：绑定「发疯毒舌」（要求对话占比 ≥ 42%，Mock 正文无对话 → 必触发自动重写）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "文风检查测试", "chapters": 1, "style_preset": "shadiao"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+
+    let mut status = String::new();
+    for _ in 0..500 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        status = v["run"]["status"].as_str().unwrap_or("").to_string();
+        if status == "done" {
+            break;
+        }
+        assert_ne!(status, "failed", "run failed: {}", v["run"]["error"]);
+    }
+    assert_eq!(status, "done", "自动重写不应导致运行失败");
+
+    // 章节详情：文风报告存在且判不通过（Mock 段落等长 + 无对话）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/chapters/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    let report = &v["style_report"];
+    assert!(!report.is_null(), "应写入文风检查报告: {v}");
+    assert_eq!(report["style"], "shadiao");
+    assert_eq!(report["hard_fail"], true, "Mock 文本应命中硬指标: {report}");
+    let failed: Vec<&str> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["passed"] == false)
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(failed.iter().any(|n| *n == "段落长短交错"), "{failed:?}");
+    assert!(failed.iter().any(|n| *n == "对话占比"), "{failed:?}");
+
+    // 审校意见应并入「文风检查：…」
+    let review_raw = v["review"].as_str().unwrap_or("");
+    assert!(review_raw.contains("文风检查"), "审校应包含文风检查意见: {review_raw}");
+
+    // 用量：正文 1 次 + 重写 1 次（且只重试一次）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/usage"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let u = json_body(resp).await;
+    let task_calls = |key: &str| -> i64 {
+        u["by_task"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["key"] == key)
+            .map(|g| g["calls"].as_i64().unwrap_or(0))
+            .unwrap_or(0)
+    };
+    assert_eq!(task_calls("chapter"), 1, "正文应只生成一次");
+    assert_eq!(task_calls("chapter_retry"), 1, "硬指标不通过应重写一次（且仅一次）: {u}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

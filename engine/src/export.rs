@@ -55,6 +55,7 @@ mod tests {
             summary: String::new(),
             status: "done".into(),
             review_json: None,
+            style_report: String::new(),
             created_at: "t".into(),
             updated_at: "t".into(),
         };

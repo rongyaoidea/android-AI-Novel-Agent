@@ -30,6 +30,8 @@ const state = {
   foreshadowings: [],
   styles: null,
   promptTask: null,
+  shelfSort: "updated",
+  shelfQuery: "",
 };
 
 /* ---------------- 工具 ---------------- */
@@ -217,13 +219,32 @@ async function loadShelf() {
 }
 
 function shelfFiltered(key) {
-  const items = state.shelfItems;
+  let items = state.shelfItems;
   if (key === "active") {
-    return items.filter((i) => i.run_status === "running" || i.novel.status === "writing" || i.novel.status === "await_confirm");
+    items = items.filter((i) => i.run_status === "running" || i.novel.status === "writing" || i.novel.status === "await_confirm");
+  } else if (key === "done") {
+    items = items.filter((i) => i.novel.status === "drafted");
+  } else if (key === "failed") {
+    items = items.filter((i) => i.novel.status === "failed" || i.run_status === "failed");
   }
-  if (key === "done") return items.filter((i) => i.novel.status === "drafted");
-  if (key === "failed") return items.filter((i) => i.novel.status === "failed" || i.run_status === "failed");
-  return items;
+  const q = (state.shelfQuery || "").trim().toLowerCase();
+  if (q) {
+    items = items.filter((i) => {
+      const n = i.novel;
+      return [n.title, n.idea, n.logline].filter(Boolean).join(" ").toLowerCase().includes(q);
+    });
+  }
+  const sorted = items.slice();
+  const sort = state.shelfSort || "updated";
+  if (sort === "words") {
+    sorted.sort((a, b) => (b.words || 0) - (a.words || 0));
+  } else if (sort === "progress") {
+    const pct = (i) => (i.chapters_target ? (i.chapters_done || 0) / i.chapters_target : 0);
+    sorted.sort((a, b) => pct(b) - pct(a));
+  } else {
+    sorted.sort((a, b) => String(b.novel.updated_at || "").localeCompare(String(a.novel.updated_at || "")));
+  }
+  return sorted;
 }
 
 function renderShelf() {
@@ -286,6 +307,14 @@ function renderShelf() {
 }
 
 function bindShelf() {
+  $("#shelf-search").addEventListener("input", (e) => {
+    state.shelfQuery = e.target.value;
+    renderShelf();
+  });
+  $("#shelf-sort").addEventListener("change", (e) => {
+    state.shelfSort = e.target.value;
+    renderShelf();
+  });
   $("#shelf-grid").addEventListener("click", async (e) => {
     const card = e.target.closest(".novel-card");
     const act = e.target.closest("[data-act]");
@@ -662,6 +691,7 @@ const USAGE_TASK_LABEL = {
   brief: "立项方案",
   outline: "章节规划",
   chapter: "正文生成",
+  chapter_retry: "文风重写",
   review: "章节审校",
   polish: "选段修文",
   continue: "光标续写",
@@ -1021,6 +1051,7 @@ async function openEditor(idx) {
   const c = await api(`/api/novels/${state.novelId}/chapters/${idx}`);
   $("#reader-title").textContent = `第${c.idx}章 ${c.title || ""}`;
   renderReviewChips(c.review);
+  renderStyleReport(c.style_report);
   $("#reader-goal").textContent = [
     c.goal ? `本章目标：${c.goal}` : "",
     c.words ? `字数：${c.words}` : "",
@@ -1067,6 +1098,39 @@ function renderReviewChips(raw) {
         })
         .join("")
     : `<span class="chip chip-success">审校通过</span>`;
+}
+
+/** 本地文风检查结果（零 token）：每项规则 ✓/✗ + 细节 */
+function renderStyleReport(report) {
+  const el = $("#reader-style");
+  if (!el) return;
+  if (!report || !Array.isArray(report.checks) || !report.checks.length) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  const styleName = (() => {
+    const s = styleById(report.style);
+    return s ? s.name : report.style;
+  })();
+  el.hidden = false;
+  const failed = report.checks.filter((c) => !c.passed);
+  const detailEl = $("#reader-style-detail");
+  if (detailEl) {
+    detailEl.textContent = failed.length
+      ? failed.map((c) => `${c.name}：${c.detail}`).join("；")
+      : "";
+    detailEl.hidden = true;
+  }
+  el.innerHTML =
+    `<span class="chip chip-dark">文风检查 · ${esc(styleName)}</span>` +
+    report.checks
+      .map((c) => {
+        const cls = c.passed ? "chip-success" : c.hard ? "chip-danger" : "chip-warning";
+        return `<span class="chip ${cls}" title="${esc(c.detail)}">${c.passed ? "✓" : "✗"} ${esc(c.name)}</span>`;
+      })
+      .join("") +
+    (failed.length ? `<span class="chip chip-filter" data-styledetail="1" title="点击查看细节">细节</span>` : "");
 }
 
 function draftKey(idx) {
@@ -1145,6 +1209,11 @@ function bindEditor() {
     if (!chip) return;
     const issue = (state.editorIssues || [])[parseInt(chip.dataset.fix, 10)];
     if (issue) fixIssue(issue).catch((err) => toast(err.message, true));
+  });
+  $("#reader-style").addEventListener("click", (e) => {
+    if (!e.target.closest("[data-styledetail]")) return;
+    const d = $("#reader-style-detail");
+    if (d) d.hidden = !d.hidden;
   });
   $$("[data-polish]").forEach((btn) => {
     btn.onclick = () => runPolish(btn.dataset.polish).catch((err) => toast(err.message, true));

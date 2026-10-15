@@ -4,9 +4,32 @@ use futures_util::StreamExt;
 use crate::models::{LlmSettings, TokenUsage, UsageRecord};
 
 /// 一次 LLM 调用的返回：文本 + 归一化后的 token 用量
+#[derive(Debug)]
 pub struct LlmOutput {
     pub text: String,
     pub usage: TokenUsage,
+}
+
+/// 单次请求的最大尝试次数（含首次）
+const MAX_ATTEMPTS: usize = 3;
+
+/// 可自动重试的 HTTP 状态：限流 / 超时 / 服务端错误
+pub fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+/// 退避时长：0.8s、1.6s…（约 -10% ~ +10% 抖动，避免多书同时重试形成尖峰）
+pub fn backoff_delay(attempt: usize) -> std::time::Duration {
+    let base_ms = 800u64.saturating_mul(1 << attempt.min(4));
+    let span = base_ms / 5 + 1; // 最大抖动范围
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+        % span;
+    std::time::Duration::from_millis(base_ms - base_ms / 10 + jitter)
 }
 
 /// 极简 LLM 客户端：
@@ -56,7 +79,7 @@ impl Llm {
         }
     }
 
-    /// 非流式补全
+    /// 非流式补全（含网络/限流/5xx 自动重试与退避）
     pub async fn complete(&self, system: &str, user: &str) -> anyhow::Result<LlmOutput> {
         if self.settings.provider == "mock" {
             let text = mock_complete(user)?;
@@ -65,8 +88,7 @@ impl Llm {
         }
         let body = self.base_body(system, user, false);
         let resp = self
-            .auth(self.http.post(self.endpoint()).json(&body))
-            .send()
+            .send_with_retry(|| self.auth(self.http.post(self.endpoint()).json(&body)))
             .await
             .context("LLM 请求失败（网络）")?;
         let status = resp.status();
@@ -81,6 +103,48 @@ impl Llm {
             .map(|s| s.trim().to_string())
             .ok_or_else(|| anyhow!("LLM 响应缺少 content 字段: {}", truncate(&text, 300)))?;
         Ok(LlmOutput { text: out, usage })
+    }
+
+    /// 带重试的请求发送：网络错误（超时/连接/请求）与 408/429/5xx 自动退避重试。
+    /// 非可重试错误（400/401 等）原样返回，交由调用方处理。
+    async fn send_with_retry(
+        &self,
+        make: impl Fn() -> reqwest::RequestBuilder,
+    ) -> anyhow::Result<reqwest::Response> {
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match make().send().await {
+                Ok(resp) => {
+                    if is_retryable_status(resp.status()) && attempt + 1 < MAX_ATTEMPTS {
+                        tracing::warn!(
+                            "LLM HTTP {} 可重试，第 {}/{} 次退避后重试",
+                            resp.status(),
+                            attempt + 1,
+                            MAX_ATTEMPTS - 1
+                        );
+                        tokio::time::sleep(backoff_delay(attempt)).await;
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    let retryable = e.is_timeout() || e.is_connect() || e.is_request();
+                    if retryable && attempt + 1 < MAX_ATTEMPTS {
+                        tracing::warn!(
+                            "LLM 网络错误（{}），第 {}/{} 次退避后重试",
+                            e,
+                            attempt + 1,
+                            MAX_ATTEMPTS - 1
+                        );
+                        tokio::time::sleep(backoff_delay(attempt)).await;
+                        last_err = Some(e.into());
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("LLM 请求失败（重试耗尽）")))
     }
 
     /// 流式生成：逐片回调 delta，返回完整文本与用量
@@ -99,8 +163,7 @@ impl Llm {
         // 部分兼容实现不认 stream_options：遇到 400 去掉该字段重试一次
         let mut body = self.base_body(system, user, true);
         let mut resp = self
-            .auth(self.http.post(self.endpoint()).json(&body))
-            .send()
+            .send_with_retry(|| self.auth(self.http.post(self.endpoint()).json(&body)))
             .await
             .context("LLM 流式请求失败（网络）")?;
         if resp.status() == reqwest::StatusCode::BAD_REQUEST {
@@ -571,5 +634,99 @@ mod tests {
         assert_eq!(u.total, Some(u.input.unwrap() + u.output.unwrap()));
         assert_eq!(u.input, Some(u.cache_hit.unwrap() + u.cache_miss.unwrap()));
         assert!(u.cache_hit.unwrap() <= u.input.unwrap());
+    }
+
+    // ---------- 重试与退避 ----------
+
+    #[test]
+    fn retryable_status_classification() {
+        use reqwest::StatusCode;
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn backoff_is_increasing_and_bounded() {
+        let d0 = backoff_delay(0).as_millis() as u64;
+        let d1 = backoff_delay(1).as_millis() as u64;
+        let d2 = backoff_delay(2).as_millis() as u64;
+        assert!((600..=1000).contains(&d0), "d0={d0}");
+        assert!(d1 > d0, "d1={d1} d0={d0}");
+        assert!(d2 > d1, "d2={d2} d1={d1}");
+        assert!(backoff_delay(10).as_millis() <= 20_000, "上限应受约束");
+    }
+
+    fn flaky_app(hits: std::sync::Arc<std::sync::atomic::AtomicUsize>, fail_times: usize) -> axum::Router {
+        use axum::response::IntoResponse;
+        axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let hits = hits.clone();
+                async move {
+                    let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n < fail_times {
+                        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response();
+                    }
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok-text"}}],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                    }))
+                    .into_response()
+                }
+            }),
+        )
+    }
+
+    fn llm_for(addr: std::net::SocketAddr) -> Llm {
+        Llm::new(LlmSettings {
+            provider: "openai".into(),
+            base_url: format!("http://{addr}/v1"),
+            api_key: String::new(),
+            model: "test-model".into(),
+            temperature: 0.5,
+        })
+    }
+
+    /// 集成：前两次 500、第三次成功 → 自动重试后正常返回（含用量解析）
+    #[tokio::test]
+    async fn retries_on_5xx_then_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let app = flaky_app(hits.clone(), 2);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let llm = llm_for(addr);
+        let out = llm.complete("system", "user").await.unwrap();
+        assert_eq!(out.text, "ok-text");
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "应为 2 次失败 + 1 次成功");
+        assert_eq!(out.usage.input, Some(10));
+    }
+
+    /// 集成：持续 500 → 重试耗尽返回错误，且尝试次数受限（不会无限重试）
+    #[tokio::test]
+    async fn gives_up_after_max_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let app = flaky_app(hits.clone(), usize::MAX);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let llm = llm_for(addr);
+        let err = llm.complete("system", "user").await.unwrap_err();
+        assert!(format!("{err}").contains("500"), "错误应带状态码: {err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "最多尝试 3 次");
     }
 }

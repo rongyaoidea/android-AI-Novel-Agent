@@ -22,19 +22,54 @@ pub enum EngineEvent {
     RunFailed { run_id: String, error: String },
 }
 
+/// 事件中心：广播给 SSE 订阅者 + 每书保留最近 N 条关键事件的环形缓冲
+/// （刷新页面后重连可回放到日志面板；Token 流不进入缓冲）
 #[derive(Clone)]
 pub struct EventHub {
     tx: broadcast::Sender<EngineEvent>,
+    history: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<EngineEvent>>>,
+    >,
 }
+
+const HISTORY_CAPACITY: usize = 300;
+const HISTORY_MAX_NOVELS: usize = 200;
 
 impl EventHub {
     pub fn new() -> Self {
         let (tx, _rx) = broadcast::channel(2048);
-        Self { tx }
+        Self {
+            tx,
+            history: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
     }
 
-    pub fn publish(&self, ev: EngineEvent) {
+    pub fn publish(&self, novel_id: &str, ev: EngineEvent) {
+        // 关键事件进历史（Token 是流式增量，不入缓冲）
+        if !matches!(ev, EngineEvent::Token { .. }) {
+            if let Ok(mut h) = self.history.lock() {
+                if h.len() > HISTORY_MAX_NOVELS && !h.contains_key(novel_id) {
+                    if let Some(k) = h.keys().next().cloned() {
+                        h.remove(&k);
+                    }
+                }
+                let q = h.entry(novel_id.to_string()).or_default();
+                if q.len() >= HISTORY_CAPACITY {
+                    q.pop_front();
+                }
+                q.push_back(ev.clone());
+            }
+        }
         let _ = self.tx.send(ev);
+    }
+
+    /// 某本书的关键事件历史（用于 SSE 重连回放）
+    pub fn history(&self, novel_id: &str) -> Vec<EngineEvent> {
+        self.history
+            .lock()
+            .ok()
+            .and_then(|h| h.get(novel_id).map(|q| q.iter().cloned().collect()))
+            .unwrap_or_default()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
@@ -54,7 +89,7 @@ pub fn spawn(engine: Arc<Engine>, novel_id: &str, chapters: i64) -> anyhow::Resu
     let run = engine.db.create_run(novel_id, chapters)?;
     let run_id = run.id.clone();
     engine.db.set_novel_status(novel_id, "writing")?;
-    engine.hub.publish(EngineEvent::RunStarted {
+    engine.hub.publish(novel_id, EngineEvent::RunStarted {
         run_id: run_id.clone(),
         novel_id: novel_id.to_string(),
         chapters,
@@ -67,7 +102,7 @@ pub fn spawn(engine: Arc<Engine>, novel_id: &str, chapters: i64) -> anyhow::Resu
             let msg = format!("{e:#}");
             let _ = engine2.db.update_run(&rid, "failed", "failed", 0, Some(&msg));
             let _ = engine2.db.set_novel_status(&nid, "failed");
-            engine2.hub.publish(EngineEvent::RunFailed { run_id: rid, error: msg });
+            engine2.hub.publish(&nid, EngineEvent::RunFailed { run_id: rid, error: msg });
         }
     });
     Ok(run_id)
@@ -89,7 +124,7 @@ async fn run_inner(
         .get_novel(novel_id)?
         .ok_or_else(|| anyhow::anyhow!("novel not found: {novel_id}"))?;
     if novel.title.trim().is_empty() {
-        engine.hub.publish(EngineEvent::Stage {
+        engine.hub.publish(novel_id, EngineEvent::Stage {
             stage: "brief".into(),
             message: "生成立项方案…".into(),
         });
@@ -123,7 +158,7 @@ async fn run_inner(
     if !missing.is_empty() {
         let from = missing[0];
         let to = chapters;
-        engine.hub.publish(EngineEvent::Stage {
+        engine.hub.publish(novel_id, EngineEvent::Stage {
             stage: "outline".into(),
             message: if from == 1 {
                 "生成章节规划…".into()
@@ -190,7 +225,7 @@ async fn run_inner(
         if novel.mode == "staged" {
             engine.db.update_run(run_id, "paused", "await_confirm", 0, None)?;
             engine.db.set_novel_status(novel_id, "await_confirm")?;
-            engine.hub.publish(EngineEvent::RunPaused {
+            engine.hub.publish(novel_id, EngineEvent::RunPaused {
                 run_id: run_id.to_string(),
                 novel_id: novel_id.to_string(),
                 message: "章节规划已生成，确认后可继续写作".into(),
@@ -238,7 +273,7 @@ async fn run_inner(
             String::new()
         };
 
-        engine.hub.publish(EngineEvent::Stage {
+        engine.hub.publish(novel_id, EngineEvent::Stage {
             stage: "draft".into(),
             message: format!("正在写第 {idx} 章…"),
         });
@@ -275,7 +310,7 @@ async fn run_inner(
                 buf.push_str(delta);
                 if buf.chars().count() >= 80 {
                     let chunk = std::mem::take(&mut buf);
-                    hub.publish(EngineEvent::Token {
+                    hub.publish(novel_id, EngineEvent::Token {
                         chapter_idx: idx,
                         delta: chunk,
                     });
@@ -286,7 +321,7 @@ async fn run_inner(
         let content = streamed.text;
         if !buf.is_empty() {
             let chunk = std::mem::take(&mut buf);
-            engine.hub.publish(EngineEvent::Token {
+            engine.hub.publish(novel_id, EngineEvent::Token {
                 chapter_idx: idx,
                 delta: chunk,
             });
@@ -295,25 +330,84 @@ async fn run_inner(
         if content.is_empty() {
             anyhow::bail!("第 {idx} 章生成内容为空");
         }
+
+        // ---- 文风一致性检查（本地、零 token）----
+        // 命中硬指标（段落等长 / 对话占比严重不足 / 禁用短语等）时自动重写一次，取表现更好的一稿。
+        let style = crate::styles::find(&novel.style_preset);
+        let mut content = content;
+        let mut report = style.map(|p| crate::style_check::check_chapter(p, &content));
+        if let (Some(p), Some(r)) = (style, report.as_ref()) {
+            if r.hard_fail {
+                engine.hub.publish(novel_id, EngineEvent::Stage {
+                    stage: "draft".into(),
+                    message: format!(
+                        "第 {idx} 章未通过文风检查（{}），自动重写一次…",
+                        r.summary()
+                    ),
+                });
+                let usr_retry = format!(
+                    "{usr}\n\n【上一稿未通过文风检查，请重写】问题：{}。请严格按文风预设修正后重写本章。",
+                    r.summary()
+                );
+                let mut buf2 = String::new();
+                let hub2 = engine.hub.clone();
+                let streamed2 = llm
+                    .stream(&sys, &usr_retry, |delta: &str| {
+                        buf2.push_str(delta);
+                        if buf2.chars().count() >= 80 {
+                            let chunk = std::mem::take(&mut buf2);
+                            hub2.publish(novel_id, EngineEvent::Token {
+                                chapter_idx: idx,
+                                delta: chunk,
+                            });
+                        }
+                    })
+                    .await?;
+                record_usage(
+                    &engine.db,
+                    Some(novel_id),
+                    Some(idx),
+                    "chapter_retry",
+                    &settings,
+                    &streamed2.usage,
+                );
+                if !buf2.is_empty() {
+                    let chunk = std::mem::take(&mut buf2);
+                    engine.hub.publish(novel_id, EngineEvent::Token {
+                        chapter_idx: idx,
+                        delta: chunk,
+                    });
+                }
+                let c2 = streamed2.text.trim().to_string();
+                if !c2.is_empty() {
+                    let r2 = crate::style_check::check_chapter(p, &c2);
+                    if r2.score() >= r.score() {
+                        content = c2;
+                        report = Some(r2);
+                    }
+                }
+            }
+        }
+
         engine.db.save_chapter_content(novel_id, idx, &content, "drafted")?;
-        engine.hub.publish(EngineEvent::ChapterSaved {
+        if let Some(r) = &report {
+            engine.db
+                .save_chapter_style_report(novel_id, idx, &serde_json::to_string(r)?)?;
+        }
+        engine.hub.publish(novel_id, EngineEvent::ChapterSaved {
             chapter_idx: idx,
             title: ch.title.clone(),
             words: content.chars().count(),
         });
 
         // 审校：非阻塞 —— 失败只记录日志，不中断生产链
-        let (rsys, rusr) = crate::prompts::review_prompt(
-            &content,
-            crate::styles::find(&novel.style_preset),
-            &ov,
-        );
+        let (rsys, rusr) = crate::prompts::review_prompt(&content, style, &ov);
         match llm.complete(&rsys, &rusr).await {
             Ok(out) => {
                 record_usage(&engine.db, Some(novel_id), Some(idx), "review", &settings, &out.usage);
                 let raw = out.text;
                 if let Some(j) = extract_json_object(&raw) {
-                    let review = Review {
+                    let mut review = Review {
                         ok: j["ok"].as_bool().unwrap_or(true),
                         issues: j["issues"]
                             .as_array()
@@ -328,8 +422,12 @@ async fn run_inner(
                             })
                             .unwrap_or_default(),
                     };
+                    // 本地文风检查结果并入审校意见，保持单一入口
+                    if let Some(r) = &report {
+                        review.issues.extend(r.as_review_issues());
+                    }
                     engine.db.save_chapter_review(novel_id, idx, &review)?;
-                    engine.hub.publish(EngineEvent::ChapterReview {
+                    engine.hub.publish(novel_id, EngineEvent::ChapterReview {
                         chapter_idx: idx,
                         ok: review.ok,
                         issues: review.issues.len(),
@@ -347,7 +445,7 @@ async fn run_inner(
                 let raw = out.text;
                 if let Some(j) = extract_json_object(&raw) {
                     let (chars, fores) = apply_extraction(&engine.db, novel_id, idx, &j);
-                    engine.hub.publish(EngineEvent::LedgerUpdated {
+                    engine.hub.publish(novel_id, EngineEvent::LedgerUpdated {
                         chapter_idx: idx,
                         characters: chars,
                         foreshadowings: fores,
@@ -363,7 +461,7 @@ async fn run_inner(
 
     engine.db.update_run(run_id, "done", "done", chapters, None)?;
     engine.db.set_novel_status(novel_id, "drafted")?;
-    engine.hub.publish(EngineEvent::RunFinished {
+    engine.hub.publish(novel_id, EngineEvent::RunFinished {
         run_id: run_id.to_string(),
     });
     Ok(())

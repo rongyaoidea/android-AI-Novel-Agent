@@ -9,6 +9,17 @@
 
 use serde::Serialize;
 
+/// 可本地检查的量化约束（配合 style_check.rs；`None` = 不做该项检查）
+#[derive(Debug, Clone, Serialize)]
+pub struct StyleChecks {
+    /// 最低对话占比（0.42 = 42%）
+    pub min_dialogue_ratio: Option<f32>,
+    /// 单句最长字数
+    pub max_sentence_len: Option<usize>,
+    /// 是否禁用现代词（古风 / 纪实）
+    pub forbid_modern_words: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StylePreset {
     pub id: &'static str,
@@ -23,6 +34,8 @@ pub struct StylePreset {
     pub traits: &'static [(&'static str, &'static str)],
     /// 单章字数窗口
     pub word_target: &'static str,
+    /// 本地可检查的量化约束
+    pub checks: StyleChecks,
     /// 写作规则（注入提示词）
     pub rules: &'static [&'static str],
     /// 反例清单（注入提示词；出现即视为不合格）
@@ -53,6 +66,7 @@ pub static PRESETS: &[StylePreset] = &[
         genres: "无限流 / 规则怪谈 / 悬疑推理 / 末世求生 / 盗墓",
         traits: &[("视角", "第三人称严格限知"), ("节奏", "每章 1 个谜题环节"), ("爽点", "反转揭示，非战力碾压")],
         word_target: "2000~2400 字",
+        checks: StyleChecks { min_dialogue_ratio: None, max_sentence_len: None, forbid_modern_words: false },
         rules: &[
             "第三人称严格限知：主角看不到、不知道的信息一律不写（包括上帝视角的环境描写）",
             "每章推进 1 个谜题环节，章末必须留下至少 1 个未解事实",
@@ -77,6 +91,7 @@ pub static PRESETS: &[StylePreset] = &[
         genres: "都市高武 / 神话复苏 / 末世 / 群像战争",
         traits: &[("句式", "战斗 6~15 字短句连打"), ("抒情", "≤ 单章 25%"), ("群像", "每卷 1 个配角高光")],
         word_target: "2000~2400 字",
+        checks: StyleChecks { min_dialogue_ratio: None, max_sentence_len: None, forbid_modern_words: false },
         rules: &[
             "战斗段落用 6~15 字短句连打；抒情段落用 20~40 字排比，但抒情合计不超过本章 25%",
             "每卷至少给 1 个非主角角色一整场独立高光（配角可以先于主角变强）",
@@ -97,6 +112,7 @@ pub static PRESETS: &[StylePreset] = &[
         genres: "都市 / 神豪 / 签到系统 / 逆袭打脸",
         traits: &[("爽点", "每章 1 次立刻兑现"), ("对话", "≥ 35%"), ("规则", "全书一致可算账")],
         word_target: "2000~2400 字",
+        checks: StyleChecks { min_dialogue_ratio: Some(0.33), max_sentence_len: None, forbid_modern_words: false },
         rules: &[
             "金手指的奖励条件、冷却、叠加方式第一次出现就写清，全书保持一致，读者能算账",
             "每章至少 1 个立刻兑现的爽点（到账/打脸/身份曝光），兑现过程要有具体画面",
@@ -117,6 +133,7 @@ pub static PRESETS: &[StylePreset] = &[
         genres: "东方玄幻 / 升级流 / 废材逆袭",
         traits: &[("打脸", "每 2~3 章一次"), ("憋屈", "不超过 1 章"), ("改编", "每章 1 个 30 秒冲突画面")],
         word_target: "2000~2400 字",
+        checks: StyleChecks { min_dialogue_ratio: None, max_sentence_len: None, forbid_modern_words: false },
         rules: &[
             "每 2~3 章一次小打脸；打脸双方的地位差距要写清，围观群众要有名字有身份",
             "境界/器/阶术语全书统一，用词从简，避免生僻自造词堆砌",
@@ -136,6 +153,7 @@ pub static PRESETS: &[StylePreset] = &[
         genres: "修仙 / 种田 / 经营 / 年代日常",
         traits: &[("战斗", "≤ 单章 15%"), ("情绪", "温情 4 幽默 4 战斗 2"), ("结构", "时间流逝感")],
         word_target: "2000~2400 字",
+        checks: StyleChecks { min_dialogue_ratio: None, max_sentence_len: None, forbid_modern_words: false },
         rules: &[
             "每章允许 0 场战斗，但必须有 1 个「时间流逝感」细节（同辈老去/季节更替/物价变化）",
             "战斗一笔带过（不超过全章 15%），结果碾压胜过过程描写",
@@ -156,6 +174,7 @@ pub static PRESETS: &[StylePreset] = &[
         genres: "盗墓 / 鉴宝 / 行业文 / 年代 / 民国",
         traits: &[("人称", "第一人称回忆录体"), ("真实感", "每章 1 个可查证锚点"), ("爽点", "知识碾压")],
         word_target: "2000~2400 字",
+        checks: StyleChecks { min_dialogue_ratio: None, max_sentence_len: None, forbid_modern_words: true },
         rules: &[
             "第一人称「我」回忆录体，语气平实，允许自嘲与疲惫感",
             "每章至少 1 个可查证的真实地名/器物/术语做真实感锚点",
@@ -176,6 +195,7 @@ pub static PRESETS: &[StylePreset] = &[
         genres: "娱乐圈 / 穿书 / 恋综 / 都市发疯",
         traits: &[("对话", "≥ 45%"), ("金句", "每章 1 句独立成段"), ("场景", "公共场合")],
         word_target: "1800~2200 字",
+        checks: StyleChecks { min_dialogue_ratio: Some(0.42), max_sentence_len: Some(45), forbid_modern_words: false },
         rules: &[
             "对话占比 45% 以上；叙述句尽量短，禁止超过 40 字的长句",
             "每章至少 1 句「可截图金句」，独立成段、放在段落末尾",
@@ -196,6 +216,7 @@ pub static PRESETS: &[StylePreset] = &[
         genres: "游戏降临 / 末世 / 无限流 / 穿书 / 大女主",
         traits: &[("感情线", "零恋爱线"), ("爽点", "每 10 章 1 次身份解锁"), ("群像", "女性角色 ≥ 2/3")],
         word_target: "2000~2400 字",
+        checks: StyleChecks { min_dialogue_ratio: None, max_sentence_len: None, forbid_modern_words: false },
         rules: &[
             "零恋爱线；第一章必须完成一次对剧情原设的主动改写（抢先机/破坏关键节点）",
             "每条机缘配一个明确的战力或资源增量，用独立段落呈现",
@@ -216,6 +237,7 @@ pub static PRESETS: &[StylePreset] = &[
         genres: "现言 / 都市情感 / 追妻火葬场 / 甜虐",
         traits: &[("拉扯", "每章 1 次进退张力"), ("对话", "≥ 50% 情绪表达"), ("配比", "甜 6 虐 4")],
         word_target: "2000~2400 字",
+        checks: StyleChecks { min_dialogue_ratio: Some(0.45), max_sentence_len: None, forbid_modern_words: false },
         rules: &[
             "感情推进落到具体日常互动（修水管/顺路送伞/深夜加班），禁止靠物质铺张示好",
             "每章至少 1 次「靠近一步又退半步」的张力设计",
@@ -236,6 +258,7 @@ pub static PRESETS: &[StylePreset] = &[
         genres: "古代言情 / 宅斗 / 宫斗 / 权谋 / 大女主",
         traits: &[("章名", "2 字为主"), ("考据", "每 800 字 1 处器物/礼制"), ("情绪", "含蓄外化")],
         word_target: "2000~2400 字",
+        checks: StyleChecks { min_dialogue_ratio: None, max_sentence_len: None, forbid_modern_words: true },
         rules: &[
             "章名 2 字为主（归来/门户/毒死），章名本身就是钩子",
             "每 800 字至少 1 处具体的器物、礼制、节令或称谓细节",
@@ -310,6 +333,24 @@ mod tests {
                 p.id,
                 p.group
             );
+        }
+    }
+
+    #[test]
+    fn checks_field_is_wired() {
+        assert!(
+            PRESETS.iter().any(|p| p.checks.min_dialogue_ratio.is_some()),
+            "至少一个预设应有对话占比要求"
+        );
+        assert!(
+            PRESETS.iter().filter(|p| p.checks.forbid_modern_words).count() >= 2,
+            "古风/纪实应禁现代词"
+        );
+        assert_eq!(find("shadiao").unwrap().checks.max_sentence_len, Some(45));
+        for p in PRESETS {
+            if let Some(r) = p.checks.min_dialogue_ratio {
+                assert!((0.1..=0.9).contains(&r), "{} 对话占比阈值不合理", p.id);
+            }
         }
     }
 

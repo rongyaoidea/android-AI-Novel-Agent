@@ -108,6 +108,14 @@
         <div class="page-actions">
           <button class="btn btn-primary" id="shelf-create"><svg class="ic"><use href="#i-pen"/></svg>创建新小说</button>
           <button class="btn btn-outline" id="shelf-refresh"><svg class="ic"><use href="#i-refresh"/></svg>刷新</button>
+          <div class="shelf-tools">
+            <input id="shelf-search" class="input-sm" placeholder="搜索书名 / 灵感" />
+            <select id="shelf-sort" class="input-sm" title="排序方式">
+              <option value="updated">最近更新</option>
+              <option value="words">字数最多</option>
+              <option value="progress">进度最高</option>
+            </select>
+          </div>
         </div>
         <div class="chips" id="shelf-filters"></div>
         <div class="novel-grid" id="shelf-grid"></div>
@@ -331,6 +339,8 @@
       <button class="btn btn-ghost" id="reader-close">关闭</button>
     </div>
     <div class="chips" id="reader-review"></div>
+    <div class="chips" id="reader-style" hidden></div>
+    <p class="muted" id="reader-style-detail" hidden style="margin:0;"></p>
     <p class="muted" id="reader-goal" style="margin:0;"></p>
     <p class="muted" id="reader-summary" style="margin:0;"></p>
     <div class="reader-toolbar">

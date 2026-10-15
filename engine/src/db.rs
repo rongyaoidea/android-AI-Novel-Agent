@@ -19,7 +19,7 @@ fn now() -> String {
 }
 
 const NOVEL_COLS: &str = "id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at,style_preset";
-const CHAPTER_COLS: &str = "id,novel_id,idx,title,goal,beats_json,content,summary,status,review_json,created_at,updated_at";
+const CHAPTER_COLS: &str = "id,novel_id,idx,title,goal,beats_json,content,summary,status,review_json,created_at,updated_at,style_report";
 const RUN_COLS: &str = "id,novel_id,status,stage,chapter_cursor,chapters_target,error,created_at,updated_at";
 
 impl Db {
@@ -154,6 +154,12 @@ impl Db {
             "novels",
             "style_preset",
             "style_preset TEXT NOT NULL DEFAULT ''",
+        )?;
+        Self::ensure_column(
+            &conn,
+            "chapters",
+            "style_report",
+            "style_report TEXT NOT NULL DEFAULT ''",
         )?;
         // 旧库升级：补 chapters.summary 列
         Self::ensure_column(&conn, "chapters", "summary", "summary TEXT NOT NULL DEFAULT ''")?;
@@ -344,7 +350,7 @@ impl Db {
 
     fn map_chapter(row: &Row<'_>) -> rusqlite::Result<Chapter> {
         // 列顺序: id(0) novel_id(1) idx(2) title(3) goal(4) beats_json(5)
-        //          content(6) summary(7) status(8) review_json(9) created_at(10) updated_at(11)
+        //          content(6) summary(7) status(8) review_json(9) created_at(10) updated_at(11) style_report(12)
         let beats_json: String = row.get(5)?;
         Ok(Chapter {
             id: row.get(0)?,
@@ -359,6 +365,7 @@ impl Db {
             review_json: row.get(9)?,
             created_at: row.get(10)?,
             updated_at: row.get(11)?,
+            style_report: row.get(12)?,
         })
     }
 
@@ -411,6 +418,21 @@ impl Db {
         conn.execute(
             "UPDATE chapters SET review_json=?3, updated_at=?4 WHERE novel_id=?1 AND idx=?2",
             params![novel_id, idx, serde_json::to_string(review)?, now()],
+        )?;
+        Ok(())
+    }
+
+    /// 保存本地文风检查报告（JSON 字符串；空串表示未检查）
+    pub fn save_chapter_style_report(
+        &self,
+        novel_id: &str,
+        idx: i64,
+        report_json: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chapters SET style_report=?3, updated_at=?4 WHERE novel_id=?1 AND idx=?2",
+            params![novel_id, idx, report_json, now()],
         )?;
         Ok(())
     }

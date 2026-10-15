@@ -8,6 +8,7 @@ pub mod llm;
 pub mod models;
 pub mod pipeline;
 pub mod prompts;
+pub mod style_check;
 pub mod styles;
 pub mod webui;
 
