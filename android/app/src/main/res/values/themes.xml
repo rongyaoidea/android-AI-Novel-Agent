@@ -2,11 +2,14 @@
 <resources>
     <!--
       纸·墨主题：窗口底色与 Web UI 的「纸」色一致；
-      状态栏 / 导航栏透明（Android 15 起系统强制 edge-to-edge，由 MainActivity 处理 insets）。
+      全版本 edge-to-edge（MainActivity 统一处理 insets），状态栏 / 导航栏透明，
+      浅色模式使用深色图标（windowLightStatusBar / windowLightNavigationBar）。
     -->
     <style name="Theme.AINovel" parent="Theme.AppCompat.DayNight.NoActionBar">
         <item name="android:windowBackground">@color/window_background</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
     </style>
 </resources>
