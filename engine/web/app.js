@@ -36,7 +36,10 @@ function toast(msg, isError = false) {
   el.className = "toast" + (isError ? " error" : "");
   el.textContent = msg;
   $("#toasts").appendChild(el);
-  setTimeout(() => el.remove(), 3800);
+  setTimeout(() => {
+    el.classList.add("hide");
+    setTimeout(() => el.remove(), 200);
+  }, 3600);
 }
 
 function fmtTime(iso) {
@@ -164,23 +167,25 @@ function renderShelf() {
   const grid = $("#shelf-grid");
   if (!items.length) {
     const inner = state.shelfItems.length
-      ? `<h3 style="margin:0; font-size:15px;">没有符合条件的作品</h3>
-         <p class="muted" style="margin:0;">试试切换上方的筛选条件。</p>`
-      : `<h3 style="margin:0; font-size:15px;">书架还是空的</h3>
-         <p class="muted" style="margin:0;">从一个想法开始：AI 会先生成立项方案与章节规划，再逐章写作、审校并保存。</p>
+      ? `<div class="empty-icon">🔍</div>
+         <h3>没有符合条件的作品</h3>
+         <p class="muted">试试切换上方的筛选条件。</p>`
+      : `<div class="empty-icon">📚</div>
+         <h3>书架还是空的</h3>
+         <p class="muted">从一个想法开始：AI 会先生成立项方案与章节规划，再逐章写作、审校并保存。</p>
          <div class="row"><a class="btn btn-primary" href="#/create">创建新小说</a></div>`;
-    grid.innerHTML = `<div class="novel-card" style="grid-column: 1 / -1; align-items: flex-start;">${inner}</div>`;
+    grid.innerHTML = `<div class="novel-card empty-card">${inner}</div>`;
     return;
   }
 
-  grid.innerHTML = items.map((it) => {
+  grid.innerHTML = items.map((it, i) => {
     const n = it.novel;
     const target = it.chapters_target || 0;
     const done = it.chapters_done || 0;
     const pct = target > 0 ? Math.min(100, Math.round((done / target) * 100)) : 0;
     const title = (n.title && n.title.trim()) || (n.idea || "").slice(0, 16) || "（未命名）";
     return `
-    <article class="novel-card" data-id="${esc(n.id)}">
+    <article class="novel-card" data-id="${esc(n.id)}" style="--i:${i}">
       <div class="novel-card-head">
         <h3>${esc(title)}</h3>
         <div class="chips">
@@ -345,6 +350,7 @@ function renderNovel() {
     run ? `<span class="chip">当前阶段：${esc(STAGE_LABEL[run.stage] || run.stage)}</span>` : "",
   ].join("");
   $("#run-progress").style.width = pct + "%";
+  $("#run-progress").classList.toggle("running", running);
   $("#run-note").textContent = run && run.error
     ? "已中断：" + run.error
     : run && run.status === "running"
@@ -415,6 +421,7 @@ function bindNovel() {
     const pre = $("#stream-pre");
     pre.textContent = "等待生成…";
     pre.classList.add("muted");
+    $("#stream-live").classList.remove("on");
   };
 }
 
@@ -457,6 +464,7 @@ function subscribe(id) {
   const preStream = $("#stream-pre");
   preStream.textContent = "等待生成…";
   preStream.classList.add("muted");
+  $("#stream-live").classList.remove("on");
   const es = new EventSource(`/api/novels/${id}/events`);
   state.es = es;
   es.addEventListener("engine", (e) => {
@@ -489,6 +497,7 @@ function handleEvent(ev) {
     case "token": {
       const pre = $("#stream-pre");
       pre.classList.remove("muted");
+      $("#stream-live").classList.add("on");
       if (state.stream.chapter !== ev.chapter_idx) {
         state.stream.chapter = ev.chapter_idx;
         state.stream.text += `${state.stream.text ? "\n\n" : ""}—— 第${ev.chapter_idx}章 ——\n`;
@@ -507,10 +516,12 @@ function handleEvent(ev) {
       break;
     case "run_finished":
       novelLog("本次运行完成");
+      $("#stream-live").classList.remove("on");
       refreshNovel();
       break;
     case "run_failed":
       novelLog(`运行失败：${ev.error}`);
+      $("#stream-live").classList.remove("on");
       refreshNovel();
       break;
   }

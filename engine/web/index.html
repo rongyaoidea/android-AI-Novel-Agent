@@ -89,14 +89,12 @@
       <!-- 本书工作台 -->
       <section class="view" id="view-novel" hidden>
         <div class="novel-head">
-          <div>
-            <div class="row">
-              <h2 id="novel-title">—</h2>
-              <span class="chips" id="novel-chips"></span>
-            </div>
-            <p class="muted" id="novel-meta" style="margin:6px 0 0;"></p>
+          <div class="novel-head-main">
+            <h2 id="novel-title">—</h2>
+            <div class="chips" id="novel-chips"></div>
+            <p class="muted" id="novel-meta"></p>
           </div>
-          <div class="row">
+          <div class="novel-head-actions">
             <input id="novel-target" class="input-sm" type="number" min="1" max="50" title="目标章节数" />
             <button class="btn btn-primary" id="novel-run">继续创作</button>
             <a class="btn btn-outline" id="novel-export" href="#">导出 TXT</a>
@@ -117,7 +115,7 @@
         <div class="grid-2">
           <div class="panel">
             <div class="panel-head">
-              <h3 class="panel-title">跟随生成</h3>
+              <h3 class="panel-title">跟随生成 <span class="live-dot" id="stream-live" title="正在接收生成内容"></span></h3>
               <button class="btn btn-outline btn-sm" id="stream-clear">清空</button>
             </div>
             <pre class="stream muted" id="stream-pre">等待生成…</pre>
