@@ -81,6 +81,7 @@ async fn run_inner(
 ) -> anyhow::Result<()> {
     let settings = engine.llm_settings()?;
     let llm = Llm::new(settings.clone());
+    let ov = engine.prompt_overrides();
 
     // ---- 1) 立项方案 ----
     let mut novel = engine
@@ -92,7 +93,11 @@ async fn run_inner(
             stage: "brief".into(),
             message: "生成立项方案…".into(),
         });
-        let (sys, usr) = crate::prompts::brief_prompt(&novel.idea, crate::styles::find(&novel.style_preset));
+        let (sys, usr) = crate::prompts::brief_prompt(
+            &novel.idea,
+            crate::styles::find(&novel.style_preset),
+            &ov,
+        );
         let out = llm.complete(&sys, &usr).await?;
         record_usage(&engine.db, Some(novel_id), None, "brief", &settings, &out.usage);
         let raw = out.text;
@@ -145,6 +150,7 @@ async fn run_inner(
             to,
             prev_tail,
             crate::styles::find(&novel.style_preset),
+            &ov,
         );
         let out = llm.complete(&sys, &usr).await?;
         record_usage(&engine.db, Some(novel_id), None, "outline", &settings, &out.usage);
@@ -259,6 +265,7 @@ async fn run_inner(
             &prev_tail,
             &context,
             crate::styles::find(&novel.style_preset),
+            &ov,
         );
         // 流式输出按 ~80 字聚合后再推送，降低 SSE 事件与前端渲染压力
         let mut buf = String::new();
@@ -299,6 +306,7 @@ async fn run_inner(
         let (rsys, rusr) = crate::prompts::review_prompt(
             &content,
             crate::styles::find(&novel.style_preset),
+            &ov,
         );
         match llm.complete(&rsys, &rusr).await {
             Ok(out) => {
@@ -332,7 +340,7 @@ async fn run_inner(
         }
 
         // 写后资料整理：抽取角色 / 伏笔台账与章节摘要（非阻塞，失败仅记录日志）
-        let (xsys, xusr) = crate::prompts::extract_prompt(idx, &content);
+        let (xsys, xusr) = crate::prompts::extract_prompt(idx, &content, &ov);
         match llm.complete(&xsys, &xusr).await {
             Ok(out) => {
                 record_usage(&engine.db, Some(novel_id), Some(idx), "extract", &settings, &out.usage);

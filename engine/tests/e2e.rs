@@ -1233,3 +1233,208 @@ async fn style_presets_endpoints() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 提示词模板：目录 / 校验 / 覆盖立即生效（含 Mock 标记兜底）/ 恢复默认
+#[tokio::test]
+async fn prompt_overrides_endpoints() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-prompts-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    // 1) 目录：8 个任务，默认模板齐全，初始无覆盖
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/prompts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 8, "任务数量应为 8");
+    for t in items {
+        assert!(!t["default_system"].as_str().unwrap().is_empty(), "{}", t["id"]);
+        assert!(!t["default_user"].as_str().unwrap().is_empty(), "{}", t["id"]);
+        assert!(t["vars"].as_array().unwrap().len() >= 2, "{}", t["id"]);
+        assert!(t["custom"].is_null(), "{} 初始不应有覆盖", t["id"]);
+    }
+
+    // 2) 非法输入：未知任务 404 / 未知占位符 400 / 空 system 400
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/prompts/bogus")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"system": "s", "user": "u"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/prompts/chapter")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"system": "s", "user": "写 {{bogus}}"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/prompts/chapter")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"system": "  ", "user": "写一章"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 3) 合法覆盖：故意不写 TASK 标记，验证 Mock 兜底仍能跑流水线
+    let custom_user = "请写第 {{idx}} 章「{{title}}」，题材：{{genre}}，字数：{{words}}。";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/prompts/chapter")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"system": "自定义系统提示", "user": custom_user}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/prompts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    let chapter_task = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "chapter")
+        .unwrap();
+    assert_eq!(chapter_task["custom"]["user"], custom_user, "覆盖应被保存");
+
+    // 引擎侧覆盖可读
+    assert!(engine.prompt_overrides().get("chapter").is_some());
+
+    // 4) 覆盖生效：建书跑流水线，Mock 因自动补标记仍可解析
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "提示词覆盖测试", "chapters": 1}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    let mut status = String::new();
+    for _ in 0..400 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        status = v["run"]["status"].as_str().unwrap_or("").to_string();
+        if status == "done" {
+            break;
+        }
+        assert_ne!(status, "failed", "run failed: {}", v["run"]["error"]);
+    }
+    assert_eq!(status, "done", "自定义模板下流水线应照常完成");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/chapters/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert!(v["content"].as_str().unwrap().contains("第1章"), "Mock 应仍能生成正文");
+
+    // 5) 恢复默认
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/prompts/chapter")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(engine.prompt_overrides().get("chapter").is_none());
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/prompts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    let chapter_task = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == "chapter")
+        .unwrap();
+    assert!(chapter_task["custom"].is_null(), "恢复后应无覆盖");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

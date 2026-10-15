@@ -2,9 +2,10 @@
 //!
 //! Kotlin 侧调用：
 //! ```kotlin
-//! external fun nativeStart(dataDir: String, port: Int): Int
+//! external fun nativeStart(dataDir: String, port: Int, authToken: String, secretHex: String): Int
 //! ```
 //! 进程内启动本地引擎（tokio + axum），只监听 127.0.0.1。
+//! 日志写入 `{dataDir}/ainovel.log`（每次启动截断），便于用户导出排障。
 
 use std::sync::OnceLock;
 
@@ -13,6 +14,25 @@ use jni::sys::jint;
 use jni::JNIEnv;
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+/// 初始化文件日志（只生效一次；失败静默，不影响引擎启动）
+fn init_logging(data_dir: &str) {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let path = std::path::Path::new(data_dir).join("ainovel.log");
+        let Ok(file) = std::fs::File::create(&path) else {
+            return;
+        };
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .try_init();
+        tracing::info!("engine log file: {}", path.display());
+    });
+}
 
 #[no_mangle]
 pub extern "system" fn Java_com_ainovel_engine_EngineService_nativeStart(
@@ -27,6 +47,7 @@ pub extern "system" fn Java_com_ainovel_engine_EngineService_nativeStart(
         Ok(s) => s.into(),
         Err(_) => return -1,
     };
+    init_logging(&dir);
     let token: Option<String> = env
         .get_string(&auth_token)
         .ok()

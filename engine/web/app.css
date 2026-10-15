@@ -527,6 +527,22 @@ mark.add { background: hsl(var(--success) / .2); color: inherit; border-radius: 
 #style-backdrop .style-grid, #create-style-grid { max-height: 52vh; overflow: auto; }
 .muted-chip { opacity: .82; }
 
+/* ---------- 提示词模板 ---------- */
+#prompt-list { display: flex; flex-direction: column; }
+.prompt-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 9px 2px; border-bottom: 1px solid hsl(var(--border) / .7);
+}
+.prompt-row:last-child { border-bottom: 0; }
+.prompt-row-title { font-size: 13.5px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.prompt-id { font-size: 11px; font-weight: 400; color: hsl(var(--muted-foreground)); background: hsl(var(--muted) / .5); border-radius: 4px; padding: 1px 6px; }
+.prompt-row-desc { font-size: 12px; color: hsl(var(--muted-foreground)); margin-top: 2px; }
+.prompt-row-side { display: flex; align-items: center; gap: 6px; flex: none; }
+#prompt-backdrop textarea { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; line-height: 1.6; }
+#prompt-vars .chip { cursor: pointer; font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; }
+#prompt-vars .chip:hover { border-color: hsl(var(--ring)); color: hsl(var(--foreground)); background: hsl(var(--primary) / .08); }
+#prompt-error { color: hsl(var(--destructive)); }
+
 /* ---------- 移动端 ---------- */
 @media (max-width: 900px) {
   .layout { flex-direction: column; }

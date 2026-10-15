@@ -98,6 +98,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/app.js", get(app_js))
         .route("/api/health", get(health))
         .route("/api/styles", get(list_styles))
+        .route("/api/prompts", get(list_prompts))
+        .route(
+            "/api/prompts/:task",
+            axum::routing::put(put_prompt).delete(delete_prompt),
+        )
         .route("/api/settings/llm", get(get_llm).put(put_llm))
         .route("/api/settings/llm/test", post(test_llm))
         .route("/api/novels", get(list_novels).post(create_novel))
@@ -183,6 +188,65 @@ async fn health() -> Json<serde_json::Value> {
 /// 文风预设目录（UI 选择器数据源；含规则/反例，便于前端展示与自检）
 async fn list_styles() -> Json<serde_json::Value> {
     Json(json!({"items": crate::styles::PRESETS}))
+}
+
+// ---------- 提示词模板 ----------
+
+/// 任务目录 + 默认模板全文 + 当前覆盖（供前端编辑 / 预览 / 恢复默认）
+async fn list_prompts(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, ApiErr> {
+    let ov = e.prompt_overrides();
+    let items: Vec<serde_json::Value> = crate::prompts::TASKS
+        .iter()
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "label": t.label,
+                "desc": t.desc,
+                "vars": t.vars,
+                "default_system": t.default_system,
+                "default_user": t.default_user,
+                "custom": ov.get(t.id),
+            })
+        })
+        .collect();
+    Ok(Json(json!({"items": items})))
+}
+
+#[derive(Deserialize)]
+struct PromptBody {
+    system: String,
+    user: String,
+}
+
+/// 保存某任务的模板覆盖（校验变量名；非法 400）
+async fn put_prompt(
+    State(e): State<Arc<Engine>>,
+    Path(task_id): Path<String>,
+    Json(b): Json<PromptBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let spec = crate::prompts::task(&task_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未知任务: {task_id}")))?;
+    let tpl = crate::prompts::validate(spec, &b.system, &b.user)
+        .map_err(|msg| (StatusCode::BAD_REQUEST, msg))?;
+    let mut ov = e.prompt_overrides();
+    ov.set(spec.id, tpl);
+    e.db.set_prompt_overrides_json(&ov.to_json_string())
+        .map_err(err)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+/// 恢复某任务的默认模板
+async fn delete_prompt(
+    State(e): State<Arc<Engine>>,
+    Path(task_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let spec = crate::prompts::task(&task_id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("未知任务: {task_id}")))?;
+    let mut ov = e.prompt_overrides();
+    ov.remove(spec.id);
+    e.db.set_prompt_overrides_json(&ov.to_json_string())
+        .map_err(err)?;
+    Ok(Json(json!({"ok": true})))
 }
 
 async fn get_llm(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, ApiErr> {
@@ -467,7 +531,7 @@ async fn polish_chapter(
         .get_novel(&id)
         .map_err(err)?
         .and_then(|n| crate::styles::find(&n.style_preset));
-    let (sys, usr) = crate::prompts::polish_prompt(&mode, sel, &ch.title, &b.instruction, style);
+    let (sys, usr) = crate::prompts::polish_prompt(&mode, sel, &ch.title, &b.instruction, style, &e.prompt_overrides());
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, Some(&id), Some(idx), "polish", &settings, &out.usage);
     Ok(Json(json!({"revised": out.text.trim(), "mode": mode})))
@@ -580,7 +644,7 @@ async fn review_chapter(
         .get_novel(&id)
         .map_err(err)?
         .and_then(|n| crate::styles::find(&n.style_preset));
-    let (sys, usr) = crate::prompts::review_prompt(&ch.content, style);
+    let (sys, usr) = crate::prompts::review_prompt(&ch.content, style, &e.prompt_overrides());
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, Some(&id), Some(idx), "review", &settings, &out.usage);
     let raw = out.text;
@@ -655,7 +719,7 @@ async fn continue_chapter(
         .get_novel(&id)
         .map_err(err)?
         .and_then(|n| crate::styles::find(&n.style_preset));
-    let (sys, usr) = crate::prompts::continue_prompt(&ch.title, &before, chars, &b.instruction, style);
+    let (sys, usr) = crate::prompts::continue_prompt(&ch.title, &before, chars, &b.instruction, style, &e.prompt_overrides());
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, Some(&id), Some(idx), "continue", &settings, &out.usage);
     Ok(Json(json!({"text": out.text.trim(), "chars": chars})))
@@ -701,8 +765,15 @@ async fn rewrite_chapter(
         .get_novel(&id)
         .map_err(err)?
         .and_then(|n| crate::styles::find(&n.style_preset));
-    let (sys, usr) =
-        crate::prompts::rewrite_prompt(mode, &ch.title, &ch.goal, &ch.content, &b.instruction, style);
+    let (sys, usr) = crate::prompts::rewrite_prompt(
+        mode,
+        &ch.title,
+        &ch.goal,
+        &ch.content,
+        &b.instruction,
+        style,
+        &e.prompt_overrides(),
+    );
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, Some(&id), Some(idx), "rewrite", &settings, &out.usage);
     Ok(Json(json!({"text": out.text.trim(), "mode": mode})))
@@ -723,7 +794,7 @@ async fn extract_chapter(
     }
     let settings = e.llm_settings().map_err(err)?;
     let llm = crate::llm::Llm::new(settings.clone());
-    let (sys, usr) = crate::prompts::extract_prompt(idx, &ch.content);
+    let (sys, usr) = crate::prompts::extract_prompt(idx, &ch.content, &e.prompt_overrides());
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, Some(&id), Some(idx), "extract", &settings, &out.usage);
     let raw = out.text;

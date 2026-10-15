@@ -77,6 +77,11 @@ impl Engine {
         }
         self.db.set_llm_settings(&to_store)
     }
+
+    /// 当前提示词覆盖（未设置或解析失败时为空集合）
+    pub fn prompt_overrides(&self) -> prompts::Overrides {
+        prompts::Overrides::from_json(self.db.prompt_overrides_json().ok().flatten().as_deref())
+    }
 }
 
 /// 启动本地服务（桌面 CLI 与 Android JNI 共用入口）。

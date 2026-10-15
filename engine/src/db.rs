@@ -12,6 +12,7 @@ pub struct Db {
 }
 
 pub const LLM_SETTINGS_KEY: &str = "llm";
+pub const PROMPT_OVERRIDES_KEY: &str = "prompt_overrides";
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -35,7 +36,23 @@ impl Db {
         )?;
         let db = Self { conn: Mutex::new(conn) };
         db.migrate()?;
+        db.recover_stale_runs()?;
         Ok(db)
+    }
+
+    /// 启动自愈：把上次进程中断遗留的 running 运行标记为失败。
+    /// 设计前提是单进程独占数据目录（Android 壳 / 桌面 dev 均如此）。
+    fn recover_stale_runs(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE runs SET status='failed', error='进程中断（启动时自动标记，可重新发起创作）', updated_at=?1
+             WHERE status='running'",
+            [now()],
+        )?;
+        if n > 0 {
+            tracing::warn!("启动自愈：{n} 条中断的运行已标记为 failed");
+        }
+        Ok(n)
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
@@ -194,6 +211,17 @@ impl Db {
 
     pub fn set_llm_settings(&self, s: &LlmSettings) -> anyhow::Result<()> {
         self.set_setting(LLM_SETTINGS_KEY, &serde_json::to_string(s)?)
+    }
+
+    /// 提示词覆盖（JSON：任务 id → {system, user}）；空串表示全部恢复默认
+    pub fn prompt_overrides_json(&self) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .get_setting(PROMPT_OVERRIDES_KEY)?
+            .filter(|s| !s.trim().is_empty() && s.trim() != "{}"))
+    }
+
+    pub fn set_prompt_overrides_json(&self, json: &str) -> anyhow::Result<()> {
+        self.set_setting(PROMPT_OVERRIDES_KEY, json)
     }
 
     // ---------- novels ----------
@@ -1024,5 +1052,50 @@ impl Db {
         // 恢复后补跑轻量迁移（兼容更早版本的备份）
         self.migrate()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ainovel-db-{tag}-{stamp}"))
+    }
+
+    #[test]
+    fn stale_running_runs_are_recovered_on_open() {
+        let dir = tmp_dir("recover");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ainovel.db");
+
+        let novel_id;
+        {
+            let db = Db::open(&path).unwrap();
+            let novel = db.create_novel("中断恢复测试", "auto", "").unwrap();
+            novel_id = novel.id.clone();
+            db.create_run(&novel.id, 3).unwrap(); // 状态 running
+            let run = db.latest_run(&novel.id).unwrap().unwrap();
+            assert_eq!(run.status, "running");
+        }
+
+        // 模拟进程重启：重新打开（不清理任何状态）
+        let db2 = Db::open(&path).unwrap();
+        let run = db2.latest_run(&novel_id).unwrap().unwrap();
+        assert_eq!(run.status, "failed", "重启后孤儿运行应被标记失败");
+        assert!(
+            run.error.unwrap_or_default().contains("进程中断"),
+            "应留下可读原因"
+        );
+
+        // 再次打开不应重复标记（状态已不是 running）
+        let db3 = Db::open(&path).unwrap();
+        assert_eq!(db3.latest_run(&novel_id).unwrap().unwrap().status, "failed");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

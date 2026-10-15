@@ -29,6 +29,7 @@ const state = {
   health: null,
   foreshadowings: [],
   styles: null,
+  promptTask: null,
 };
 
 /* ---------------- 工具 ---------------- */
@@ -1557,6 +1558,115 @@ async function loadRuns() {
     : `<tr><td colspan="7" class="muted">还没有运行记录。</td></tr>`;
 }
 
+/* ---------------- 提示词模板 ---------------- */
+
+let promptsCache = null;
+let promptFocusTarget = null;
+
+async function loadPrompts(force = false) {
+  if (!promptsCache || force) {
+    const r = await api("/api/prompts");
+    promptsCache = r.items || [];
+  }
+  return promptsCache;
+}
+
+async function renderPromptList() {
+  const list = await loadPrompts(true);
+  const el = $("#prompt-list");
+  if (!el) return;
+  el.innerHTML = list.map((t) => `
+    <div class="prompt-row">
+      <div class="prompt-row-main">
+        <div class="prompt-row-title">${esc(t.label)} <span class="prompt-id">${esc(t.id)}</span></div>
+        <div class="prompt-row-desc">${esc(t.desc)}</div>
+      </div>
+      <div class="prompt-row-side">
+        <span class="chip ${t.custom ? "chip-info" : ""}">${t.custom ? "已自定义" : "默认"}</span>
+        <button class="btn btn-outline btn-sm" data-pedit="${esc(t.id)}">编辑</button>
+      </div>
+    </div>`).join("");
+}
+
+function insertAtCursor(ta, text) {
+  const start = typeof ta.selectionStart === "number" ? ta.selectionStart : ta.value.length;
+  const end = typeof ta.selectionEnd === "number" ? ta.selectionEnd : start;
+  ta.value = ta.value.slice(0, start) + text + ta.value.slice(end);
+  ta.focus();
+  ta.selectionStart = ta.selectionEnd = start + text.length;
+}
+
+async function openPromptEditor(id) {
+  const list = await loadPrompts();
+  const t = list.find((x) => x.id === id);
+  if (!t) return;
+  state.promptTask = t;
+  $("#prompt-title").textContent = `编辑提示词 · ${t.label}`;
+  $("#prompt-desc").textContent = t.desc;
+  $("#prompt-state").textContent = t.custom ? "当前：已自定义" : "当前：默认模板";
+  $("#prompt-error").textContent = "";
+  const src = t.custom || { system: t.default_system, user: t.default_user };
+  $("#prompt-system").value = src.system;
+  $("#prompt-user").value = src.user;
+  $("#prompt-vars").innerHTML = t.vars
+    .map((v) => `<span class="chip chip-filter" data-pvar="{{${esc(v.name)}}}" title="${esc(v.desc)}｜示例：${esc(v.sample)}">{{${esc(v.name)}}}</span>`)
+    .join("");
+  promptFocusTarget = $("#prompt-user");
+  $("#prompt-backdrop").hidden = false;
+}
+
+function bindPrompts() {
+  $("#prompt-close").onclick = () => { $("#prompt-backdrop").hidden = true; };
+  $("#prompt-list").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-pedit]");
+    if (!b) return;
+    openPromptEditor(b.dataset.pedit).catch((err) => toast(err.message, true));
+  });
+  ["#prompt-system", "#prompt-user"].forEach((sel) => {
+    $(sel).addEventListener("focusin", () => { promptFocusTarget = $(sel); });
+  });
+  $("#prompt-vars").addEventListener("click", (e) => {
+    const c = e.target.closest("[data-pvar]");
+    if (!c) return;
+    const ta = promptFocusTarget && document.contains(promptFocusTarget) ? promptFocusTarget : $("#prompt-user");
+    insertAtCursor(ta, c.dataset.pvar);
+  });
+  $("#prompt-save").onclick = async () => {
+    const t = state.promptTask;
+    if (!t) return;
+    $("#prompt-error").textContent = "";
+    try {
+      await apiSend(`/api/prompts/${t.id}`, "PUT", {
+        system: $("#prompt-system").value,
+        user: $("#prompt-user").value,
+      });
+      toast(`已保存：${t.label}（对后续生成生效）`);
+      $("#prompt-backdrop").hidden = true;
+      await renderPromptList();
+    } catch (err) {
+      $("#prompt-error").textContent = err.message;
+    }
+  };
+  $("#prompt-reset").onclick = async () => {
+    const t = state.promptTask;
+    if (!t) return;
+    try {
+      await api(`/api/prompts/${t.id}`, { method: "DELETE" });
+      toast(`已恢复默认：${t.label}`);
+      $("#prompt-backdrop").hidden = true;
+      await renderPromptList();
+    } catch (err) {
+      $("#prompt-error").textContent = err.message;
+    }
+  };
+  $("#prompt-load-default").onclick = () => {
+    const t = state.promptTask;
+    if (!t) return;
+    $("#prompt-system").value = t.default_system;
+    $("#prompt-user").value = t.default_user;
+  };
+}
+
 /* ---------------- 设置 ---------------- */
 
 const PRESETS = {
@@ -1596,6 +1706,12 @@ async function loadSettingsForm() {
   $("#set-status").textContent = "";
   const backup = $("#set-backup");
   if (backup) backup.href = withToken("/api/backup");
+  try {
+    await renderPromptList();
+  } catch (err) {
+    const el = $("#prompt-status");
+    if (el) el.textContent = "提示词目录加载失败：" + err.message;
+  }
 }
 
 function bindSettings() {
@@ -1708,6 +1824,7 @@ function init() {
   bindEditor();
   bindFormDialog();
   bindSettings();
+  bindPrompts();
   loadSettings().catch(() => {});
   loadHealth();
   setInterval(loadHealth, 15000);

@@ -309,6 +309,14 @@
             <span class="muted" id="set-backup-status"></span>
           </div>
         </div>
+        <div class="panel" style="max-width:700px;">
+          <div class="panel-head">
+            <h3 class="panel-title">提示词模板</h3>
+            <span class="muted" id="prompt-status"></span>
+          </div>
+          <p class="muted" style="margin:0;">8 个写作任务的提示词均可自定义；占位符写作 <code>{{name}}</code>，点变量即可插入。修改立即对后续生成生效，可随时恢复默认。</p>
+          <div id="prompt-list"></div>
+        </div>
       </section>
 
     </main>
@@ -452,6 +460,32 @@
     <div class="chips" id="style-groups"></div>
     <div class="style-grid" id="style-grid"></div>
     <p class="muted" style="margin:0;">选择后立即生效：后续生成的章节、续写与修文都会按该风格执行；已完成的章节不受影响。</p>
+  </div>
+</div>
+
+<!-- 提示词模板编辑 -->
+<div class="dialog-backdrop" id="prompt-backdrop" hidden>
+  <div class="dialog" style="width:min(880px,95vw);">
+    <div class="dialog-head">
+      <h3 id="prompt-title">编辑提示词</h3>
+      <span class="chips"><span class="chip" id="prompt-state">默认</span><button class="btn btn-ghost btn-sm" id="prompt-close">关闭</button></span>
+    </div>
+    <p class="muted" id="prompt-desc" style="margin:0;"></p>
+    <div class="chips" id="prompt-vars"></div>
+    <div class="field" style="margin:0;">
+      <label for="prompt-system">System 提示词</label>
+      <textarea id="prompt-system" rows="3" spellcheck="false"></textarea>
+    </div>
+    <div class="field" style="margin:0;">
+      <label for="prompt-user">User 提示词（占位符会被替换为实际内容）</label>
+      <textarea id="prompt-user" rows="12" spellcheck="false"></textarea>
+    </div>
+    <div class="row">
+      <button class="btn btn-primary" id="prompt-save"><svg class="ic"><use href="#i-check"/></svg>保存</button>
+      <button class="btn btn-outline" id="prompt-reset"><svg class="ic"><use href="#i-refresh"/></svg>恢复默认</button>
+      <button class="btn btn-outline" id="prompt-load-default">载入默认（供修改）</button>
+      <span class="muted" id="prompt-error"></span>
+    </div>
   </div>
 </div>
 
