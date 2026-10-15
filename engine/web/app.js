@@ -21,14 +21,22 @@ const state = {
   shelfFilter: "all",
   tab: "chapters",
   editorDirty: false,
+  editorIssues: [],
   polishRange: null,
   polishResult: null,
+  polishLast: null,
+  foreshadowings: [],
 };
 
 /* ---------------- 工具 ---------------- */
 
 function esc(v) {
   return String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/** 手绘线条图标（引用 index.html 中的 SVG sprite） */
+function ic(name, cls = "ic") {
+  return `<svg class="${cls}"><use href="#${name}"/></svg>`;
 }
 
 async function api(path, opts) {
@@ -195,10 +203,10 @@ function renderShelf() {
   const grid = $("#shelf-grid");
   if (!items.length) {
     const inner = state.shelfItems.length
-      ? `<div class="empty-icon">🔍</div>
+      ? `<div class="empty-icon">${ic("i-search", "ic-xl")}</div>
          <h3>没有符合条件的作品</h3>
          <p class="muted">试试切换上方的筛选条件。</p>`
-      : `<div class="empty-icon">📚</div>
+      : `<div class="empty-icon">${ic("i-book", "ic-xl")}</div>
          <h3>书架还是空的</h3>
          <p class="muted">从一个想法开始：AI 会先生成立项方案与章节规划，再逐章写作、审校并保存。</p>
          <div class="row"><a class="btn btn-primary" href="#/create">创建新小说</a></div>`;
@@ -411,6 +419,8 @@ function renderNovel() {
   $$("#novel-tabs [data-tab]").forEach((el) => {
     el.classList.toggle("chip-dark", el.dataset.tab === state.tab);
   });
+
+  refreshInsights();
 }
 
 function renderTab() {
@@ -420,6 +430,27 @@ function renderTab() {
   if (state.tab === "chapters") renderChapters();
   if (state.tab === "characters") renderCharacters().catch((e) => toast(e.message, true));
   if (state.tab === "foreshadowings") renderForeshadowings().catch((e) => toast(e.message, true));
+}
+
+/** 头部思维提示：未回收伏笔数 + 有审校提醒的章节数（可点击直达页签） */
+async function refreshInsights() {
+  if (!state.novelId) return;
+  let openF = 0;
+  try {
+    const f = await api(`/api/novels/${state.novelId}/foreshadowings`);
+    state.foreshadowings = f.items || [];
+    openF = state.foreshadowings.filter((x) => x.status === "open").length;
+  } catch { /* 忽略 */ }
+  if (parseRoute().kind !== "novel") return;
+  const issues = (state.novel?.chapters || []).filter((c) => {
+    const r = parseReview(c.review);
+    return r && (!r.ok || r.issues.length > 0);
+  }).length;
+  const el = $("#novel-insights");
+  if (!el) return;
+  el.innerHTML =
+    `<span class="chip chip-filter ${openF ? "chip-warning" : ""}" data-insight="foreshadowings" title="点击查看伏笔台账">${ic("i-flag")}未回收伏笔 ${openF}</span>` +
+    `<span class="chip chip-filter ${issues ? "chip-warning" : ""}" data-insight="chapters" title="点击查看章节">${ic("i-flag")}审校提醒 ${issues} 章</span>`;
 }
 
 function renderChapters() {
@@ -433,8 +464,13 @@ function renderChapters() {
         <td>${c.status === "done" ? `<span class="chip chip-success">已完成</span>` : c.status === "drafted" ? `<span class="chip chip-info">待审校</span>` : `<span class="chip">已规划</span>`}</td>
         <td class="num">${c.words || 0}</td>
         <td>${reviewChip(c.review)}</td>
-        <td>
-          ${c.status === "planned" ? `<button class="btn btn-outline btn-sm" data-plan="${c.idx}">改规划</button>` : `<button class="btn btn-outline btn-sm" data-read="${c.idx}">阅读/编辑</button>`}
+        <td class="row-actions">
+          ${c.status === "planned"
+            ? `<button class="btn btn-outline btn-sm" data-plan="${c.idx}">改规划</button>`
+            : `<button class="icon-btn" data-read="${c.idx}" title="阅读 / 编辑">${ic("i-eye")}</button>`}
+          <button class="icon-btn" data-move="${c.idx}" data-dir="up" title="上移">${ic("i-up")}</button>
+          <button class="icon-btn" data-move="${c.idx}" data-dir="down" title="下移">${ic("i-down")}</button>
+          <button class="icon-btn danger" data-del="${c.idx}" title="删除本章">${ic("i-x")}</button>
         </td>
       </tr>`).join("")
     : `<tr><td colspan="6" class="muted">章节规划生成后会显示在这里。</td></tr>`;
@@ -479,11 +515,28 @@ async function renderForeshadowings() {
 }
 
 function bindNovel() {
-  $("#chapter-rows").addEventListener("click", (e) => {
+  $("#chapter-rows").addEventListener("click", async (e) => {
     const read = e.target.closest("[data-read]");
     if (read) { openEditor(parseInt(read.dataset.read, 10)).catch((err) => toast(err.message, true)); return; }
     const plan = e.target.closest("[data-plan]");
-    if (plan) { editPlan(parseInt(plan.dataset.plan, 10)).catch((err) => toast(err.message, true)); }
+    if (plan) { editPlan(parseInt(plan.dataset.plan, 10)).catch((err) => toast(err.message, true)); return; }
+    const move = e.target.closest("[data-move]");
+    if (move) {
+      try {
+        await apiSend(`/api/novels/${state.novelId}/chapters/${move.dataset.move}/move`, "PUT", { direction: move.dataset.dir });
+        await refreshNovel();
+      } catch (err) { toast(err.message, true); }
+      return;
+    }
+    const del = e.target.closest("[data-del]");
+    if (del) {
+      if (!confirm(`删除第 ${del.dataset.del} 章？后续章节会自动重排，且不可恢复。`)) return;
+      try {
+        await api(`/api/novels/${state.novelId}/chapters/${del.dataset.del}`, { method: "DELETE" });
+        toast("已删除并重排");
+        await refreshNovel();
+      } catch (err) { toast(err.message, true); }
+    }
   });
   $("#character-rows").addEventListener("click", (e) => {
     const edit = e.target.closest("[data-char-edit]");
@@ -562,6 +615,33 @@ function bindNovel() {
         await apiSend(`/api/novels/${state.novelId}/foreshadowings`, "POST", { title: v.title, notes: v.notes });
         toast("已新增伏笔");
         await renderForeshadowings();
+      },
+    });
+  };
+  $("#novel-insights").addEventListener("click", (e) => {
+    const chip = e.target.closest("[data-insight]");
+    if (!chip) return;
+    state.tab = chip.dataset.insight;
+    renderNovel();
+  });
+  $("#insert-chapter").onclick = () => {
+    const count = (state.novel?.chapters || []).length;
+    openForm({
+      title: "插入章节",
+      fields: [
+        { name: "after_idx", label: "插入位置（在第 N 章之后，0 = 最前）", value: String(count) },
+        { name: "title", label: "章节标题", value: "新章节" },
+        { name: "goal", label: "本章目标（可选）" },
+      ],
+      onSubmit: async (v) => {
+        const after = Math.max(0, parseInt(v.after_idx || "0", 10) || 0);
+        await apiSend(`/api/novels/${state.novelId}/chapters`, "POST", {
+          after_idx: after,
+          title: v.title,
+          goal: v.goal,
+        });
+        toast("已插入章节");
+        await refreshNovel();
       },
     });
   };
@@ -676,26 +756,80 @@ async function editForeshadowing(id) {
 async function openEditor(idx) {
   const c = await api(`/api/novels/${state.novelId}/chapters/${idx}`);
   $("#reader-title").textContent = `第${c.idx}章 ${c.title || ""}`;
-  const review = parseReview(c.review);
-  $("#reader-review").innerHTML = review
-    ? review.issues.length
-      ? review.issues.map((it) => `<span class="chip ${it.severity === "high" ? "chip-danger" : it.severity === "medium" ? "chip-warning" : "chip"}">${esc(it.note || it.severity)}</span>`).join("")
-      : `<span class="chip chip-success">审校通过</span>`
-    : "";
+  renderReviewChips(c.review);
   $("#reader-goal").textContent = [
     c.goal ? `本章目标：${c.goal}` : "",
     c.words ? `字数：${c.words}` : "",
   ].filter(Boolean).join(" · ");
+
   const ta = $("#reader-content");
   ta.value = c.content || "";
   ta.dataset.idx = String(idx);
+
+  // 防丢稿：恢复本机草稿
+  try {
+    const raw = localStorage.getItem(draftKey(idx));
+    if (raw) {
+      const d = JSON.parse(raw);
+      if (d && typeof d.content === "string" && d.content !== (c.content || "")) {
+        const when = new Date(d.at || Date.now()).toLocaleString();
+        if (confirm(`发现 ${when} 的未保存草稿，恢复它吗？（取消则丢弃该草稿）`)) {
+          ta.value = d.content;
+        } else {
+          localStorage.removeItem(draftKey(idx));
+        }
+      }
+    }
+  } catch { /* 忽略 */ }
+
   state.editorDirty = false;
   $("#reader-save").disabled = true;
   $("#reader-backdrop").hidden = false;
 }
 
+function renderReviewChips(raw) {
+  const review = parseReview(raw);
+  if (!review) {
+    $("#reader-review").innerHTML = "";
+    return;
+  }
+  state.editorIssues = review.issues;
+  $("#reader-review").innerHTML = review.issues.length
+    ? review.issues
+        .map((it, i) => {
+          const cls = it.severity === "high" ? "chip-danger" : it.severity === "medium" ? "chip-warning" : "";
+          return `<span class="chip chip-filter ${cls}" data-fix="${i}" title="点击：按这条意见修文">${ic("i-flag")}${esc(it.note || it.severity)}</span>`;
+        })
+        .join("")
+    : `<span class="chip chip-success">审校通过</span>`;
+}
+
+function draftKey(idx) {
+  return `ainovel.draft.${state.novelId}.${idx}`;
+}
+
 function closeReader() {
   $("#reader-backdrop").hidden = true;
+}
+
+let draftTimer = null;
+
+async function saveChapter(silent = false) {
+  const ta = $("#reader-content");
+  const idx = parseInt(ta.dataset.idx || "0", 10);
+  if (!idx) return false;
+  try {
+    await apiSend(`/api/novels/${state.novelId}/chapters/${idx}`, "PUT", { content: ta.value });
+    state.editorDirty = false;
+    $("#reader-save").disabled = true;
+    try { localStorage.removeItem(draftKey(idx)); } catch { /* 忽略 */ }
+    if (!silent) toast("已保存");
+    await refreshNovel();
+    return true;
+  } catch (err) {
+    toast(err.message, true);
+    return false;
+  }
 }
 
 function bindEditor() {
@@ -703,6 +837,15 @@ function bindEditor() {
   ta.addEventListener("input", () => {
     state.editorDirty = true;
     $("#reader-save").disabled = false;
+    // 防丢稿：本地草稿（700ms 防抖）
+    clearTimeout(draftTimer);
+    draftTimer = setTimeout(() => {
+      const idx = parseInt(ta.dataset.idx || "0", 10);
+      if (!idx) return;
+      try {
+        localStorage.setItem(draftKey(idx), JSON.stringify({ content: ta.value, at: Date.now() }));
+      } catch { /* 忽略 */ }
+    }, 700);
   });
   $("#reader-close").onclick = () => {
     if (state.editorDirty && !confirm("有未保存的修改，确定关闭？")) return;
@@ -714,24 +857,36 @@ function bindEditor() {
       closeReader();
     }
   });
-  $("#reader-save").onclick = async () => {
+  $("#reader-save").onclick = () => { saveChapter(); };
+  $("#reader-recheck").onclick = async () => {
+    if (state.editorDirty) {
+      if (!confirm("先保存当前修改，再重新审校？")) return;
+      if (!(await saveChapter(true))) return;
+    }
     const idx = parseInt(ta.dataset.idx || "0", 10);
     if (!idx) return;
+    toast("重新审校中…");
     try {
-      await apiSend(`/api/novels/${state.novelId}/chapters/${idx}`, "PUT", { content: ta.value });
-      state.editorDirty = false;
-      $("#reader-save").disabled = true;
-      toast("已保存");
+      const r = await api(`/api/novels/${state.novelId}/chapters/${idx}/review`, { method: "POST" });
+      renderReviewChips(JSON.stringify(r.review));
+      toast(r.review.ok ? "复核完成：通过" : `复核完成：${r.review.issues.length} 条提醒`);
       await refreshNovel();
     } catch (err) {
       toast(err.message, true);
     }
   };
+  $("#reader-review").addEventListener("click", (e) => {
+    const chip = e.target.closest("[data-fix]");
+    if (!chip) return;
+    const issue = (state.editorIssues || [])[parseInt(chip.dataset.fix, 10)];
+    if (issue) fixIssue(issue).catch((err) => toast(err.message, true));
+  });
   $$("[data-polish]").forEach((btn) => {
     btn.onclick = () => runPolish(btn.dataset.polish).catch((err) => toast(err.message, true));
   });
   $("#diff-cancel").onclick = closeDiff;
   $("#diff-apply").onclick = applyPolish;
+  $("#diff-reroll").onclick = () => rerollPolish().catch((err) => toast(err.message, true));
 }
 
 async function runPolish(mode) {
@@ -757,6 +912,8 @@ async function runPolish(mode) {
   }
   state.polishRange = { start, end, text };
   state.polishResult = revised;
+  state.polishLast = { mode, selection: text, instruction: $("#polish-instruction").value.trim() };
+  $("#diff-feedback").value = "";
   showDiff(mode, text, revised);
 }
 
@@ -774,6 +931,8 @@ function closeDiff() {
   $("#diff-backdrop").hidden = true;
   state.polishResult = null;
   state.polishRange = null;
+  const fb = $("#diff-feedback");
+  if (fb) fb.value = "";
 }
 
 function applyPolish() {
@@ -791,6 +950,63 @@ function applyPolish() {
   state.editorDirty = true;
   $("#reader-save").disabled = false;
   toast("已应用修改，记得点「保存修改」");
+}
+
+/** 按一条审校意见直接修文（优先定位意见引用的原文片段） */
+async function fixIssue(issue) {
+  const ta = $("#reader-content");
+  let start = ta.selectionStart;
+  let end = ta.selectionEnd;
+  let text = ta.value.slice(start, end).trim();
+  if (text.length < 8 && issue.quote) {
+    const pos = ta.value.indexOf(issue.quote);
+    if (pos >= 0) {
+      start = pos;
+      end = pos + issue.quote.length;
+      text = issue.quote;
+      ta.focus();
+      ta.setSelectionRange(start, end);
+    }
+  }
+  if (text.length < 8) {
+    toast("没有定位到对应原文，请手动选中要修的段落", true);
+    return;
+  }
+  const idx = parseInt(ta.dataset.idx || "0", 10);
+  toast("按审校意见修文中…");
+  const r = await apiSend(`/api/novels/${state.novelId}/chapters/${idx}/polish`, "POST", {
+    mode: "rewrite",
+    selection: text,
+    instruction: issue.note || "",
+  });
+  const revised = r.revised || "";
+  if (!revised || revised === text) {
+    toast("没有产生修改，请手动选中相关段落再试", true);
+    return;
+  }
+  state.polishRange = { start, end, text };
+  state.polishResult = revised;
+  state.polishLast = { mode: "rewrite", selection: text, instruction: issue.note || "" };
+  $("#diff-feedback").value = "";
+  showDiff("rewrite", text, revised);
+}
+
+/** 修文可迭代：按「修改要求」再改一版（始终基于最初的选中原文，避免层层漂移） */
+async function rerollPolish() {
+  const last = state.polishLast;
+  if (!last) return;
+  const feedback = $("#diff-feedback").value.trim();
+  const instruction = [last.instruction, feedback].filter(Boolean).join("；");
+  toast("再改一版中…");
+  const idx = parseInt($("#reader-content").dataset.idx || "0", 10);
+  const r = await apiSend(`/api/novels/${state.novelId}/chapters/${idx}/polish`, "POST", {
+    mode: last.mode,
+    selection: last.selection,
+    instruction,
+  });
+  if (!r.revised) return;
+  state.polishResult = r.revised;
+  showDiff(last.mode, last.selection, r.revised);
 }
 
 /** 极简 diff：公共前缀/后缀定位变动区，中间高亮 */

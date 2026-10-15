@@ -371,3 +371,175 @@ async fn polish_edit_and_ledger_endpoints() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 章节结构编辑（插入 / 移动 / 删除）+ 单章重新审校
+#[tokio::test]
+async fn chapter_structure_and_review_endpoints() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-struct-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "结构编辑测试", "chapters": 2}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+
+    let mut status = String::new();
+    for _ in 0..400 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        status = v["run"]["status"].as_str().unwrap_or("").to_string();
+        if status == "done" {
+            break;
+        }
+        assert_ne!(status, "failed");
+    }
+    assert_eq!(status, "done");
+
+    // 在第 1 章后插入新章
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/chapters"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"after_idx": 1, "title": "插入的新章", "goal": "插入目标"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["idx"], 2);
+
+    let titles = |v: &serde_json::Value| -> Vec<String> {
+        v["chapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["title"].as_str().unwrap_or("").to_string())
+            .collect()
+    };
+    let fetch = |app: axum::Router, novel_id: String| async move {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        json_body(resp).await
+    };
+
+    let v = fetch(app.clone(), novel_id.clone()).await;
+    assert_eq!(titles(&v), vec!["风起之1", "插入的新章", "风起之2"]);
+
+    // 下移插入的新章
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/novels/{novel_id}/chapters/2/move"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"direction": "down"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = fetch(app.clone(), novel_id.clone()).await;
+    assert_eq!(titles(&v), vec!["风起之1", "风起之2", "插入的新章"]);
+
+    // 单章重新审校
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/chapters/1/review"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["review"]["ok"], true);
+
+    // 删除第 2 章
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/novels/{novel_id}/chapters/2"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = fetch(app.clone(), novel_id.clone()).await;
+    assert_eq!(titles(&v), vec!["风起之1", "插入的新章"]);
+    let idxs: Vec<i64> = v["chapters"].as_array().unwrap().iter().map(|c| c["idx"].as_i64().unwrap()).collect();
+    assert_eq!(idxs, vec![1, 2]);
+
+    // 删到只剩一章后再删 → 409
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/novels/{novel_id}/chapters/2"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/novels/{novel_id}/chapters/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

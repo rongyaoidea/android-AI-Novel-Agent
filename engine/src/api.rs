@@ -34,9 +34,15 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/settings/llm/test", post(test_llm))
         .route("/api/novels", get(list_novels).post(create_novel))
         .route("/api/novels/:id", get(get_novel).patch(patch_novel).delete(delete_novel))
-        .route("/api/novels/:id/chapters/:idx", get(get_chapter).put(edit_chapter))
+        .route("/api/novels/:id/chapters", post(insert_chapter))
+        .route(
+            "/api/novels/:id/chapters/:idx",
+            get(get_chapter).put(edit_chapter).delete(delete_chapter),
+        )
         .route("/api/novels/:id/chapters/:idx/plan", axum::routing::put(edit_plan))
         .route("/api/novels/:id/chapters/:idx/polish", post(polish_chapter))
+        .route("/api/novels/:id/chapters/:idx/review", post(review_chapter))
+        .route("/api/novels/:id/chapters/:idx/move", axum::routing::put(move_chapter))
         .route("/api/novels/:id/run", post(run_novel))
         .route("/api/novels/:id/events", get(events))
         .route("/api/novels/:id/export", get(export_novel))
@@ -348,6 +354,137 @@ async fn polish_chapter(
     let (sys, usr) = crate::prompts::polish_prompt(&mode, sel, &ch.title, &b.instruction);
     let revised = llm.complete(&sys, &usr).await.map_err(err)?;
     Ok(Json(json!({"revised": revised.trim(), "mode": mode})))
+}
+
+/// 结构编辑类操作的保护：运行中不允许改章节结构
+fn ensure_not_running(e: &Engine, novel_id: &str) -> Result<(), ApiErr> {
+    let running = matches!(e.db.latest_run(novel_id).map_err(err)?, Some(r) if r.status == "running");
+    if running {
+        return Err((
+            StatusCode::CONFLICT,
+            "有运行进行中，请完成后再调整章节结构。".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct InsertChapterBody {
+    #[serde(default)]
+    after_idx: i64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    goal: String,
+}
+
+/// 插入章节（after_idx=0 表示插到最前）
+async fn insert_chapter(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(b): Json<InsertChapterBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    ensure_not_running(&e, &id)?;
+    let title = if b.title.trim().is_empty() {
+        "新章节".to_string()
+    } else {
+        b.title.trim().to_string()
+    };
+    let idx = e
+        .db
+        .insert_chapter_after(&id, b.after_idx, &title, b.goal.trim())
+        .map_err(err)?;
+    Ok(Json(json!({"ok": true, "idx": idx})))
+}
+
+/// 删除章节并重排（至少保留一章）
+async fn delete_chapter(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx)): Path<(String, i64)>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_chapter(&id, idx).map_err(err)?.is_none() {
+        return Err(not_found("chapter"));
+    }
+    ensure_not_running(&e, &id)?;
+    let ok = e.db.delete_chapter_at(&id, idx).map_err(err)?;
+    if !ok {
+        return Err((StatusCode::CONFLICT, "至少保留一章，无法继续删除。".to_string()));
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct MoveChapterBody {
+    direction: String,
+}
+
+/// 章节上移 / 下移
+async fn move_chapter(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx)): Path<(String, i64)>,
+    Json(b): Json<MoveChapterBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_chapter(&id, idx).map_err(err)?.is_none() {
+        return Err(not_found("chapter"));
+    }
+    ensure_not_running(&e, &id)?;
+    let direction = match b.direction.as_str() {
+        "up" => -1,
+        "down" => 1,
+        _ => return Err((StatusCode::BAD_REQUEST, "direction 只能是 up 或 down".to_string())),
+    };
+    let moved = e.db.move_chapter(&id, idx, direction).map_err(err)?;
+    if !moved {
+        return Err((StatusCode::CONFLICT, "已经到边界了。".to_string()));
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
+/// 单章重新审校（保存/修文后复核用）
+async fn review_chapter(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx)): Path<(String, i64)>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let ch = e
+        .db
+        .get_chapter(&id, idx)
+        .map_err(err)?
+        .ok_or_else(|| not_found("chapter"))?;
+    if ch.content.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "本章还没有正文，无法复核。".to_string()));
+    }
+    let settings = e.db.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings);
+    let (sys, usr) = crate::prompts::review_prompt(&ch.content);
+    let raw = llm.complete(&sys, &usr).await.map_err(err)?;
+    let v = crate::llm::extract_json_object(&raw).ok_or_else(|| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "复核输出不是 JSON".to_string())
+    })?;
+    let review = crate::models::Review {
+        ok: v["ok"].as_bool().unwrap_or(true),
+        issues: v["issues"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|it| crate::models::ReviewIssue {
+                        severity: it["severity"].as_str().unwrap_or("info").to_string(),
+                        note: it["note"].as_str().unwrap_or("").to_string(),
+                        quote: it["quote"].as_str().unwrap_or("").to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    e.db.save_chapter_review(&id, idx, &review).map_err(err)?;
+    e.hub.publish(pipeline::EngineEvent::ChapterReview {
+        chapter_idx: idx,
+        ok: review.ok,
+        issues: review.issues.len(),
+    });
+    Ok(Json(json!({"ok": true, "review": review})))
 }
 
 // ---------- 创作运行 ----------

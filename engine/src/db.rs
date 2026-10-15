@@ -115,6 +115,8 @@ impl Db {
         )?;
         // 旧库升级：补 novels.mode 列
         Self::ensure_column(&conn, "novels", "mode", "mode TEXT NOT NULL DEFAULT 'auto'")?;
+        // 章节结构编辑的中断兜底：把负区占位 idx 还原
+        conn.execute_batch("UPDATE chapters SET idx = -idx - 1 WHERE idx < 0;")?;
         Ok(())
     }
 
@@ -767,5 +769,100 @@ impl Db {
             }
         }
         Ok(n)
+    }
+
+    // ---------- 章节结构编辑 ----------
+
+    /// 统一重排：先整体挪到负区（避免 UNIQUE(novel_id, idx) 冲突），再按新顺序写回。
+    /// 中断时由 migrate 的负区还原兜底。
+    fn apply_chapter_order(
+        conn: &Connection,
+        novel_id: &str,
+        order: &[(String, i64)],
+    ) -> anyhow::Result<()> {
+        conn.execute(
+            "UPDATE chapters SET idx = -idx - 1 WHERE novel_id=?1",
+            params![novel_id],
+        )?;
+        for (id, new_idx) in order {
+            conn.execute(
+                "UPDATE chapters SET idx=?2, updated_at=?3 WHERE id=?1",
+                params![id, new_idx, now()],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn chapter_pairs_ordered(&self, conn: &Connection, novel_id: &str) -> anyhow::Result<Vec<(String, i64)>> {
+        let mut stmt = conn.prepare("SELECT id, idx FROM chapters WHERE novel_id=?1 ORDER BY idx ASC")?;
+        let rows = stmt.query_map([novel_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut v = Vec::new();
+        for x in rows {
+            v.push(x?);
+        }
+        Ok(v)
+    }
+
+    fn write_order(conn: &Connection, novel_id: &str, ids: &[String]) -> anyhow::Result<()> {
+        let order: Vec<(String, i64)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i as i64 + 1))
+            .collect();
+        Self::apply_chapter_order(conn, novel_id, &order)
+    }
+
+    /// 在 after_idx 之后插入一章（after_idx=0 表示插到最前），返回新章 idx。
+    pub fn insert_chapter_after(
+        &self,
+        novel_id: &str,
+        after_idx: i64,
+        title: &str,
+        goal: &str,
+    ) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let pairs = self.chapter_pairs_ordered(&conn, novel_id)?;
+        let pos = pairs.iter().filter(|(_, i)| *i <= after_idx).count().min(pairs.len());
+        let mut ids: Vec<String> = pairs.into_iter().map(|(id, _)| id).collect();
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let ts = now();
+        conn.execute(
+            "INSERT INTO chapters(id, novel_id, idx, title, goal, beats_json, content, status, created_at, updated_at)
+             VALUES(?1,?2,-1000000,?3,?4,'[]','','planned',?5,?5)",
+            params![new_id, novel_id, title, goal, ts],
+        )?;
+        ids.insert(pos, new_id);
+        Self::write_order(&conn, novel_id, &ids)?;
+        Ok(pos as i64 + 1)
+    }
+
+    /// 删除一章并重排；索引越界或仅剩一章时返回 false。
+    pub fn delete_chapter_at(&self, novel_id: &str, idx: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let pairs = self.chapter_pairs_ordered(&conn, novel_id)?;
+        let mut ids: Vec<String> = pairs.into_iter().map(|(id, _)| id).collect();
+        if ids.len() <= 1 || idx < 1 || idx > ids.len() as i64 {
+            return Ok(false);
+        }
+        let removed = ids.remove(idx as usize - 1);
+        conn.execute("DELETE FROM chapters WHERE id=?1", [removed])?;
+        Self::write_order(&conn, novel_id, &ids)?;
+        Ok(true)
+    }
+
+    /// 上下移动一章（direction: -1 上移 / 1 下移）；到边界返回 false。
+    pub fn move_chapter(&self, novel_id: &str, idx: i64, direction: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let pairs = self.chapter_pairs_ordered(&conn, novel_id)?;
+        let mut ids: Vec<String> = pairs.into_iter().map(|(id, _)| id).collect();
+        let n = ids.len() as i64;
+        let target = idx + direction;
+        if idx < 1 || idx > n || target < 1 || target > n {
+            return Ok(false);
+        }
+        ids.swap(idx as usize - 1, target as usize - 1);
+        Self::write_order(&conn, novel_id, &ids)?;
+        Ok(true)
     }
 }
