@@ -734,20 +734,29 @@ async fn review_chapter(
     let v = crate::llm::extract_json_object(&raw).ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, "复核输出不是 JSON".to_string())
     })?;
+    let new_issues: Vec<crate::models::ReviewIssue> = v["issues"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|it| crate::models::ReviewIssue {
+                    severity: it["severity"].as_str().unwrap_or("info").to_string(),
+                    note: it["note"].as_str().unwrap_or("").to_string(),
+                    quote: it["quote"].as_str().unwrap_or("").to_string(),
+                    status: "open".to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // 与上次审校对比：不再出现的旧意见标记为 fixed（保留记录供追溯），新意见为 open
+    let previous_issues: Vec<crate::models::ReviewIssue> = ch
+        .review_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<crate::models::Review>(raw).ok())
+        .map(|r| r.issues)
+        .unwrap_or_default();
     let review = crate::models::Review {
         ok: v["ok"].as_bool().unwrap_or(true),
-        issues: v["issues"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|it| crate::models::ReviewIssue {
-                        severity: it["severity"].as_str().unwrap_or("info").to_string(),
-                        note: it["note"].as_str().unwrap_or("").to_string(),
-                        quote: it["quote"].as_str().unwrap_or("").to_string(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        issues: pipeline::merge_issue_statuses(&previous_issues, &new_issues),
     };
     e.db.save_chapter_review(&id, idx, &review).map_err(err)?;
     e.hub.publish(&id, pipeline::EngineEvent::ChapterReview {

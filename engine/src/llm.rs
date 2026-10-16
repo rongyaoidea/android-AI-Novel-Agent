@@ -603,6 +603,10 @@ fn mock_complete(user: &str) -> anyhow::Result<String> {
         }
         return Ok(text);
     }
+    if user.contains("TASK:foreshadow_audit") {
+        // 离线演示不臆造回收结论
+        return Ok(serde_json::json!({"resolved": []}).to_string());
+    }
     if user.contains("TASK:review") {
         return Ok(serde_json::json!({
             "ok": true,

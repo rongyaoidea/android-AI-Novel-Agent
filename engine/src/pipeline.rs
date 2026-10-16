@@ -344,6 +344,7 @@ async fn run_inner(
     let novel = engine.db.get_novel(novel_id)?.unwrap_or(novel);
 
     // ---- 3) 逐章：写正文 + 审校 ----
+    let mut wrote_in_run = 0usize;
     for idx in 1..=chapters {
         if engine.db.get_novel(novel_id)?.is_none() {
             // 作品已被删除：静默结束本次运行
@@ -588,6 +589,12 @@ async fn run_inner(
 
         engine.db.save_chapter_content(novel_id, idx, &content, "done")?;
         engine.db.update_run(run_id, "running", "draft", idx, None)?;
+        wrote_in_run += 1;
+    }
+
+    // 伏笔自动审核（仅当本轮确实写了新章）：用摘要判定未回收伏笔是否已被后文实质回收
+    if wrote_in_run > 0 {
+        let _ = audit_foreshadowings(&engine, novel_id).await;
     }
 
     engine.db.update_run(run_id, "done", "done", chapters, None)?;
@@ -729,6 +736,7 @@ pub async fn review_and_fix_chapter(
                                         severity: str_field(it, "severity", "info"),
                                         note: str_field(it, "note", ""),
                                         quote: str_field(it, "quote", ""),
+                                        status: "open".to_string(),
                                     })
                                     .collect()
                             })
@@ -803,6 +811,7 @@ pub async fn review_and_fix_chapter(
                                                                     quote: str_field(
                                                                         it, "quote", "",
                                                                     ),
+                                                                    status: "open".to_string(),
                                                                 })
                                                                 .collect()
                                                         })
@@ -822,9 +831,15 @@ pub async fn review_and_fix_chapter(
                                         .unwrap_or(false);
                                     if better {
                                         let before = review.issues.len();
+                                        let previous_issues = review.issues.clone();
                                         content = fixed;
-                                        review.issues = rechecked.unwrap_or_default();
-                                        review.ok = review.issues.is_empty();
+                                        // 状态化合并：不再出现的旧意见标记为 fixed，新意见为 open
+                                        let latest = rechecked.unwrap_or_default();
+                                        review.issues =
+                                            merge_issue_statuses(&previous_issues, &latest);
+                                        let open_left =
+                                            review.issues.iter().filter(|i| i.status != "fixed").count();
+                                        review.ok = open_left == 0;
                                         // 内容已变化：重算本地文风报告并回存
                                         if let Some(p) = style {
                                             let r2 = crate::style_check::check_chapter(p, &content);
@@ -846,8 +861,8 @@ pub async fn review_and_fix_chapter(
                                         engine.hub.publish(novel_id, EngineEvent::Stage {
                                             stage: "autofix".into(),
                                             message: format!(
-                                                "第 {idx} 章自动修复完成（{before} → {} 条问题）",
-                                                review.issues.len()
+                                                "第 {idx} 章自动修复完成（{before} → {open_left} 条仍存在，{} 条已修复）",
+                                                review.issues.iter().filter(|i| i.status == "fixed").count()
                                             ),
                                         });
                                     } else {
@@ -885,7 +900,7 @@ pub async fn review_and_fix_chapter(
     Ok(review)
 }
 
-/// 章节是否还有待处理的审校（无审校记录，或存在高/中危意见）
+/// 章节是否还有待处理的审校（无审校记录，或存在仍为 open 的高/中危意见）
 fn review_needs_processing(ch: &crate::models::Chapter) -> bool {
     match &ch.review_json {
         None => true,
@@ -895,12 +910,166 @@ fn review_needs_processing(ch: &crate::models::Chapter) -> bool {
     }
 }
 
+/// 仍存在（未标 fixed）的高/中危意见数
 fn medium_high_count(review: &Review) -> usize {
     review
         .issues
         .iter()
+        .filter(|i| i.status != "fixed")
         .filter(|i| i.severity == "high" || i.severity == "medium")
         .count()
+}
+
+/// 汇总审校意见状态（旧 → 新）：
+/// - 旧意见仍出现在新列表 → open（采用新表述）
+/// - 旧意见不再出现 → fixed（保留旧文案，供追溯「已修复了什么」）
+/// - 新列表中新增的意见 → open
+/// - 旧列表里已是 fixed 的条目继续保留
+pub fn merge_issue_statuses(previous: &[ReviewIssue], latest: &[ReviewIssue]) -> Vec<ReviewIssue> {
+    let norm = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !c.is_whitespace())
+            .take(24)
+            .collect()
+    };
+    let mut out: Vec<ReviewIssue> = Vec::new();
+    for p in previous {
+        if p.status == "fixed" {
+            out.push(p.clone());
+            continue;
+        }
+        match latest.iter().find(|l| norm(&l.note) == norm(&p.note)) {
+            Some(l) => out.push(ReviewIssue {
+                status: "open".into(),
+                ..l.clone()
+            }),
+            None => out.push(ReviewIssue {
+                status: "fixed".into(),
+                ..p.clone()
+            }),
+        }
+    }
+    for l in latest {
+        if !previous.iter().any(|p| norm(&p.note) == norm(&l.note)) {
+            out.push(ReviewIssue {
+                status: "open".into(),
+                ..l.clone()
+            });
+        }
+    }
+    out
+}
+
+/// 伏笔自动审核：用章节摘要批量判断哪些未回收伏笔已被后文实质回收，自动标记。
+/// 每次批量运行收尾与「一键 AI 处理全部审校」时调用，返回新回收条数。
+async fn audit_foreshadowings(engine: &Arc<Engine>, novel_id: &str) -> anyhow::Result<usize> {
+    let open: Vec<crate::models::Foreshadowing> = engine
+        .db
+        .list_foreshadowings(novel_id)?
+        .into_iter()
+        .filter(|f| f.status == "open")
+        .collect();
+    if open.is_empty() {
+        return Ok(0);
+    }
+    let chapters = engine.db.list_chapters(novel_id)?;
+    let summaries: Vec<String> = chapters
+        .iter()
+        .filter(|c| !c.summary.trim().is_empty())
+        .map(|c| format!("第{}章 {}：{}", c.idx, c.title, c.summary.trim()))
+        .collect();
+    if summaries.is_empty() {
+        return Ok(0);
+    }
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "extract".into(),
+        message: format!("伏笔自动审核：核对 {} 条未回收伏笔…", open.len()),
+    });
+    let settings = engine.llm_settings()?;
+    let llm = Llm::new(settings.clone());
+    let list = open
+        .iter()
+        .map(|f| format!("- {}（第{}章埋下）", f.title, f.planted_chapter))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let sum_text: String = summaries.join("\n").chars().take(6000).collect();
+    let sys = "你是小说连续性审核助手。只输出一个 JSON 对象，不要输出其他文字、不要使用 Markdown 代码块。";
+    let usr = format!(
+        "TASK:foreshadow_audit\n未回收伏笔清单：\n{list}\n\n各章摘要：\n{sum_text}\n\n\
+请判断哪些伏笔已经在后文被实质回收（事件落地、谜底揭开或明确交代，而非仅仅被提及）。\n\
+输出 JSON：{{\"resolved\": [{{\"title\": \"伏笔标题\", \"chapter_idx\": 回收所在章号, \"evidence\": \"一句话依据\"}}]}}\n\
+只报告有把握的；没有把握就返回空数组。\n"
+    );
+    match llm.complete(sys, &usr).await {
+        Ok(out) => {
+            record_usage(
+                &engine.db,
+                Some(novel_id),
+                None,
+                "foreshadow_audit",
+                &settings,
+                &out.usage,
+            );
+            let resolved = apply_foreshadow_audit(&engine.db, &open, &out.text);
+            if resolved > 0 {
+                engine.hub.publish(novel_id, EngineEvent::LedgerUpdated {
+                    chapter_idx: 0,
+                    characters: 0,
+                    foreshadowings: resolved,
+                });
+                engine.hub.publish(novel_id, EngineEvent::Stage {
+                    stage: "extract".into(),
+                    message: format!("伏笔自动审核：回收 {resolved} 条"),
+                });
+            }
+            Ok(resolved)
+        }
+        Err(e) => {
+            tracing::warn!("foreshadow audit failed: {e:#}");
+            Ok(0)
+        }
+    }
+}
+
+/// 应用伏笔审核结果（纯逻辑，便于单测）：按标题精确匹配未回收清单后标记回收
+pub fn apply_foreshadow_audit(
+    db: &crate::db::Db,
+    open: &[crate::models::Foreshadowing],
+    raw: &str,
+) -> usize {
+    let Some(v) = extract_json_object(raw) else {
+        return 0;
+    };
+    let Some(arr) = v["resolved"].as_array() else {
+        return 0;
+    };
+    let mut n = 0usize;
+    for item in arr {
+        let Some(title) = item["title"].as_str() else {
+            continue;
+        };
+        let Some(f) = open.iter().find(|f| f.title.trim() == title.trim()) else {
+            continue;
+        };
+        let chapter_idx = item["chapter_idx"].as_i64().unwrap_or(0);
+        let evidence = item["evidence"].as_str().unwrap_or("").trim();
+        let notes = if f.notes.trim().is_empty() {
+            if evidence.is_empty() {
+                "AI 自动审核确认已回收".to_string()
+            } else {
+                format!("AI 自动审核：{evidence}")
+            }
+        } else {
+            f.notes.clone()
+        };
+        if db
+            .update_foreshadowing(&f.id, "resolved", &notes, Some(chapter_idx))
+            .unwrap_or(false)
+        {
+            n += 1;
+        }
+    }
+    n
 }
 
 /// 一键「AI 处理全部审校」：对有内容的、存在待处理问题的章节重新审校并自动修复。
@@ -918,7 +1087,15 @@ pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i
         .map(|c| (c.idx, c.title.clone(), c.goal.clone()))
         .collect();
     if targets.is_empty() {
-        return Ok(0);
+        // 章节审校都已处理：若仍有未回收伏笔，也跑一轮伏笔自动审核（不返回队列数）
+        let has_open_foreshadow = engine
+            .db
+            .list_foreshadowings(novel_id)?
+            .iter()
+            .any(|f| f.status == "open");
+        if !has_open_foreshadow {
+            return Ok(0);
+        }
     }
     let total = targets.len() as i64;
     let style_id = novel.style_preset.clone();
@@ -951,10 +1128,122 @@ pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i
                 Err(e) => tracing::warn!("review-all chapter {idx} failed: {e:#}"),
             }
         }
+        // 阶段二：伏笔自动审核（用章节摘要判定未回收伏笔是否已实质回收）
+        let resolved = audit_foreshadowings(&engine, &nid).await.unwrap_or(0);
+        let message = if total > 0 {
+            format!(
+                "AI 审校处理完成：复核 {total} 章，消化 {digested} 条问题；伏笔自动审核回收 {resolved} 条"
+            )
+        } else {
+            format!("章节审校均已处理；伏笔自动审核回收 {resolved} 条")
+        };
         engine.hub.publish(&nid, EngineEvent::Stage {
             stage: "done".into(),
-            message: format!("AI 审校处理完成：复核 {total} 章，消化 {digested} 条问题"),
+            message,
         });
     });
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+
+    fn issue(severity: &str, note: &str, status: &str) -> ReviewIssue {
+        ReviewIssue {
+            severity: severity.into(),
+            note: note.into(),
+            quote: String::new(),
+            status: status.into(),
+        }
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ainovel-pipeline-{tag}-{stamp}"))
+    }
+
+    #[test]
+    fn merge_issue_statuses_marks_fixed_and_new_open() {
+        let previous = vec![
+            issue("high", "主角动机缺失", "open"),
+            issue("medium", "时间线冲突", "open"),
+        ];
+        // 复核后：时间线冲突仍存在（同文案），新增一条低危；主角动机缺失不再出现
+        let latest = vec![
+            issue("medium", "时间线冲突", "open"),
+            issue("low", "口头禅重复", "open"),
+        ];
+        let merged = merge_issue_statuses(&previous, &latest);
+        assert_eq!(merged.len(), 3);
+        let find = |note: &str| merged.iter().find(|i| i.note == note).cloned().unwrap();
+        assert_eq!(find("时间线冲突").status, "open");
+        assert_eq!(find("口头禅重复").status, "open");
+        assert_eq!(find("主角动机缺失").status, "fixed");
+    }
+
+    #[test]
+    fn merge_issue_statuses_keeps_previously_fixed_and_fixes_disappeared() {
+        let previous = vec![
+            issue("high", "旧问题A", "fixed"),
+            issue("medium", "旧问题B", "open"),
+        ];
+        // 复核后没有任何意见：B 也应转为 fixed，A 保留
+        let merged = merge_issue_statuses(&previous, &[]);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|i| i.status == "fixed"));
+        assert!(merged.iter().any(|i| i.note == "旧问题A"));
+        assert!(merged.iter().any(|i| i.note == "旧问题B"));
+    }
+
+    #[test]
+    fn medium_high_count_ignores_fixed() {
+        let review = Review {
+            ok: false,
+            issues: vec![
+                issue("high", "a", "fixed"),
+                issue("medium", "b", "open"),
+                issue("low", "c", "open"),
+            ],
+        };
+        assert_eq!(medium_high_count(&review), 1);
+    }
+
+    #[test]
+    fn foreshadow_audit_applies_only_confident_resolutions() {
+        let dir = tmp_dir("audit");
+        let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+        let novel = engine.db.create_novel("伏笔审核测试", "auto", "").unwrap();
+        engine
+            .db
+            .add_foreshadowing(&novel.id, "青铜钥匙的来历", "")
+            .unwrap();
+        engine
+            .db
+            .add_foreshadowing(&novel.id, "守夜人的身份", "")
+            .unwrap();
+        let open = engine.db.list_foreshadowings(&novel.id).unwrap();
+        assert_eq!(open.len(), 2);
+
+        // 只回收标题精确匹配的；编造标题不生效
+        let raw = r#"{"resolved":[{"title":"青铜钥匙的来历","chapter_idx":3,"evidence":"第3章已交代来历"},{"title":"不存在的伏笔"}]}"#;
+        let n = apply_foreshadow_audit(&engine.db, &open, raw);
+        assert_eq!(n, 1, "只有精确匹配的伏笔被回收");
+        let after = engine.db.list_foreshadowings(&novel.id).unwrap();
+        let key = after.iter().find(|f| f.title == "青铜钥匙的来历").unwrap();
+        assert_eq!(key.status, "resolved");
+        assert_eq!(key.resolved_chapter, Some(3));
+        assert!(key.notes.contains("已交代来历"));
+        let other = after.iter().find(|f| f.title == "守夜人的身份").unwrap();
+        assert_eq!(other.status, "open");
+
+        // 非 JSON / 缺字段：静默返回 0
+        assert_eq!(apply_foreshadow_audit(&engine.db, &open, "not json"), 0);
+        assert_eq!(apply_foreshadow_audit(&engine.db, &open, r#"{"resolved":[]}"#), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

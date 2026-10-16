@@ -2099,7 +2099,17 @@ async fn review_all_endpoint() {
         .unwrap_or(0);
     assert!(fix_calls >= 4, "auto_fix calls = {fix_calls}: {u}");
 
-    // 审校记录仍在
+    // 伏笔自动审核：流水线收尾 1 次 + 一键处理阶段二 1 次
+    let audit_calls = u["by_task"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["key"] == "foreshadow_audit")
+        .map(|g| g["calls"].as_i64().unwrap_or(0))
+        .unwrap_or(0);
+    assert!(audit_calls >= 2, "foreshadow_audit calls = {audit_calls}: {u}");
+
+    // 审校记录仍在，且每条意见都带生命周期状态（open/fixed）
     let resp = app
         .clone()
         .oneshot(Request::builder().uri(format!("/api/novels/{novel_id}/chapters/1")).body(Body::empty()).unwrap())
@@ -2107,6 +2117,20 @@ async fn review_all_endpoint() {
         .unwrap();
     let v = json_body(resp).await;
     assert!(v["review"].is_string(), "章节应保留审校记录");
+    let review: serde_json::Value =
+        serde_json::from_str(v["review"].as_str().unwrap()).unwrap();
+    let issues = review["issues"].as_array().unwrap();
+    assert!(!issues.is_empty(), "mock 审校应留意见: {review}");
+    assert!(
+        issues
+            .iter()
+            .all(|i| i["status"] == "open" || i["status"] == "fixed"),
+        "每条意见都要有状态: {review}"
+    );
+    assert!(
+        issues.iter().any(|i| i["status"] == "open"),
+        "mock 复核问题未减少，应仍为 open: {review}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

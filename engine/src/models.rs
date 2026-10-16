@@ -145,6 +145,13 @@ pub struct ReviewIssue {
     pub note: String,
     #[serde(default)]
     pub quote: String,
+    /// 意见状态："open"（仍存在，AI 可再处理）/ "fixed"（AI 已按此修复，旧记录保留供追溯）
+    #[serde(default = "default_issue_status")]
+    pub status: String,
+}
+
+pub fn default_issue_status() -> String {
+    "open".to_string()
 }
 
 /// 书架条目：作品 + 进度统计 + 最近一次运行

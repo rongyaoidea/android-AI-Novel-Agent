@@ -185,6 +185,7 @@ input:focus, select:focus, textarea:focus { outline: none; }
 .chip-filter { cursor: pointer; user-select: none; }
 .chip-filter:hover { border-color: hsl(var(--ring)); color: hsl(var(--foreground)); transform: translateY(-1px); }
 .chip-filter:active { transform: none; }
+.chip-fixed { text-decoration: line-through; opacity: .62; font-weight: 500; background: hsl(var(--muted) / .5); }
 .table-wrap { overflow-x: auto; }
 .table-wrap .table { min-width: 520px; }
 

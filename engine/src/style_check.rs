@@ -84,6 +84,7 @@ impl StyleReport {
                 severity: if c.hard { "medium" } else { "low" }.to_string(),
                 note: format!("文风检查：{} —— {}", c.name, c.detail),
                 quote: String::new(),
+                status: "open".to_string(),
             })
             .collect()
     }

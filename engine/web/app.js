@@ -729,6 +729,7 @@ const USAGE_TASK_LABEL = {
   continue: "光标续写",
   rewrite: "重写本章",
   extract: "资料整理",
+  foreshadow_audit: "伏笔审核",
   test: "连通测试",
 };
 
@@ -1011,7 +1012,7 @@ function bindNovel() {
   $("#novel-review-all").onclick = async () => {
     try {
       const r = await api(`/api/novels/${state.novelId}/review-all`, { method: "POST" });
-      toast(r.queued > 0 ? `已开始：AI 后台处理 ${r.queued} 章审校（进度见「跟随生成」）` : "所有章节的审校都已处理");
+      toast(r.queued > 0 ? `已开始：AI 后台处理 ${r.queued} 章审校（进度见「跟随生成」）` : "章节审校均已处理，正在自动核对伏笔回收");
       await refreshNovel();
     } catch (err) {
       toast(err.message, true);
@@ -1215,17 +1216,31 @@ function renderReviewChips(raw) {
   const review = parseReview(raw);
   if (!review) {
     $("#reader-review").innerHTML = "";
+    state.editorIssues = [];
     return;
   }
-  state.editorIssues = review.issues;
-  $("#reader-review").innerHTML = review.issues.length
-    ? review.issues
-        .map((it, i) => {
-          const cls = it.severity === "high" ? "chip-danger" : it.severity === "medium" ? "chip-warning" : "";
-          return `<span class="chip chip-filter ${cls}" data-fix="${i}" title="点击：按这条意见修文">${ic("i-flag")}${esc(it.note || it.severity)}</span>`;
-        })
-        .join("")
-    : `<span class="chip chip-success">审校通过</span>`;
+  // 意见按状态分开展示：open = 仍存在（可点击再修）；fixed = AI 已修复（灰显留档）
+  const open = review.issues.filter((it) => it.status !== "fixed");
+  const fixed = review.issues.filter((it) => it.status === "fixed");
+  state.editorIssues = open;
+  const openChips = open
+    .map((it, i) => {
+      const cls = it.severity === "high" ? "chip-danger" : it.severity === "medium" ? "chip-warning" : "";
+      return `<span class="chip chip-filter ${cls}" data-fix="${i}" title="仍存在：点击可按这条意见再修一次">${ic("i-flag")}${esc(it.note || it.severity)}</span>`;
+    })
+    .join("");
+  const fixedChips = fixed
+    .map((it) => {
+      const note = it.note || it.severity;
+      const brief = note.length > 18 ? note.slice(0, 18) + "…" : note;
+      return `<span class="chip chip-fixed" title="AI 已修复（留档）：${esc(note)}">${ic("i-check")}已修复 ${esc(brief)}</span>`;
+    })
+    .join("");
+  let head = "";
+  if (open.length) head = "";
+  else if (fixed.length) head = `<span class="chip chip-success">审校意见已全部修复</span>`;
+  else head = `<span class="chip chip-success">审校通过</span>`;
+  $("#reader-review").innerHTML = head + openChips + fixedChips;
 }
 
 /** 本地文风检查结果（零 token）：每项规则 ✓/✗ + 细节 */
@@ -1344,7 +1359,7 @@ function bindEditor() {
     try {
       const r = await api(`/api/novels/${state.novelId}/chapters/${idx}/review`, { method: "POST" });
       renderReviewChips(JSON.stringify(r.review));
-      toast(r.review.ok ? "复核完成：通过" : `复核完成：${r.review.issues.length} 条提醒`);
+      toast(r.review.ok ? "复核完成：通过" : `复核完成：${r.review.issues.filter((i) => i.status !== "fixed").length} 条仍存在`);
       await refreshNovel();
     } catch (err) {
       toast(err.message, true);
