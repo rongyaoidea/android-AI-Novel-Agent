@@ -2004,3 +2004,109 @@ async fn auto_continue_chain_and_budget() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 一键「AI 处理全部审校」：待处理计数 → 后台处理 → 完成事件 + 修复用量
+#[tokio::test]
+async fn review_all_endpoint() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-reviewall-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "一键审校测试", "chapters": 2}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+
+    let mut status = String::new();
+    for _ in 0..900 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(format!("/api/novels/{novel_id}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        status = v["run"]["status"].as_str().unwrap_or("").to_string();
+        if status == "done" {
+            break;
+        }
+        assert_ne!(status, "failed");
+    }
+    assert_eq!(status, "done");
+
+    // Mock 审校固定留 1 条 medium → 两章均为「待处理」
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/review-all"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["queued"], 2, "{v}");
+
+    // 等待后台处理完成事件
+    let mut finished = false;
+    for _ in 0..900 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let done = engine.hub.history(&novel_id).iter().any(|e| match e {
+            EngineEvent::Stage { stage, message } => {
+                stage == "done" && message.contains("审校处理完成")
+            }
+            _ => false,
+        });
+        if done {
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished, "未等到审校处理完成事件");
+
+    // 用量：流水线每章 1 次 + 一键处理每章 1 次 ≥ 4
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(format!("/api/novels/{novel_id}/usage")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let u = json_body(resp).await;
+    let fix_calls = u["by_task"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["key"] == "auto_fix")
+        .map(|g| g["calls"].as_i64().unwrap_or(0))
+        .unwrap_or(0);
+    assert!(fix_calls >= 4, "auto_fix calls = {fix_calls}: {u}");
+
+    // 审校记录仍在
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(format!("/api/novels/{novel_id}/chapters/1")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert!(v["review"].is_string(), "章节应保留审校记录");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

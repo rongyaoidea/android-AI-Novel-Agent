@@ -549,177 +549,21 @@ async fn run_inner(
             words: content.chars().count(),
         });
 
-        // 审校：非阻塞 —— 失败只记录日志，不中断生产链
-        engine.hub.publish(novel_id, EngineEvent::Stage {
-            stage: "review".into(),
-            message: format!("审校第 {idx} 章…"),
-        });
-        let (rsys, rusr) = crate::prompts::review_prompt(&content, style, &ov);
-        match llm.complete(&rsys, &rusr).await {
-            Ok(out) => {
-                record_usage(&engine.db, Some(novel_id), Some(idx), "review", &settings, &out.usage);
-                let raw = out.text;
-                if let Some(j) = extract_json_object(&raw) {
-                    let mut review = Review {
-                        ok: j["ok"].as_bool().unwrap_or(true),
-                        issues: j["issues"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .map(|it| ReviewIssue {
-                                        severity: str_field(it, "severity", "info"),
-                                        note: str_field(it, "note", ""),
-                                        quote: str_field(it, "quote", ""),
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    };
-
-                    // ---- 自动修复（减少人工介入）----
-                    // 审校出现高/中危问题时：按意见自动修订一次并复核，仅在问题变少时采用新稿。
-                    let pipeline_settings = engine.db.pipeline_settings().unwrap_or_default();
-                    let fixable: Vec<String> = review
-                        .issues
-                        .iter()
-                        .filter(|i| i.severity == "high" || i.severity == "medium")
-                        .map(|i| i.note.trim().to_string())
-                        .filter(|n| !n.is_empty())
-                        .take(6)
-                        .collect();
-                    if pipeline_settings.auto_fix_review && !fixable.is_empty() {
-                        engine.hub.publish(novel_id, EngineEvent::Stage {
-                            stage: "autofix".into(),
-                            message: format!(
-                                "按审校意见自动修复第 {idx} 章（{} 条问题）…",
-                                fixable.len()
-                            ),
-                        });
-                        let instruction = fixable.join("；");
-                        let (fsys, fusr) = crate::prompts::rewrite_prompt(
-                            "revise",
-                            &ch.title,
-                            &ch.goal,
-                            &content,
-                            &instruction,
-                            style,
-                            &ov,
-                        );
-                        match llm.complete(&fsys, &fusr).await {
-                            Ok(fout) => {
-                                record_usage(
-                                    &engine.db,
-                                    Some(novel_id),
-                                    Some(idx),
-                                    "auto_fix",
-                                    &settings,
-                                    &fout.usage,
-                                );
-                                let fixed = fout.text.trim().to_string();
-                                if !fixed.is_empty() && fixed != content {
-                                    // 复核修复稿：仅在问题变少时采用
-                                    let (r2sys, r2usr) =
-                                        crate::prompts::review_prompt(&fixed, style, &ov);
-                                    let rechecked: Option<Vec<ReviewIssue>> =
-                                        match llm.complete(&r2sys, &r2usr).await {
-                                            Ok(r2out) => {
-                                                record_usage(
-                                                    &engine.db,
-                                                    Some(novel_id),
-                                                    Some(idx),
-                                                    "review",
-                                                    &settings,
-                                                    &r2out.usage,
-                                                );
-                                                extract_json_object(&r2out.text).map(|j2| {
-                                                    j2["issues"]
-                                                        .as_array()
-                                                        .map(|a| {
-                                                            a.iter()
-                                                                .map(|it| ReviewIssue {
-                                                                    severity: str_field(
-                                                                        it, "severity", "info",
-                                                                    ),
-                                                                    note: str_field(it, "note", ""),
-                                                                    quote: str_field(
-                                                                        it, "quote", "",
-                                                                    ),
-                                                                })
-                                                                .collect()
-                                                        })
-                                                        .unwrap_or_default()
-                                                })
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    "chapter {idx} re-review failed: {e:#}"
-                                                );
-                                                None
-                                            }
-                                        };
-                                    let better = rechecked
-                                        .as_ref()
-                                        .map(|list| list.len() < review.issues.len())
-                                        .unwrap_or(false);
-                                    if better {
-                                        let before = review.issues.len();
-                                        content = fixed;
-                                        review.issues = rechecked.unwrap_or_default();
-                                        review.ok = review.issues.is_empty();
-                                        // 内容已变化：重算本地文风报告并回存
-                                        if let Some(p) = style {
-                                            let r2 = crate::style_check::check_chapter(p, &content);
-                                            let _ = engine.db.save_chapter_style_report(
-                                                novel_id,
-                                                idx,
-                                                &serde_json::to_string(&r2)?,
-                                            );
-                                            report = Some(r2);
-                                        }
-                                        engine.db.save_chapter_content(
-                                            novel_id, idx, &content, "drafted",
-                                        )?;
-                                        engine.hub.publish(novel_id, EngineEvent::ChapterSaved {
-                                            chapter_idx: idx,
-                                            title: ch.title.clone(),
-                                            words: content.chars().count(),
-                                        });
-                                        engine.hub.publish(novel_id, EngineEvent::Stage {
-                                            stage: "autofix".into(),
-                                            message: format!(
-                                                "第 {idx} 章自动修复完成（{before} → {} 条问题）",
-                                                review.issues.len()
-                                            ),
-                                        });
-                                    } else {
-                                        engine.hub.publish(novel_id, EngineEvent::Stage {
-                                            stage: "autofix".into(),
-                                            message: format!(
-                                                "第 {idx} 章自动修复未改善，保留原稿"
-                                            ),
-                                        });
-                                    }
-                                }
-                            }
-                            Err(e) => tracing::warn!("chapter {idx} auto-fix failed: {e:#}"),
-                        }
-                    }
-
-                    // 本地文风检查结果并入审校意见，保持单一入口
-                    if let Some(r) = &report {
-                        review.issues.extend(r.as_review_issues());
-                    }
-                    engine.db.save_chapter_review(novel_id, idx, &review)?;
-                    engine.hub.publish(novel_id, EngineEvent::ChapterReview {
-                        chapter_idx: idx,
-                        ok: review.ok,
-                        issues: review.issues.len(),
-                    });
-                }
-            }
-            Err(e) => tracing::warn!("chapter {idx} review failed: {e:#}"),
+        // 审校 + 自动修复（公共函数：与「一键 AI 处理全部审校」共用同一逻辑）
+        if let Err(e) = review_and_fix_chapter(
+            &engine,
+            novel_id,
+            idx,
+            &ch.title,
+            &ch.goal,
+            &mut content,
+            style,
+            &ov,
+        )
+        .await
+        {
+            tracing::warn!("chapter {idx} review failed: {e:#}");
         }
-
         // 写后资料整理：抽取角色 / 伏笔台账与章节摘要（非阻塞，失败仅记录日志）
         engine.hub.publish(novel_id, EngineEvent::Stage {
             stage: "extract".into(),
@@ -842,4 +686,275 @@ fn ledger_context(db: &crate::db::Db, novel_id: &str, current_idx: i64) -> anyho
         }
     }
     Ok(s)
+}
+
+/// 审校一章并按意见自动修复（流水线与「一键 AI 处理全部审校」共用）。
+/// - 高/中危意见且开启 auto_fix 时：自动修订一次 → 复核 → 仅在问题变少时采用新稿
+/// - 本地文风检查结果并入审校意见（内容变化时重算并回存）
+/// 返回最终审校结果；`content_ref` 可能被替换为修复稿。
+pub async fn review_and_fix_chapter(
+    engine: &Arc<Engine>,
+    novel_id: &str,
+    idx: i64,
+    title: &str,
+    goal: &str,
+    content_ref: &mut String,
+    style: Option<&crate::styles::StylePreset>,
+    ov: &crate::prompts::Overrides,
+) -> anyhow::Result<Review> {
+    let settings = engine.llm_settings()?;
+    let llm = crate::llm::Llm::new(settings.clone());
+    let mut content: String = content_ref.clone();
+    let mut report = style.map(|p| crate::style_check::check_chapter(p, &content));
+    let mut parsed: Option<Review> = None;
+
+        // 审校：非阻塞 —— 失败只记录日志，不中断生产链
+        engine.hub.publish(novel_id, EngineEvent::Stage {
+            stage: "review".into(),
+            message: format!("审校第 {idx} 章…"),
+        });
+        let (rsys, rusr) = crate::prompts::review_prompt(&content, style, &ov);
+        match llm.complete(&rsys, &rusr).await {
+            Ok(out) => {
+                record_usage(&engine.db, Some(novel_id), Some(idx), "review", &settings, &out.usage);
+                let raw = out.text;
+                if let Some(j) = extract_json_object(&raw) {
+                    let mut review = Review {
+                        ok: j["ok"].as_bool().unwrap_or(true),
+                        issues: j["issues"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .map(|it| ReviewIssue {
+                                        severity: str_field(it, "severity", "info"),
+                                        note: str_field(it, "note", ""),
+                                        quote: str_field(it, "quote", ""),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    };
+
+                    // ---- 自动修复（减少人工介入）----
+                    // 审校出现高/中危问题时：按意见自动修订一次并复核，仅在问题变少时采用新稿。
+                    let pipeline_settings = engine.db.pipeline_settings().unwrap_or_default();
+                    let fixable: Vec<String> = review
+                        .issues
+                        .iter()
+                        .filter(|i| i.severity == "high" || i.severity == "medium")
+                        .map(|i| i.note.trim().to_string())
+                        .filter(|n| !n.is_empty())
+                        .take(6)
+                        .collect();
+                    if pipeline_settings.auto_fix_review && !fixable.is_empty() {
+                        engine.hub.publish(novel_id, EngineEvent::Stage {
+                            stage: "autofix".into(),
+                            message: format!(
+                                "按审校意见自动修复第 {idx} 章（{} 条问题）…",
+                                fixable.len()
+                            ),
+                        });
+                        let instruction = fixable.join("；");
+                        let (fsys, fusr) = crate::prompts::rewrite_prompt(
+                            "revise",
+                            title,
+                            goal,
+                            &content,
+                            &instruction,
+                            style,
+                            &ov,
+                        );
+                        match llm.complete(&fsys, &fusr).await {
+                            Ok(fout) => {
+                                record_usage(
+                                    &engine.db,
+                                    Some(novel_id),
+                                    Some(idx),
+                                    "auto_fix",
+                                    &settings,
+                                    &fout.usage,
+                                );
+                                let fixed = fout.text.trim().to_string();
+                                if !fixed.is_empty() && fixed != content {
+                                    // 复核修复稿：仅在问题变少时采用
+                                    let (r2sys, r2usr) =
+                                        crate::prompts::review_prompt(&fixed, style, &ov);
+                                    let rechecked: Option<Vec<ReviewIssue>> =
+                                        match llm.complete(&r2sys, &r2usr).await {
+                                            Ok(r2out) => {
+                                                record_usage(
+                                                    &engine.db,
+                                                    Some(novel_id),
+                                                    Some(idx),
+                                                    "review",
+                                                    &settings,
+                                                    &r2out.usage,
+                                                );
+                                                extract_json_object(&r2out.text).map(|j2| {
+                                                    j2["issues"]
+                                                        .as_array()
+                                                        .map(|a| {
+                                                            a.iter()
+                                                                .map(|it| ReviewIssue {
+                                                                    severity: str_field(
+                                                                        it, "severity", "info",
+                                                                    ),
+                                                                    note: str_field(it, "note", ""),
+                                                                    quote: str_field(
+                                                                        it, "quote", "",
+                                                                    ),
+                                                                })
+                                                                .collect()
+                                                        })
+                                                        .unwrap_or_default()
+                                                })
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "chapter {idx} re-review failed: {e:#}"
+                                                );
+                                                None
+                                            }
+                                        };
+                                    let better = rechecked
+                                        .as_ref()
+                                        .map(|list| list.len() < review.issues.len())
+                                        .unwrap_or(false);
+                                    if better {
+                                        let before = review.issues.len();
+                                        content = fixed;
+                                        review.issues = rechecked.unwrap_or_default();
+                                        review.ok = review.issues.is_empty();
+                                        // 内容已变化：重算本地文风报告并回存
+                                        if let Some(p) = style {
+                                            let r2 = crate::style_check::check_chapter(p, &content);
+                                            let _ = engine.db.save_chapter_style_report(
+                                                novel_id,
+                                                idx,
+                                                &serde_json::to_string(&r2)?,
+                                            );
+                                            report = Some(r2);
+                                        }
+                                        engine.db.save_chapter_content(
+                                            novel_id, idx, &content, "drafted",
+                                        )?;
+                                        engine.hub.publish(novel_id, EngineEvent::ChapterSaved {
+                                            chapter_idx: idx,
+                                            title: title.to_string(),
+                                            words: content.chars().count(),
+                                        });
+                                        engine.hub.publish(novel_id, EngineEvent::Stage {
+                                            stage: "autofix".into(),
+                                            message: format!(
+                                                "第 {idx} 章自动修复完成（{before} → {} 条问题）",
+                                                review.issues.len()
+                                            ),
+                                        });
+                                    } else {
+                                        engine.hub.publish(novel_id, EngineEvent::Stage {
+                                            stage: "autofix".into(),
+                                            message: format!(
+                                                "第 {idx} 章自动修复未改善，保留原稿"
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::warn!("chapter {idx} auto-fix failed: {e:#}"),
+                        }
+                    }
+
+                    // 本地文风检查结果并入审校意见，保持单一入口
+                    if let Some(r) = &report {
+                        review.issues.extend(r.as_review_issues());
+                    }
+                    engine.db.save_chapter_review(novel_id, idx, &review)?;
+                    engine.hub.publish(novel_id, EngineEvent::ChapterReview {
+                        chapter_idx: idx,
+                        ok: review.ok,
+                        issues: review.issues.len(),
+                    });
+                    parsed = Some(review);
+                }
+            }
+            Err(e) => tracing::warn!("chapter {idx} review failed: {e:#}"),
+        }
+
+    let review = parsed.ok_or_else(|| anyhow::anyhow!("审校输出无法解析为 JSON"))?;
+    *content_ref = content;
+    Ok(review)
+}
+
+/// 章节是否还有待处理的审校（无审校记录，或存在高/中危意见）
+fn review_needs_processing(ch: &crate::models::Chapter) -> bool {
+    match &ch.review_json {
+        None => true,
+        Some(raw) => serde_json::from_str::<Review>(raw)
+            .map(|r| medium_high_count(&r) > 0)
+            .unwrap_or(true),
+    }
+}
+
+fn medium_high_count(review: &Review) -> usize {
+    review
+        .issues
+        .iter()
+        .filter(|i| i.severity == "high" || i.severity == "medium")
+        .count()
+}
+
+/// 一键「AI 处理全部审校」：对有内容的、存在待处理问题的章节重新审校并自动修复。
+/// 返回待处理章节数（0 = 都已处理）；后台执行，进度经 SSE 推送。
+pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i64> {
+    let novel = engine
+        .db
+        .get_novel(novel_id)?
+        .ok_or_else(|| anyhow::anyhow!("novel not found: {novel_id}"))?;
+    let chapters = engine.db.list_chapters(novel_id)?;
+    let targets: Vec<(i64, String, String)> = chapters
+        .iter()
+        .filter(|c| !c.content.trim().is_empty())
+        .filter(|c| review_needs_processing(c))
+        .map(|c| (c.idx, c.title.clone(), c.goal.clone()))
+        .collect();
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    let total = targets.len() as i64;
+    let style_id = novel.style_preset.clone();
+    let nid = novel_id.to_string();
+    tokio::spawn(async move {
+        let style = crate::styles::find(&style_id);
+        let ov = engine.prompt_overrides();
+        let mut digested = 0usize;
+        for (i, (idx, title, goal)) in targets.iter().enumerate() {
+            engine.hub.publish(&nid, EngineEvent::Stage {
+                stage: "review".into(),
+                message: format!("AI 处理审校：第 {idx} 章（{}/{total}）…", i + 1),
+            });
+            let Some(ch) = engine.db.get_chapter(&nid, *idx).ok().flatten() else {
+                continue;
+            };
+            let before = ch
+                .review_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Review>(raw).ok())
+                .map(|r| medium_high_count(&r))
+                .unwrap_or(0);
+            let mut content = ch.content.clone();
+            match review_and_fix_chapter(&engine, &nid, *idx, title, goal, &mut content, style, &ov)
+                .await
+            {
+                Ok(r) => {
+                    digested += before.saturating_sub(medium_high_count(&r));
+                }
+                Err(e) => tracing::warn!("review-all chapter {idx} failed: {e:#}"),
+            }
+        }
+        engine.hub.publish(&nid, EngineEvent::Stage {
+            stage: "done".into(),
+            message: format!("AI 审校处理完成：复核 {total} 章，消化 {digested} 条问题"),
+        });
+    });
+    Ok(total)
 }

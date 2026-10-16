@@ -127,6 +127,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/api/novels/:id/auto",
             post(start_auto).delete(stop_auto),
         )
+        .route("/api/novels/:id/review-all", post(review_all))
         .route("/api/usage", get(monthly_usage))
         .route("/api/novels/:id/events", get(events))
         .route("/api/novels/:id/export", get(export_novel))
@@ -975,7 +976,7 @@ async fn novel_health(
     }
     if review_warnings > 0 {
         suggestions.push(format!(
-            "有 {} 章共 {} 条审校意见待处理：{}",
+            "有 {} 章存在 AI 尚未完全消化的审校意见（共 {} 条）：{} —— 点「AI 处理全部审校」再跑一轮即可",
             review_chapters.len(),
             review_warnings,
             join_idx(&review_chapters)
@@ -1133,6 +1134,26 @@ async fn monthly_usage(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::
         "budget": budget,
         "over_budget": budget > 0 && used >= budget,
     })))
+}
+
+/// 一键让 AI 处理全部待处理审校（后台执行；进度经 SSE 推送）
+async fn review_all(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    if let Some(run) = e.db.latest_run(&id).map_err(err)? {
+        if run.status == "running" {
+            return Err((
+                StatusCode::CONFLICT,
+                "有创作运行进行中，完成后再处理审校".to_string(),
+            ));
+        }
+    }
+    let queued = pipeline::spawn_review_all(e.clone(), &id).map_err(err)?;
+    Ok(Json(json!({"ok": true, "queued": queued})))
 }
 
 async fn events(

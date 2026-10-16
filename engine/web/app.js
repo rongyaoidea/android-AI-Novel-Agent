@@ -150,12 +150,11 @@ function parseReview(raw) {
   }
 }
 
+/** 章节表里的审校列：只呈现「AI 已处理」，不再向用户暴露待办数量（详情在编辑器里看） */
 function reviewChip(raw) {
   const r = parseReview(raw);
   if (!r) return `<span class="chip">—</span>`;
-  if (r.ok && r.issues.length === 0) return `<span class="chip chip-success">通过</span>`;
-  if (r.ok) return `<span class="chip chip-warning">提醒 ${r.issues.length}</span>`;
-  return `<span class="chip chip-danger">需处理 ${r.issues.length}</span>`;
+  return `<span class="chip chip-success" title="AI 已自动审校并按意见修复（细节可打开章节查看）">AI 已处理</span>`;
 }
 
 /* ---------------- 路由 ---------------- */
@@ -647,7 +646,7 @@ function renderTab() {
   if (state.tab === "foreshadowings") renderForeshadowings().catch((e) => toast(e.message, true));
 }
 
-/** 头部思维提示：未回收伏笔数 + 有审校提醒的章节数（可点击直达页签） */
+/** 头部概览：未回收伏笔数（提示用）+ AI 审校处理量（只报"已处理多少"，不报待办） */
 async function refreshInsights() {
   if (!state.novelId) return;
   let openF = 0;
@@ -656,16 +655,20 @@ async function refreshInsights() {
     state.foreshadowings = f.items || [];
     openF = state.foreshadowings.filter((x) => x.status === "open").length;
   } catch { /* 忽略 */ }
+  let fixCalls = 0;
+  try {
+    const u = await api(`/api/novels/${state.novelId}/usage`);
+    fixCalls = (u.by_task || [])
+      .filter((g) => g.key === "auto_fix")
+      .reduce((sum, g) => sum + (g.calls || 0), 0);
+  } catch { /* 忽略 */ }
   if (parseRoute().kind !== "novel") return;
-  const issues = (state.novel?.chapters || []).filter((c) => {
-    const r = parseReview(c.review);
-    return r && (!r.ok || r.issues.length > 0);
-  }).length;
+  const reviewed = (state.novel?.chapters || []).filter((c) => c.review).length;
   const el = $("#novel-insights");
   if (!el) return;
   el.innerHTML =
     `<span class="chip chip-filter ${openF ? "chip-warning" : ""}" data-insight="foreshadowings" title="点击查看伏笔台账">${ic("i-flag")}未回收伏笔 ${openF}</span>` +
-    `<span class="chip chip-filter ${issues ? "chip-warning" : ""}" data-insight="chapters" title="点击查看章节">${ic("i-flag")}审校提醒 ${issues} 章</span>`;
+    `<span class="chip chip-filter" data-insight="chapters" title="AI 已自动审校并按意见修复；细节可在章节里查看">${ic("i-check")}AI 审校已处理 ${reviewed} 章${fixCalls ? ` · 修复 ${fixCalls} 次` : ""}</span>`;
 }
 
 /* ---------------- 书籍体检 ---------------- */
@@ -1000,6 +1003,15 @@ function bindNovel() {
         const r = await api(`/api/novels/${state.novelId}/auto`, { method: "POST" });
         toast(`自动连载已开始：每批 ≤10 章，直到第 ${r.target} 章`);
       }
+      await refreshNovel();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+  $("#novel-review-all").onclick = async () => {
+    try {
+      const r = await api(`/api/novels/${state.novelId}/review-all`, { method: "POST" });
+      toast(r.queued > 0 ? `已开始：AI 后台处理 ${r.queued} 章审校（进度见「跟随生成」）` : "所有章节的审校都已处理");
       await refreshNovel();
     } catch (err) {
       toast(err.message, true);
