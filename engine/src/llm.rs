@@ -38,6 +38,116 @@ pub fn backoff_delay(attempt: usize) -> std::time::Duration {
 pub struct Llm {
     settings: LlmSettings,
     http: reqwest::Client,
+    /// 候选端点（按优先级；Base URL 缺 /v1 时提供兜底，修复常见 404）
+    endpoints: Vec<String>,
+}
+
+/// 解析可用的 chat/completions 端点候选：
+/// - Base URL 已含 /chat/completions → 原样使用
+/// - 否则先试 `{base}/chat/completions`；若 Base 末段不是版本段（v1/v2/…），
+///   再加入 `{base}/v1/chat/completions` 兜底
+///   （用户常只填域名，如 `https://api.openai.com`，缺 `/v1` 会 404）
+pub fn endpoint_candidates(base_url: &str) -> Vec<String> {
+    let b = base_url.trim().trim_end_matches('/');
+    if b.is_empty() {
+        return vec!["/chat/completions".to_string()];
+    }
+    if b.ends_with("/chat/completions") {
+        return vec![b.to_string()];
+    }
+    let mut out = vec![format!("{b}/chat/completions")];
+    let last_seg = b.rsplit('/').next().unwrap_or("");
+    let is_version_seg = last_seg.len() >= 2
+        && last_seg.starts_with('v')
+        && last_seg[1..].chars().all(|c| c.is_ascii_digit());
+    if !is_version_seg {
+        out.push(format!("{b}/v1/chat/completions"));
+    }
+    out
+}
+
+/// 解析可用的 /models 端点候选（与 chat 端点同构；用于「拉取模型列表」）
+pub fn model_list_candidates(base_url: &str) -> Vec<String> {
+    let b0 = base_url.trim().trim_end_matches('/');
+    let b = b0
+        .strip_suffix("/chat/completions")
+        .unwrap_or(b0)
+        .trim_end_matches('/');
+    if b.is_empty() {
+        return vec!["/models".to_string()];
+    }
+    let mut out = vec![format!("{b}/models")];
+    let last_seg = b.rsplit('/').next().unwrap_or("");
+    let is_version_seg = last_seg.len() >= 2
+        && last_seg.starts_with('v')
+        && last_seg[1..].chars().all(|c| c.is_ascii_digit());
+    if !is_version_seg {
+        out.push(format!("{b}/v1/models"));
+    }
+    out
+}
+
+impl Llm {
+    /// 拉取服务商模型列表（GET {base}/models，OpenAI 兼容格式）。
+    /// Base URL 缺 /v1 时自动回退；错误信息包含已尝试端点。
+    pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        let urls = model_list_candidates(&self.settings.base_url);
+        let mut last: Option<(reqwest::StatusCode, String)> = None;
+        for (i, url) in urls.iter().enumerate() {
+            let resp = self
+                .send_with_retry(|| self.auth(self.http.get(url)))
+                .await
+                .context("拉取模型列表失败（网络）")?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                let v: serde_json::Value =
+                    serde_json::from_str(&text).context("模型列表响应不是 JSON")?;
+                let mut ids: Vec<String> = v["data"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if ids.is_empty() {
+                    anyhow::bail!(
+                        "未解析到模型（响应非 OpenAI /models 格式）: {}",
+                        truncate(&text, 200)
+                    );
+                }
+                ids.sort();
+                ids.dedup();
+                return Ok(ids);
+            }
+            if status == reqwest::StatusCode::NOT_FOUND {
+                if i + 1 < urls.len() {
+                    tracing::warn!(
+                        "模型列表端点 404（{url}），尝试备用端点 {url2}",
+                        url = url,
+                        url2 = &urls[i + 1]
+                    );
+                    last = Some((status, text));
+                    continue;
+                }
+                anyhow::bail!("模型列表接口不存在（已尝试端点：{}）", urls.join("、"));
+            }
+            anyhow::bail!(
+                "拉取模型列表 HTTP {} @ {}: {}",
+                status,
+                url,
+                truncate(&text, 300)
+            );
+        }
+        let (status, text) = last.unwrap_or((reqwest::StatusCode::NOT_FOUND, String::new()));
+        anyhow::bail!(
+            "拉取模型列表 HTTP {}（已尝试端点：{}）: {}",
+            status,
+            urls.join("、"),
+            truncate(&text, 300)
+        )
+    }
 }
 
 impl Llm {
@@ -47,11 +157,8 @@ impl Llm {
             .connect_timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap_or_default();
-        Self { settings, http }
-    }
-
-    fn endpoint(&self) -> String {
-        format!("{}/chat/completions", self.settings.base_url.trim_end_matches('/'))
+        let endpoints = endpoint_candidates(&settings.base_url);
+        Self { settings, http, endpoints }
     }
 
     fn base_body(&self, system: &str, user: &str, stream: bool) -> serde_json::Value {
@@ -79,7 +186,7 @@ impl Llm {
         }
     }
 
-    /// 非流式补全（含网络/限流/5xx 自动重试与退避）
+    /// 非流式补全（含网络/限流/5xx 自动重试与退避；Base URL 缺 /v1 时自动回退尝试）
     pub async fn complete(&self, system: &str, user: &str) -> anyhow::Result<LlmOutput> {
         if self.settings.provider == "mock" {
             let text = mock_complete(user)?;
@@ -87,22 +194,58 @@ impl Llm {
             return Ok(LlmOutput { text, usage });
         }
         let body = self.base_body(system, user, false);
-        let resp = self
-            .send_with_retry(|| self.auth(self.http.post(self.endpoint()).json(&body)))
-            .await
-            .context("LLM 请求失败（网络）")?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("LLM HTTP {}: {}", status, truncate(&text, 300)));
+        let mut last: Option<(reqwest::StatusCode, String)> = None;
+        for (i, url) in self.endpoints.iter().enumerate() {
+            let resp = self
+                .send_with_retry(|| self.auth(self.http.post(url).json(&body)))
+                .await
+                .context("LLM 请求失败（网络）")?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                let v: serde_json::Value =
+                    serde_json::from_str(&text).context("LLM 响应不是 JSON")?;
+                let usage = parse_usage(&v);
+                let out = v["choices"][0]["message"]["content"]
+                    .as_str()
+                    .map(|s| s.trim().to_string())
+                    .ok_or_else(|| {
+                        anyhow!("LLM 响应缺少 content 字段: {}", truncate(&text, 300))
+                    })?;
+                return Ok(LlmOutput { text: out, usage });
+            }
+            // 404 且还有候选端点 → 换下一个（常见于 Base URL 少写 /v1）
+            if status == reqwest::StatusCode::NOT_FOUND {
+                if i + 1 < self.endpoints.len() {
+                    tracing::warn!(
+                        "LLM 端点 404（{url}），尝试备用端点 {url2}",
+                        url = url,
+                        url2 = &self.endpoints[i + 1]
+                    );
+                    last = Some((status, text));
+                    continue;
+                }
+                return Err(anyhow!(
+                    "LLM HTTP {}（已尝试端点：{}）: {}",
+                    status,
+                    self.endpoints.join("、"),
+                    truncate(&text, 300)
+                ));
+            }
+            return Err(anyhow!(
+                "LLM HTTP {} @ {}: {}",
+                status,
+                url,
+                truncate(&text, 300)
+            ));
         }
-        let v: serde_json::Value = serde_json::from_str(&text).context("LLM 响应不是 JSON")?;
-        let usage = parse_usage(&v);
-        let out = v["choices"][0]["message"]["content"]
-            .as_str()
-            .map(|s| s.trim().to_string())
-            .ok_or_else(|| anyhow!("LLM 响应缺少 content 字段: {}", truncate(&text, 300)))?;
-        Ok(LlmOutput { text: out, usage })
+        let (status, text) = last.unwrap_or((reqwest::StatusCode::NOT_FOUND, String::new()));
+        Err(anyhow!(
+            "LLM HTTP {}（已尝试端点：{}）: {}",
+            status,
+            self.endpoints.join("、"),
+            truncate(&text, 300)
+        ))
     }
 
     /// 带重试的请求发送：网络错误（超时/连接/请求）与 408/429/5xx 自动退避重试。
@@ -160,25 +303,72 @@ impl Llm {
             return Ok(LlmOutput { text, usage });
         }
 
-        // 部分兼容实现不认 stream_options：遇到 400 去掉该字段重试一次
+        // 部分兼容实现不认 stream_options：遇到 400 去掉该字段重试一次；404 时回退备用端点
         let mut body = self.base_body(system, user, true);
-        let mut resp = self
-            .send_with_retry(|| self.auth(self.http.post(self.endpoint()).json(&body)))
-            .await
-            .context("LLM 流式请求失败（网络）")?;
-        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
-            body.as_object_mut().map(|m| m.remove("stream_options"));
-            resp = self
-                .auth(self.http.post(self.endpoint()).json(&body))
-                .send()
+        let mut resp: Option<reqwest::Response> = None;
+        let mut last: Option<(reqwest::StatusCode, String)> = None;
+        for (i, url) in self.endpoints.iter().enumerate() {
+            let r = self
+                .send_with_retry(|| self.auth(self.http.post(url).json(&body)))
                 .await
-                .context("LLM 流式重试失败（网络）")?;
+                .context("LLM 流式请求失败（网络）")?;
+            if r.status() == reqwest::StatusCode::BAD_REQUEST {
+                body.as_object_mut().map(|m| m.remove("stream_options"));
+                let r2 = self
+                    .send_with_retry(|| self.auth(self.http.post(url).json(&body)))
+                    .await
+                    .context("LLM 流式重试失败（网络）")?;
+                if r2.status().is_success() {
+                    resp = Some(r2);
+                    break;
+                }
+                let st = r2.status();
+                let text = r2.text().await.unwrap_or_default();
+                if st == reqwest::StatusCode::NOT_FOUND && i + 1 < self.endpoints.len() {
+                    last = Some((st, text));
+                    continue;
+                }
+                return Err(anyhow!("LLM HTTP {} @ {}: {}", st, url, truncate(&text, 300)));
+            }
+            if r.status().is_success() {
+                resp = Some(r);
+                break;
+            }
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                if i + 1 < self.endpoints.len() {
+                    tracing::warn!(
+                        "LLM 流式端点 404（{url}），尝试备用端点 {url2}",
+                        url = url,
+                        url2 = &self.endpoints[i + 1]
+                    );
+                    last = Some((status, text));
+                    continue;
+                }
+                return Err(anyhow!(
+                    "LLM HTTP {}（已尝试端点：{}）: {}",
+                    status,
+                    self.endpoints.join("、"),
+                    truncate(&text, 300)
+                ));
+            }
+            return Err(anyhow!(
+                "LLM HTTP {} @ {}: {}",
+                status,
+                url,
+                truncate(&text, 300)
+            ));
         }
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("LLM HTTP {}: {}", status, truncate(&text, 300)));
-        }
+        let Some(resp) = resp else {
+            let (status, text) = last.unwrap_or((reqwest::StatusCode::NOT_FOUND, String::new()));
+            return Err(anyhow!(
+                "LLM HTTP {}（已尝试端点：{}）: {}",
+                status,
+                self.endpoints.join("、"),
+                truncate(&text, 300)
+            ));
+        };
 
         let mut acc = String::new();
         let mut usage = TokenUsage::default();
@@ -728,5 +918,211 @@ mod tests {
         let err = llm.complete("system", "user").await.unwrap_err();
         assert!(format!("{err}").contains("500"), "错误应带状态码: {err}");
         assert_eq!(hits.load(Ordering::SeqCst), 3, "最多尝试 3 次");
+    }
+
+    // ---------- 端点解析与 404 回退 ----------
+
+    #[test]
+    fn endpoint_candidates_variants() {
+        let c = |b: &str| endpoint_candidates(b);
+        // 已含完整路径：原样使用
+        assert_eq!(
+            c("https://api.x.com/v1/chat/completions"),
+            vec!["https://api.x.com/v1/chat/completions"]
+        );
+        // 常见：Base 已含 /v1（含尾斜杠）
+        assert_eq!(
+            c("https://api.deepseek.com/v1"),
+            vec!["https://api.deepseek.com/v1/chat/completions"]
+        );
+        assert_eq!(
+            c("https://api.deepseek.com/v1/"),
+            vec!["https://api.deepseek.com/v1/chat/completions"]
+        );
+        // 缺 /v1：提供兜底候选（修复 404 的主要场景）
+        assert_eq!(
+            c("https://api.openai.com"),
+            vec![
+                "https://api.openai.com/chat/completions",
+                "https://api.openai.com/v1/chat/completions"
+            ]
+        );
+        // 本地带端口（Ollama / LM Studio 根地址）
+        assert_eq!(
+            c("http://127.0.0.1:11434"),
+            vec![
+                "http://127.0.0.1:11434/chat/completions",
+                "http://127.0.0.1:11434/v1/chat/completions"
+            ]
+        );
+        // 深路径末段是版本段 → 不重复补 /v1
+        assert_eq!(
+            c("https://openrouter.ai/api/v1"),
+            vec!["https://openrouter.ai/api/v1/chat/completions"]
+        );
+        assert_eq!(
+            c("https://api.commandcode.ai/provider/v1"),
+            vec!["https://api.commandcode.ai/provider/v1/chat/completions"]
+        );
+        assert_eq!(
+            c("https://open.bigmodel.cn/api/paas/v4"),
+            vec!["https://open.bigmodel.cn/api/paas/v4/chat/completions"]
+        );
+    }
+
+    /// 集成：Base URL 缺 /v1 时自动回退（/chat/completions 404 → /v1/chat/completions 成功）
+    #[tokio::test]
+    async fn falls_back_to_v1_when_missing() {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let llm = Llm::new(LlmSettings {
+            provider: "openai".into(),
+            base_url: format!("http://{addr}"), // 故意不带 /v1
+            api_key: String::new(),
+            model: "m".into(),
+            temperature: 0.5,
+        });
+        let out = llm.complete("s", "u").await.unwrap();
+        assert_eq!(out.text, "ok");
+    }
+
+    /// 集成：所有候选端点都 404 时，错误信息列出已尝试的端点（便于诊断）
+    #[tokio::test]
+    async fn reports_tried_endpoints_on_404() {
+        let app = axum::Router::new(); // 无任何路由 → 全部 404
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let llm = Llm::new(LlmSettings {
+            provider: "openai".into(),
+            base_url: format!("http://{addr}"),
+            api_key: String::new(),
+            model: "m".into(),
+            temperature: 0.5,
+        });
+        let err = format!("{}", llm.complete("s", "u").await.unwrap_err());
+        assert!(err.contains("404"), "{err}");
+        assert!(err.contains("已尝试端点"), "应列出所有已尝试的端点: {err}");
+        assert!(err.contains(&format!("http://{addr}/chat/completions")), "{err}");
+        assert!(err.contains(&format!("http://{addr}/v1/chat/completions")), "{err}");
+    }
+
+    // ---------- 模型列表拉取 ----------
+
+    #[test]
+    fn model_list_candidates_variants() {
+        let c = |b: &str| model_list_candidates(b);
+        assert_eq!(
+            c("https://api.deepseek.com/v1"),
+            vec!["https://api.deepseek.com/v1/models"]
+        );
+        assert_eq!(
+            c("https://api.openai.com"),
+            vec!["https://api.openai.com/models", "https://api.openai.com/v1/models"]
+        );
+        // 误填完整 chat 路径 → 自动剥掉再补 /models
+        assert_eq!(
+            c("https://api.deepseek.com/v1/chat/completions"),
+            vec!["https://api.deepseek.com/v1/models"]
+        );
+        // 深路径（Zen Go / CommandCode）
+        assert_eq!(
+            c("https://opencode.ai/zen/go/v1"),
+            vec!["https://opencode.ai/zen/go/v1/models"]
+        );
+        assert_eq!(
+            c("https://api.commandcode.ai/provider/v1"),
+            vec!["https://api.commandcode.ai/provider/v1/models"]
+        );
+    }
+
+    /// 集成：拉取 OpenAI 兼容 /models 列表（排序去重；缺 /v1 自动回退）
+    #[tokio::test]
+    async fn lists_models_with_fallback() {
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "object": "list",
+                    "data": [
+                        {"id": "model-b", "object": "model"},
+                        {"id": "model-a", "object": "model"},
+                        {"id": "model-b", "object": "model"}
+                    ]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let llm = Llm::new(LlmSettings {
+            provider: "openai".into(),
+            base_url: format!("http://{addr}"), // 缺 /v1
+            api_key: String::new(),
+            model: String::new(),
+            temperature: 0.0,
+        });
+        let models = llm.list_models().await.unwrap();
+        assert_eq!(models, vec!["model-a".to_string(), "model-b".to_string()]);
+    }
+
+    /// 集成：/models 全 404 → 报错含已尝试端点；响应格式不对 → 明确报错
+    #[tokio::test]
+    async fn model_list_errors_are_clear() {
+        // 全 404
+        let app = axum::Router::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let llm = Llm::new(LlmSettings {
+            provider: "openai".into(),
+            base_url: format!("http://{addr}/v1"),
+            api_key: String::new(),
+            model: String::new(),
+            temperature: 0.0,
+        });
+        let err = format!("{}", llm.list_models().await.unwrap_err());
+        assert!(err.contains("不存在"), "{err}");
+
+        // 200 但格式不对
+        let app2 = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({"foo": "bar"})) }),
+        );
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener2, app2).await;
+        });
+        let llm2 = Llm::new(LlmSettings {
+            provider: "openai".into(),
+            base_url: format!("http://{addr2}/v1"),
+            api_key: String::new(),
+            model: String::new(),
+            temperature: 0.0,
+        });
+        let err2 = format!("{}", llm2.list_models().await.unwrap_err());
+        assert!(err2.contains("未解析到模型"), "{err2}");
     }
 }

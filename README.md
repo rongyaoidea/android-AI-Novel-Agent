@@ -36,7 +36,7 @@ android-AI-Novel-Agent/
 | 断点续跑（已完成章节跳过） | ✅ |
 | SSE 实时事件（stage / token / saved / review / finished） | ✅ |
 | 导出 TXT | ✅ |
-| 模型接入：mock（离线）/ OpenAI 兼容（含 DeepSeek、通义、GLM、Ollama 等） | ✅ |
+| 模型接入：mock（离线）/ OpenAI 兼容（内置 14 家快速预设：DeepSeek、通义、GLM、Kimi、硅基流动、OpenAI、OpenRouter、xAI Grok、Groq、OpenCode Zen、OpenCode Go、Command Code、Ollama、LM Studio）；Base URL 缺 /v1 自动补全回退；支持一键拉取服务商模型列表 | ✅ |
 | 界面：书架卡片 / 开书流程 / 工作台（进度步骤条 + 跟随生成 + 章节表）/ 运行记录 / 模型设置（浅色 & 深色主题） | ✅ |
 | 书架搜索与排序（最近更新 / 字数最多 / 进度最高）；运行日志刷新后回放（每书最近 300 条关键事件） | ✅ |
 | 角色台账 / 伏笔台账（写后自动抽取 + 上下文注入） | ✅ |

@@ -288,6 +288,13 @@
               <input id="set-model" placeholder="deepseek-chat" />
             </div>
           </div>
+          <div class="field" style="max-width:700px;">
+            <label>模型列表（点「拉取模型」从服务商获取，选一个即填入上方）</label>
+            <div class="row">
+              <button class="btn btn-outline btn-sm" type="button" id="set-models-fetch"><svg class="ic"><use href="#i-refresh"/></svg>拉取模型</button>
+              <select id="set-model-list" class="input-sm" disabled><option>先点「拉取模型」</option></select>
+            </div>
+          </div>
           <div class="field" style="max-width:220px;">
             <label for="set-temp">temperature</label>
             <input id="set-temp" type="number" step="0.1" min="0" max="2" />
@@ -300,10 +307,30 @@
         </form>
         <div class="presets" style="max-width:700px;">
           <span class="muted">快速填充：</span>
-          <button class="btn btn-outline btn-sm" data-preset="deepseek">DeepSeek</button>
-          <button class="btn btn-outline btn-sm" data-preset="qwen">通义千问</button>
-          <button class="btn btn-outline btn-sm" data-preset="glm">智谱 GLM</button>
-          <button class="btn btn-outline btn-sm" data-preset="ollama">Ollama 本地</button>
+          <select id="set-preset" class="input-sm" title="选择服务商，自动填入 Base URL 与推荐模型">
+            <option value="">选择服务商…</option>
+            <optgroup label="国内">
+              <option value="deepseek">DeepSeek</option>
+              <option value="qwen">通义千问</option>
+              <option value="glm">智谱 GLM</option>
+              <option value="moonshot">月之暗面 Kimi</option>
+              <option value="siliconflow">硅基流动</option>
+            </optgroup>
+            <optgroup label="国际">
+              <option value="openai">OpenAI</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="xai">xAI Grok</option>
+              <option value="groq">Groq</option>
+              <option value="opencode_zen">OpenCode Zen（按量付费）</option>
+              <option value="opencode_go">OpenCode Go（订阅版）</option>
+              <option value="commandcode">Command Code</option>
+            </optgroup>
+            <optgroup label="本地">
+              <option value="ollama">Ollama</option>
+              <option value="lmstudio">LM Studio</option>
+            </optgroup>
+          </select>
+          <span class="muted" style="font-size:12px;">Base URL 可只填到版本段（如 …/v1）；缺 /v1 会自动尝试补全，并在错误里给出已尝试的端点。</span>
         </div>
         <div class="panel" style="max-width:700px;">
           <div class="panel-head">

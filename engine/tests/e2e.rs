@@ -1490,7 +1490,6 @@ async fn style_report_and_auto_retry() {
         assert_ne!(status, "failed", "run failed: {}", v["run"]["error"]);
     }
     assert_eq!(status, "done", "自动重写不应导致运行失败");
-
     // 章节详情：文风报告存在且判不通过（Mock 段落等长 + 无对话）
     let resp = app
         .clone()
@@ -1544,6 +1543,91 @@ async fn style_report_and_auto_retry() {
     };
     assert_eq!(task_calls("chapter"), 1, "正文应只生成一次");
     assert_eq!(task_calls("chapter_retry"), 1, "硬指标不通过应重写一次（且仅一次）: {u}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 拉取服务商模型列表（API 全链路：表单参数 → 假服务商 /v1/models → 排序结果）
+#[tokio::test]
+async fn llm_model_list_endpoint() {
+    // 假服务商：只有 /v1/models 可达
+    let provider = axum::Router::new().route(
+        "/v1/models",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "zz-last", "object": "model"},
+                    {"id": "aa-first", "object": "model"}
+                ]
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, provider).await;
+    });
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-models-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    let app = api::build_router(engine.clone());
+
+    // 表单只填了域名（无 /v1）→ 应自动回退并成功
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/settings/llm/models")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"base_url": format!("http://{addr}"), "api_key": "sk-test"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["models"][0], "aa-first");
+    assert_eq!(v["models"][1], "zz-last");
+
+    // 无 Base URL 且未保存过 → 400（表单与存档都为空）
+    engine
+        .db
+        .set_llm_settings(&LlmSettings::default())
+        .unwrap();
+    // mock 默认设置里的 base_url 是 openai 官方地址，先清空再测
+    engine
+        .db
+        .set_llm_settings(&LlmSettings {
+            provider: "mock".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            temperature: 0.8,
+        })
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/settings/llm/models")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1739,10 +1739,23 @@ function bindPrompts() {
 /* ---------------- 设置 ---------------- */
 
 const PRESETS = {
+  // 国内
   deepseek: { base: "https://api.deepseek.com/v1", model: "deepseek-chat" },
   qwen: { base: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus" },
   glm: { base: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.5-air" },
+  moonshot: { base: "https://api.moonshot.cn/v1", model: "kimi-latest" },
+  siliconflow: { base: "https://api.siliconflow.cn/v1", model: "deepseek-ai/DeepSeek-V3" },
+  // 国际
+  openai: { base: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+  openrouter: { base: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini" },
+  xai: { base: "https://api.x.ai/v1", model: "grok-4" },
+  groq: { base: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
+  opencode_zen: { base: "https://opencode.ai/zen/v1", model: "kimi-k2.5" },
+  opencode_go: { base: "https://opencode.ai/zen/go/v1", model: "kimi-k2.5" },
+  commandcode: { base: "https://api.commandcode.ai/provider/v1", model: "deepseek/deepseek-v4-flash" },
+  // 本地
   ollama: { base: "http://127.0.0.1:11434/v1", model: "qwen2.5:7b" },
+  lmstudio: { base: "http://127.0.0.1:1234/v1", model: "qwen3-8b" },
 };
 
 async function loadSettings() {
@@ -1846,15 +1859,51 @@ function bindSettings() {
     }
   };
 
-  $$(".presets [data-preset]").forEach((btn) => {
-    btn.onclick = () => {
-      const p = PRESETS[btn.dataset.preset];
+  const presetSel = $("#set-preset");
+  if (presetSel) {
+    presetSel.addEventListener("change", () => {
+      const p = PRESETS[presetSel.value];
       if (!p) return;
       $("#set-provider").value = "openai";
       $("#set-base").value = p.base;
       $("#set-model").value = p.model;
       syncProviderFields();
-    };
+      $("#set-status").textContent = "已填入预设，请补 API Key 后保存";
+    });
+  }
+
+  // 拉取服务商模型列表（用表单里正在填的 Base URL / Key；为空回退到已保存设置）
+  $("#set-models-fetch").onclick = async () => {
+    const btn = $("#set-models-fetch");
+    const sel = $("#set-model-list");
+    btn.disabled = true;
+    $("#set-status").textContent = "正在拉取模型列表…";
+    try {
+      const r = await apiSend("/api/settings/llm/models", "POST", {
+        base_url: $("#set-base").value.trim(),
+        api_key: $("#set-key").value.trim(),
+      });
+      if (!r.ok) throw new Error(r.message || "拉取失败");
+      const models = r.models || [];
+      sel.innerHTML = [`<option value="">选择模型（共 ${models.length} 个）…</option>`]
+        .concat(models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`))
+        .join("");
+      sel.disabled = false;
+      $("#set-status").textContent = `已拉取 ${models.length} 个模型，从下拉里选一个即可`;
+    } catch (err) {
+      sel.innerHTML = "<option>拉取失败</option>";
+      sel.disabled = true;
+      $("#set-status").textContent = "拉取失败：" + err.message;
+    } finally {
+      btn.disabled = false;
+    }
+  };
+  $("#set-model-list").addEventListener("change", () => {
+    const v = $("#set-model-list").value;
+    if (v) {
+      $("#set-model").value = v;
+      $("#set-status").textContent = `已选择模型：${v}（记得保存）`;
+    }
   });
 }
 

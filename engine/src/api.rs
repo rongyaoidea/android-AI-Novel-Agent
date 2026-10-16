@@ -105,6 +105,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         .route("/api/settings/llm", get(get_llm).put(put_llm))
         .route("/api/settings/llm/test", post(test_llm))
+        .route("/api/settings/llm/models", post(list_llm_models))
         .route("/api/novels", get(list_novels).post(create_novel))
         .route("/api/novels/:id", get(get_novel).patch(patch_novel).delete(delete_novel))
         .route("/api/novels/:id/chapters", post(insert_chapter))
@@ -273,6 +274,48 @@ async fn test_llm(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value
                 "message": out.text.chars().take(80).collect::<String>(),
             })))
         }
+        Err(e2) => Ok(Json(json!({"ok": false, "message": format!("{e2}")}))),
+    }
+}
+
+#[derive(Deserialize)]
+struct ModelsBody {
+    /// 表单里正在填写的 Base URL（为空则用已保存的设置）
+    #[serde(default)]
+    base_url: String,
+    /// 表单里正在填写的 API Key（为空则用已保存的 Key）
+    #[serde(default)]
+    api_key: String,
+}
+
+/// 拉取服务商模型列表（OpenAI 兼容 GET /models），供设置页下拉选择
+async fn list_llm_models(
+    State(e): State<Arc<Engine>>,
+    Json(b): Json<ModelsBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let stored = e.llm_settings().map_err(err)?;
+    let base_url = if b.base_url.trim().is_empty() {
+        stored.base_url.clone()
+    } else {
+        b.base_url.trim().to_string()
+    };
+    let api_key = if b.api_key.trim().is_empty() {
+        stored.api_key.clone()
+    } else {
+        b.api_key.trim().to_string()
+    };
+    if base_url.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "请先填写 Base URL".to_string()));
+    }
+    let llm = crate::llm::Llm::new(LlmSettings {
+        provider: "openai".into(),
+        base_url,
+        api_key,
+        model: String::new(),
+        temperature: 0.0,
+    });
+    match llm.list_models().await {
+        Ok(models) => Ok(Json(json!({"ok": true, "models": models}))),
         Err(e2) => Ok(Json(json!({"ok": false, "message": format!("{e2}")}))),
     }
 }
