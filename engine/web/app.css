@@ -527,6 +527,10 @@ mark.add { background: hsl(var(--success) / .2); color: inherit; border-radius: 
 #style-backdrop .style-grid, #create-style-grid { max-height: 52vh; overflow: auto; }
 .muted-chip { opacity: .82; }
 
+/* ---------- 设置页下拉：需要完整显示文字（.input-sm 默认过窄） ---------- */
+#set-preset, #set-model-list { width: auto; min-width: 220px; max-width: 100%; flex: 1 1 auto; }
+#set-model-list { min-width: 280px; }
+
 /* ---------- 书架工具栏 ---------- */
 .shelf-tools { display: flex; gap: 8px; align-items: center; margin-left: auto; }
 .shelf-tools .input-sm { min-width: 170px; }
@@ -568,6 +572,7 @@ mark.add { background: hsl(var(--success) / .2); color: inherit; border-radius: 
   .topbar-right { width: 100%; justify-content: flex-start; }
   .shelf-tools { width: 100%; margin-left: 0; }
   .shelf-tools .input-sm { flex: 1; min-width: 0; }
+  #set-preset, #set-model-list { min-width: 0; flex: 1 1 100%; }
   .content { padding: 14px; }
   .page-actions { flex-wrap: wrap; }
   .novel-grid { grid-template-columns: 1fr; }

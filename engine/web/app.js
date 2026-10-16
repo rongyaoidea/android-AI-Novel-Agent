@@ -1751,7 +1751,7 @@ const PRESETS = {
   xai: { base: "https://api.x.ai/v1", model: "grok-4" },
   groq: { base: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
   opencode_zen: { base: "https://opencode.ai/zen/v1", model: "kimi-k2.5" },
-  opencode_go: { base: "https://opencode.ai/zen/go/v1", model: "kimi-k2.5" },
+  opencode_go: { base: "https://opencode.ai/inference/go/openai/v1", model: "kimi-k3" },
   commandcode: { base: "https://api.commandcode.ai/provider/v1", model: "deepseek/deepseek-v4-flash" },
   // 本地
   ollama: { base: "http://127.0.0.1:11434/v1", model: "qwen2.5:7b" },

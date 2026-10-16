@@ -40,6 +40,24 @@ pub struct Llm {
     http: reqwest::Client,
     /// 候选端点（按优先级；Base URL 缺 /v1 时提供兜底，修复常见 404）
     endpoints: Vec<String>,
+    /// OpenCode（Zen/Go）要求的稳定会话标识（其它服务商为 None）
+    session: Option<String>,
+}
+
+/// 归一化已知的过时 / 易错 Base URL（在解析端点前调用）
+/// - 早前版本预设的 OpenCode Go 地址（`/zen/go/v1`）→ 官方文档端点
+pub fn normalize_base_url(base: &str) -> String {
+    let b = base.trim().trim_end_matches('/');
+    let lower = b.to_ascii_lowercase();
+    if lower == "https://opencode.ai/zen/go" || lower == "https://opencode.ai/zen/go/v1" {
+        return "https://opencode.ai/inference/go/openai/v1".to_string();
+    }
+    b.to_string()
+}
+
+/// OpenCode（Zen / Go）要求客户端提供稳定会话标识（x-opencode-session）
+fn needs_opencode_session(base_url: &str) -> bool {
+    base_url.to_ascii_lowercase().contains("opencode.ai")
 }
 
 /// 解析可用的 chat/completions 端点候选：
@@ -48,7 +66,8 @@ pub struct Llm {
 ///   再加入 `{base}/v1/chat/completions` 兜底
 ///   （用户常只填域名，如 `https://api.openai.com`，缺 `/v1` 会 404）
 pub fn endpoint_candidates(base_url: &str) -> Vec<String> {
-    let b = base_url.trim().trim_end_matches('/');
+    let b = normalize_base_url(base_url);
+    let b = b.trim().trim_end_matches('/');
     if b.is_empty() {
         return vec!["/chat/completions".to_string()];
     }
@@ -68,10 +87,17 @@ pub fn endpoint_candidates(base_url: &str) -> Vec<String> {
 
 /// 解析可用的 /models 端点候选（与 chat 端点同构；用于「拉取模型列表」）
 pub fn model_list_candidates(base_url: &str) -> Vec<String> {
-    let b0 = base_url.trim().trim_end_matches('/');
-    let b = b0
+    let b0 = normalize_base_url(base_url);
+    let b = b0.trim_end_matches('/');
+    // OpenCode Go：模型列表在 `inference/go/v1/models`（与 chat 的 /openai/v1 不同前缀）
+    let lower = b.to_ascii_lowercase();
+    if lower.ends_with("/inference/go/openai/v1") {
+        let prefix = &b[..b.len() - "/openai/v1".len()];
+        return vec![format!("{prefix}/v1/models"), format!("{b}/models")];
+    }
+    let b = b
         .strip_suffix("/chat/completions")
-        .unwrap_or(b0)
+        .unwrap_or(b)
         .trim_end_matches('/');
     if b.is_empty() {
         return vec!["/models".to_string()];
@@ -95,7 +121,7 @@ impl Llm {
         let mut last: Option<(reqwest::StatusCode, String)> = None;
         for (i, url) in urls.iter().enumerate() {
             let resp = self
-                .send_with_retry(|| self.auth(self.http.get(url)))
+                .send_with_retry(|| self.decorate(self.http.get(url)))
                 .await
                 .context("拉取模型列表失败（网络）")?;
             let status = resp.status();
@@ -152,13 +178,30 @@ impl Llm {
 
 impl Llm {
     pub fn new(settings: LlmSettings) -> Self {
+        // 归一化 Base URL（含早前预设的 OpenCode Go 地址纠正）
+        let mut settings = settings;
+        settings.base_url = normalize_base_url(&settings.base_url);
+
         let http = reqwest::Client::builder()
+            // 标识本应用（OpenCode Go 等要求非通用 SDK 的 UA）
+            .user_agent(format!(
+                "android-AI-Novel-Agent/{}",
+                env!("CARGO_PKG_VERSION")
+            ))
             .timeout(std::time::Duration::from_secs(600))
             .connect_timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap_or_default();
         let endpoints = endpoint_candidates(&settings.base_url);
-        Self { settings, http, endpoints }
+        // OpenCode（Zen/Go）要求稳定会话标识用于路由与提示缓存
+        let session = needs_opencode_session(&settings.base_url)
+            .then(|| uuid::Uuid::new_v4().to_string());
+        Self {
+            settings,
+            http,
+            endpoints,
+            session,
+        }
     }
 
     fn base_body(&self, system: &str, user: &str, stream: bool) -> serde_json::Value {
@@ -186,6 +229,15 @@ impl Llm {
         }
     }
 
+    /// 鉴权 + 平台附加头（OpenCode：x-opencode-session）
+    fn decorate(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let req = self.auth(req);
+        match &self.session {
+            Some(s) => req.header("x-opencode-session", s),
+            None => req,
+        }
+    }
+
     /// 非流式补全（含网络/限流/5xx 自动重试与退避；Base URL 缺 /v1 时自动回退尝试）
     pub async fn complete(&self, system: &str, user: &str) -> anyhow::Result<LlmOutput> {
         if self.settings.provider == "mock" {
@@ -197,7 +249,7 @@ impl Llm {
         let mut last: Option<(reqwest::StatusCode, String)> = None;
         for (i, url) in self.endpoints.iter().enumerate() {
             let resp = self
-                .send_with_retry(|| self.auth(self.http.post(url).json(&body)))
+                .send_with_retry(|| self.decorate(self.http.post(url).json(&body)))
                 .await
                 .context("LLM 请求失败（网络）")?;
             let status = resp.status();
@@ -309,13 +361,13 @@ impl Llm {
         let mut last: Option<(reqwest::StatusCode, String)> = None;
         for (i, url) in self.endpoints.iter().enumerate() {
             let r = self
-                .send_with_retry(|| self.auth(self.http.post(url).json(&body)))
+                .send_with_retry(|| self.decorate(self.http.post(url).json(&body)))
                 .await
                 .context("LLM 流式请求失败（网络）")?;
             if r.status() == reqwest::StatusCode::BAD_REQUEST {
                 body.as_object_mut().map(|m| m.remove("stream_options"));
                 let r2 = self
-                    .send_with_retry(|| self.auth(self.http.post(url).json(&body)))
+                    .send_with_retry(|| self.decorate(self.http.post(url).json(&body)))
                     .await
                     .context("LLM 流式重试失败（网络）")?;
                 if r2.status().is_success() {
@@ -925,7 +977,6 @@ mod tests {
     #[test]
     fn endpoint_candidates_variants() {
         let c = |b: &str| endpoint_candidates(b);
-        // 已含完整路径：原样使用
         assert_eq!(
             c("https://api.x.com/v1/chat/completions"),
             vec!["https://api.x.com/v1/chat/completions"]
@@ -1044,7 +1095,11 @@ mod tests {
         // 深路径（Zen Go / CommandCode）
         assert_eq!(
             c("https://opencode.ai/zen/go/v1"),
-            vec!["https://opencode.ai/zen/go/v1/models"]
+            vec![
+                "https://opencode.ai/inference/go/v1/models",
+                "https://opencode.ai/inference/go/openai/v1/models"
+            ],
+            "旧 Go 地址应归一化到官方 inference 前缀"
         );
         assert_eq!(
             c("https://api.commandcode.ai/provider/v1"),
@@ -1124,5 +1179,111 @@ mod tests {
         });
         let err2 = format!("{}", llm2.list_models().await.unwrap_err());
         assert!(err2.contains("未解析到模型"), "{err2}");
+    }
+
+    // ---------- OpenCode（Zen/Go）：地址归一化 + 会话头 ----------
+
+    #[test]
+    fn normalize_open_code_go_base() {
+        assert_eq!(
+            normalize_base_url("https://opencode.ai/zen/go/v1"),
+            "https://opencode.ai/inference/go/openai/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://opencode.ai/zen/go/"),
+            "https://opencode.ai/inference/go/openai/v1"
+        );
+        // 其它地址不受影响（含 Zen）
+        assert_eq!(
+            normalize_base_url("https://opencode.ai/zen/v1"),
+            "https://opencode.ai/zen/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/v1"
+        );
+        // 归一化后端点解析正确
+        assert_eq!(
+            endpoint_candidates("https://opencode.ai/zen/go/v1"),
+            vec!["https://opencode.ai/inference/go/openai/v1/chat/completions"]
+        );
+    }
+
+    #[test]
+    fn opencode_go_model_list_uses_inference_prefix() {
+        // Go 的模型列表在 inference/go/v1/models（与 chat 的 /openai/v1 前缀不同）
+        let c = model_list_candidates("https://opencode.ai/inference/go/openai/v1");
+        assert_eq!(c[0], "https://opencode.ai/inference/go/v1/models");
+        // 旧地址归一化后同样命中
+        let c2 = model_list_candidates("https://opencode.ai/zen/go/v1");
+        assert_eq!(c2[0], "https://opencode.ai/inference/go/v1/models");
+    }
+
+    /// 集成：OpenCode 域名的请求带 x-opencode-session 与会话 UA；其它域名不带
+    /// （用 `http://opencode.ai@127.0.0.1:port` 的 userinfo 形式触发域名判定但实际打本地）
+    #[tokio::test]
+    async fn opencode_session_header_is_sent() {
+        use axum::http::HeaderMap;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let seen2 = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |headers: HeaderMap| {
+                let seen = seen2.clone();
+                async move {
+                    let session = headers
+                        .get("x-opencode-session")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let ua = headers
+                        .get("user-agent")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    seen.lock().unwrap().push((session, ua));
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // ① OpenCode 域名（userinfo 技巧→实际连本地）应带会话头
+        let llm = Llm::new(LlmSettings {
+            provider: "openai".into(),
+            base_url: format!("http://opencode.ai@{addr}/v1"),
+            api_key: "sk-test".into(),
+            model: "m".into(),
+            temperature: 0.5,
+        });
+        llm.complete("s", "u").await.unwrap();
+        {
+            let got = seen.lock().unwrap();
+            assert_eq!(got.len(), 1);
+            assert!(!got[0].0.is_empty(), "应发送 x-opencode-session");
+            assert!(got[0].1.contains("android-AI-Novel-Agent"), "UA={}", got[0].1);
+        }
+
+        // ② 普通域名不应带该头
+        let llm2 = Llm::new(LlmSettings {
+            provider: "openai".into(),
+            base_url: format!("http://{addr}/v1"),
+            api_key: String::new(),
+            model: "m".into(),
+            temperature: 0.5,
+        });
+        llm2.complete("s", "u").await.unwrap();
+        {
+            let got = seen.lock().unwrap();
+            assert_eq!(got.len(), 2);
+            assert!(got[1].0.is_empty(), "普通服务商不应发送 x-opencode-session");
+        }
     }
 }
