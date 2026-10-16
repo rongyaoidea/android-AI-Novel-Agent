@@ -213,7 +213,9 @@ class MainActivity : AppCompatActivity() {
             val ok = try {
                 Socket().use {
                     it.connect(InetSocketAddress("127.0.0.1", EngineService.PORT), 500)
-                } && engineHandshake()
+                }
+                // 端口可连 ≠ 是本应用引擎：再做一次健康握手，防止把令牌交给占用端口的第三方页面
+                engineHandshake()
             } catch (_: Exception) {
                 false
             }
