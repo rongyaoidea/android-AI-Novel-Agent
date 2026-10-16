@@ -707,6 +707,7 @@ const USAGE_TASK_LABEL = {
   outline: "章节规划",
   chapter: "正文生成",
   chapter_retry: "文风重写",
+  auto_fix: "自动修复",
   review: "章节审校",
   polish: "选段修文",
   continue: "光标续写",
