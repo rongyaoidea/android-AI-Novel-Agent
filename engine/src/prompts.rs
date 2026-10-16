@@ -45,6 +45,7 @@ static BRIEF: TaskSpec = TaskSpec {
 - genre: 题材（如 玄幻/都市/悬疑/科幻/历史）\n\
 - logline: 一句话卖点（40 字以内）\n\
 - protagonist: 主角名与一句话设定\n\
+- worldview: 世界观设定（60 字以内：时代背景、力量体系/核心规则、关键地点或阵营）\n\
 - style: 写法基调（节奏 / 视角 / 语言风格；若给了文风预设，需与该预设一致）\n",
 };
 
@@ -188,8 +189,39 @@ static EXTRACT: TaskSpec = TaskSpec {
 没有的字段返回空数组；只统计确实发生的信息，不要臆造。\n",
 };
 
+static VOLUME_SUMMARY: TaskSpec = TaskSpec {
+    id: "volume_summary",
+    label: "卷级摘要",
+    desc: "每 20 章归并一条卷级摘要，供长书回顾注入（JSON）",
+    vars: &[
+        VarSpec { name: "from", desc: "本卷起始章号", sample: "1" },
+        VarSpec { name: "to", desc: "本卷结束章号", sample: "20" },
+        VarSpec { name: "chapter_summaries", desc: "本卷各章摘要清单", sample: "第1章 风起：……\n第2章 暗涌：……" },
+    ],
+    default_system: "你是小说结构编辑。只输出一个 JSON 对象，不要输出其他文字、不要使用 Markdown 代码块。",
+    default_user: "TASK:volume_summary from={{from}} to={{to}}\n以下是第 {{from}}~{{to}} 章逐章摘要：\n---\n{{chapter_summaries}}\n---\n\n\
+请把这一卷压缩成一条连贯的卷级摘要（200 字以内），保留：关键事件走向、主要人物变化、尚未回收的悬念。\n\
+输出 JSON：{\"summary\": \"……\"}\n",
+};
+
+static FORESHADOW_AUDIT: TaskSpec = TaskSpec {
+    id: "foreshadow_audit",
+    label: "伏笔审核",
+    desc: "用章节摘要批量判定未回收伏笔是否已被后文实质回收（JSON）",
+    vars: &[
+        VarSpec { name: "foreshadow_list", desc: "未回收伏笔清单（含埋设章号）", sample: "- 青铜钥匙的来历（第3章埋下）" },
+        VarSpec { name: "chapter_summaries", desc: "各章摘要（供判断是否已回收）", sample: "第3章 钥匙：……\n第7章 门开：……" },
+    ],
+    default_system: "你是小说连续性审核助手。只输出一个 JSON 对象，不要输出其他文字、不要使用 Markdown 代码块。",
+    default_user: "TASK:foreshadow_audit\n未回收伏笔清单：\n{{foreshadow_list}}\n\n各章摘要：\n{{chapter_summaries}}\n\n\
+请判断哪些伏笔已经在后文被实质回收（事件落地、谜底揭开或明确交代，而非仅仅被提及）。\n\
+输出 JSON：{\"resolved\": [{\"title\": \"伏笔标题\", \"chapter_idx\": 回收所在章号, \"evidence\": \"一句话依据\"}]}\n\
+只报告有把握的；没有把握就返回空数组。\n",
+};
+
 pub static TASKS: &[&TaskSpec] = &[
     &BRIEF, &OUTLINE, &CHAPTER, &REVIEW, &POLISH, &CONTINUE, &REWRITE, &EXTRACT,
+    &VOLUME_SUMMARY, &FORESHADOW_AUDIT,
 ];
 
 pub fn task(id: &str) -> Option<&'static TaskSpec> {
@@ -596,6 +628,35 @@ pub fn extract_prompt(chapter_idx: i64, text: &str, ov: &Overrides) -> (String, 
     build(&EXTRACT, ov, &vars)
 }
 
+/// 卷级摘要：把一卷内各章摘要压成一条（from~to 含端点）
+pub fn volume_summary_prompt(
+    from: i64,
+    to: i64,
+    summaries: &[(i64, String, String)],
+    ov: &Overrides,
+) -> (String, String) {
+    let text = summaries
+        .iter()
+        .map(|(i, t, s)| format!("第{i}章 {t}：{s}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let vars = vec![
+        ("from", from.to_string()),
+        ("to", to.to_string()),
+        ("chapter_summaries", text),
+    ];
+    build(&VOLUME_SUMMARY, ov, &vars)
+}
+
+/// 伏笔自动审核：未回收清单 + 各章摘要 → 判定哪些已实质回收
+pub fn foreshadow_audit_prompt(list: &str, summaries: &str, ov: &Overrides) -> (String, String) {
+    let vars = vec![
+        ("foreshadow_list", list.to_string()),
+        ("chapter_summaries", summaries.to_string()),
+    ];
+    build(&FORESHADOW_AUDIT, ov, &vars)
+}
+
 // 保留一个 JSON 约束后缀，便于其它模块复用
 pub const JSON_SUFFIX: &str = "只输出一个 JSON 对象，不要输出任何其他文字、不要使用 Markdown 代码块。";
 
@@ -611,6 +672,7 @@ mod tests {
             logline: "一句话卖点".into(),
             protagonist: "主角名".into(),
             style: "快节奏".into(),
+            worldview: "现代都市，无超自然".into(),
         }
     }
 
@@ -629,7 +691,7 @@ mod tests {
 
     #[test]
     fn task_catalog_is_consistent() {
-        assert_eq!(TASKS.len(), 8, "任务数量应为 8");
+        assert_eq!(TASKS.len(), 10, "任务数量应为 10");
         for spec in TASKS {
             assert!(task(spec.id).is_some());
             assert!(!spec.label.is_empty() && !spec.desc.is_empty());

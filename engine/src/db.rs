@@ -19,7 +19,34 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-const NOVEL_COLS: &str = "id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at,style_preset,target_chapters,auto_continue";
+const NOVEL_COLS: &str = "id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at,style_preset,target_chapters,auto_continue,worldview";
+
+/// CJK 判定（含扩展 A、兼容表意文字与日文假名；用于 FTS 逐字拆分）
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x3040..=0x30FF
+    )
+}
+
+/// 检索摘录：首个命中词的上下文（前后各 30 / 60 字符）；未命中取开头 80 字
+fn excerpt_for(content: &str, query: &str) -> String {
+    let needle = query.split_whitespace().next().unwrap_or("").trim();
+    if !needle.is_empty() {
+        if let Some(pos) = content.find(needle) {
+            let before: String = {
+                let mut v: Vec<char> = content[..pos].chars().rev().take(30).collect();
+                v.reverse();
+                v.into_iter().collect()
+            };
+            let width = needle.chars().count() + 60;
+            let after: String = content[pos..].chars().take(width).collect();
+            return format!("…{before}{after}…");
+        }
+    }
+    let head: String = content.chars().take(80).collect();
+    format!("{head}…")
+}
 const CHAPTER_COLS: &str = "id,novel_id,idx,title,goal,beats_json,content,summary,status,review_json,created_at,updated_at,style_report";
 const RUN_COLS: &str = "id,novel_id,status,stage,chapter_cursor,chapters_target,error,created_at,updated_at";
 
@@ -176,8 +203,135 @@ impl Db {
         )?;
         // 旧库升级：补 chapters.summary 列
         Self::ensure_column(&conn, "chapters", "summary", "summary TEXT NOT NULL DEFAULT ''")?;
+        // 旧库升级：补 novels.worldview 列（立项世界观）
+        Self::ensure_column(&conn, "novels", "worldview", "worldview TEXT NOT NULL DEFAULT ''")?;
+        // 卷级摘要（每 20 章归并一条，供长书回顾注入）
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS volume_summaries (
+                novel_id     TEXT NOT NULL,
+                volume_idx   INTEGER NOT NULL,
+                upto_chapter INTEGER NOT NULL,
+                summary      TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL,
+                PRIMARY KEY(novel_id, volume_idx)
+             );",
+        )?;
+        // 全文检索（FTS5，CJK 逐字空格化后入库；查询用同规则归一化）
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chapter_fts USING fts5(novel_id UNINDEXED, chapter_idx UNINDEXED, title, body);",
+        )?;
+        // 首次启用 / 从旧备份恢复后：回填索引（只在索引为空时做一次）
+        let fts_count: i64 = conn.query_row("SELECT COUNT(*) FROM chapter_fts", [], |r| r.get(0))?;
+        if fts_count == 0 {
+            let mut stmt =
+                conn.prepare("SELECT novel_id, idx, title, content FROM chapters WHERE content != ''")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut n = 0usize;
+            for row in rows {
+                let (nid, idx, title, content) = row?;
+                conn.execute(
+                    "INSERT INTO chapter_fts(novel_id, chapter_idx, title, body) VALUES(?1,?2,?3,?4)",
+                    params![nid, idx, Self::fts_normalize(&title), Self::fts_normalize(&content)],
+                )?;
+                n += 1;
+            }
+            if n > 0 {
+                tracing::info!("全文索引已回填 {n} 章");
+            }
+        }
         // 章节结构编辑的中断兜底：把负区占位 idx 还原
         conn.execute_batch("UPDATE chapters SET idx = -idx - 1 WHERE idx < 0;")?;
+        Ok(())
+    }
+
+    /// FTS 归一化：CJK 逐字拆成独立 token（空格分隔），拉丁转小写，其余（标点/空白）作分隔符。
+    /// 索引与查询用同一规则，多字词用引号短语匹配，即近似「包含」检索（中文无需分词器）。
+    pub fn fts_normalize(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + s.len() / 2);
+        for c in s.chars() {
+            if is_cjk(c) {
+                if !out.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                out.push(c);
+                out.push(' ');
+            } else if c.is_alphanumeric() {
+                for lc in c.to_lowercase() {
+                    out.push(lc);
+                }
+            } else if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// 生成 FTS5 MATCH 表达式：每个 token 用引号短语，空格连接（AND）
+    fn fts_query(q: &str) -> String {
+        Self::fts_normalize(q)
+            .split_whitespace()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// 重建一章的全文索引（无内容也写标题，便于按章名检索）
+    fn reindex_chapter_locked(conn: &Connection, novel_id: &str, idx: i64) -> rusqlite::Result<()> {
+        conn.execute(
+            "DELETE FROM chapter_fts WHERE novel_id=?1 AND chapter_idx=?2",
+            params![novel_id, idx],
+        )?;
+        let row = conn.query_row(
+            "SELECT title, content FROM chapters WHERE novel_id=?1 AND idx=?2",
+            params![novel_id, idx],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        );
+        match row {
+            Ok((title, content)) => {
+                conn.execute(
+                    "INSERT INTO chapter_fts(novel_id, chapter_idx, title, body) VALUES(?1,?2,?3,?4)",
+                    params![novel_id, idx, Self::fts_normalize(&title), Self::fts_normalize(&content)],
+                )?;
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+
+    /// 重建一本书的全部全文索引（章节重排 / 结构编辑后调用）
+    pub fn reindex_novel(&self, novel_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        Self::reindex_novel_locked(&conn, novel_id)
+    }
+
+    fn reindex_novel_locked(conn: &Connection, novel_id: &str) -> anyhow::Result<()> {
+        conn.execute("DELETE FROM chapter_fts WHERE novel_id=?1", [novel_id])?;
+        let mut stmt = conn.prepare(
+            "SELECT idx, title, content FROM chapters WHERE novel_id=?1 ORDER BY idx ASC",
+        )?;
+        let rows = stmt.query_map([novel_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (idx, title, content) = row?;
+            conn.execute(
+                "INSERT INTO chapter_fts(novel_id, chapter_idx, title, body) VALUES(?1,?2,?3,?4)",
+                params![novel_id, idx, Self::fts_normalize(&title), Self::fts_normalize(&content)],
+            )?;
+        }
         Ok(())
     }
 
@@ -267,6 +421,7 @@ impl Db {
             protagonist: String::new(),
             style: String::new(),
             book_outline: String::new(),
+            worldview: String::new(),
             status: "created".into(),
             mode: if mode == "staged" { "staged".into() } else { "auto".into() },
             created_at: now(),
@@ -301,6 +456,7 @@ impl Db {
             style_preset: row.get(12)?,
             target_chapters: row.get(13)?,
             auto_continue: row.get(14)?,
+            worldview: row.get(15)?,
         })
     }
 
@@ -327,12 +483,12 @@ impl Db {
         let rows = stmt.query_map([], |row| {
             Ok(NovelListItem {
                 novel: Self::map_novel(row)?,
-                chapters_done: row.get(15)?,
-                words: row.get(16)?,
-                run_status: row.get(17)?,
-                run_stage: row.get(18)?,
-                chapters_target: row.get(19)?,
-                last_error: row.get(20)?,
+                chapters_done: row.get(16)?,
+                words: row.get(17)?,
+                run_status: row.get(18)?,
+                run_stage: row.get(19)?,
+                chapters_target: row.get(20)?,
+                last_error: row.get(21)?,
             })
         })?;
         let mut out = Vec::new();
@@ -344,6 +500,9 @@ impl Db {
 
     pub fn delete_novel(&self, id: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
+        // FTS 表无外键级联：手动清理该书的检索索引
+        conn.execute("DELETE FROM chapter_fts WHERE novel_id=?1", [id])?;
+        conn.execute("DELETE FROM volume_summaries WHERE novel_id=?1", [id])?;
         let n = conn.execute("DELETE FROM novels WHERE id=?1", [id])?;
         Ok(n > 0)
     }
@@ -351,8 +510,8 @@ impl Db {
     pub fn update_novel_brief(&self, id: &str, b: &Brief) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE novels SET title=?2, genre=?3, logline=?4, protagonist=?5, style=?6, updated_at=?7 WHERE id=?1",
-            params![id, b.title, b.genre, b.logline, b.protagonist, b.style, now()],
+            "UPDATE novels SET title=?2, genre=?3, logline=?4, protagonist=?5, style=?6, worldview=?8, updated_at=?7 WHERE id=?1",
+            params![id, b.title, b.genre, b.logline, b.protagonist, b.style, now(), b.worldview],
         )?;
         Ok(())
     }
@@ -430,6 +589,8 @@ impl Db {
              WHERE chapters.status = 'planned'",
             params![uuid::Uuid::new_v4().to_string(), novel_id, plan.idx, plan.title, plan.goal, beats_json, now()],
         )?;
+        // 章名变化同步到检索索引（先删后插，幂等）
+        Self::reindex_chapter_locked(&conn, novel_id, plan.idx)?;
         Ok(())
     }
 
@@ -439,14 +600,18 @@ impl Db {
             "UPDATE chapters SET content=?3, status=?4, updated_at=?5 WHERE novel_id=?1 AND idx=?2",
             params![novel_id, idx, content, status, now()],
         )?;
+        Self::reindex_chapter_locked(&conn, novel_id, idx)?;
         Ok(())
     }
 
     pub fn save_chapter_review(&self, novel_id: &str, idx: i64, review: &Review) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
+        // fixed 留档有上限，防止 review_json 随多轮修复无限膨胀（open 不裁）
+        let mut capped = review.clone();
+        crate::models::cap_review_fixed(&mut capped, crate::models::MAX_FIXED_ISSUES);
         conn.execute(
             "UPDATE chapters SET review_json=?3, updated_at=?4 WHERE novel_id=?1 AND idx=?2",
-            params![novel_id, idx, serde_json::to_string(review)?, now()],
+            params![novel_id, idx, serde_json::to_string(&capped)?, now()],
         )?;
         Ok(())
     }
@@ -473,6 +638,114 @@ impl Db {
             params![novel_id, idx, summary, now()],
         )?;
         Ok(())
+    }
+
+    /// 章节列表（轻量：不含正文；正文按需走章节详情）
+    pub fn list_chapter_metas(&self, novel_id: &str) -> anyhow::Result<Vec<crate::models::ChapterMeta>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT idx, title, goal, beats_json, status, LENGTH(content),
+                    SUBSTR(content, 1, 60), review_json
+             FROM chapters WHERE novel_id=?1 ORDER BY idx ASC",
+        )?;
+        let rows = stmt.query_map([novel_id], |r| {
+            let beats_json: String = r.get(3)?;
+            Ok(crate::models::ChapterMeta {
+                idx: r.get(0)?,
+                title: r.get(1)?,
+                goal: r.get(2)?,
+                beats: serde_json::from_str(&beats_json).unwrap_or_default(),
+                status: r.get(4)?,
+                words: r.get(5)?,
+                preview: r.get(6)?,
+                review_json: r.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 全文检索（FTS5）：返回 (章号, 章节名, 摘录)，按章号升序
+    pub fn search_chapters(
+        &self,
+        novel_id: &str,
+        query: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(i64, String, String)>> {
+        let q = Self::fts_query(query);
+        if q.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chapter_fts.chapter_idx, c.title, c.content
+             FROM chapter_fts
+             JOIN chapters c ON c.novel_id = chapter_fts.novel_id AND c.idx = chapter_fts.chapter_idx
+             WHERE chapter_fts.novel_id = ?1 AND chapter_fts MATCH ?2
+             ORDER BY chapter_fts.chapter_idx ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![novel_id, q, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (idx, title, content) = row?;
+            out.push((idx, title, excerpt_for(&content, query)));
+        }
+        Ok(out)
+    }
+
+    /// 保存 / 更新卷级摘要
+    pub fn upsert_volume_summary(
+        &self,
+        novel_id: &str,
+        volume_idx: i64,
+        upto_chapter: i64,
+        summary: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO volume_summaries(novel_id, volume_idx, upto_chapter, summary, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?5)
+             ON CONFLICT(novel_id, volume_idx) DO UPDATE SET
+                upto_chapter=excluded.upto_chapter,
+                summary=excluded.summary,
+                updated_at=excluded.updated_at",
+            params![novel_id, volume_idx, upto_chapter, summary, now()],
+        )?;
+        Ok(())
+    }
+
+    /// 卷级摘要列表（按卷号升序）
+    pub fn list_volume_summaries(
+        &self,
+        novel_id: &str,
+    ) -> anyhow::Result<Vec<crate::models::VolumeSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT volume_idx, upto_chapter, summary FROM volume_summaries
+             WHERE novel_id=?1 ORDER BY volume_idx ASC",
+        )?;
+        let rows = stmt.query_map([novel_id], |r| {
+            Ok(crate::models::VolumeSummary {
+                volume_idx: r.get(0)?,
+                upto_chapter: r.get(1)?,
+                summary: r.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     // ---------- runs ----------
@@ -631,6 +904,7 @@ impl Db {
                 params![novel_id, idx, t, now()],
             )?;
         }
+        Self::reindex_chapter_locked(&conn, novel_id, idx)?;
         Ok(())
     }
 
@@ -648,6 +922,7 @@ impl Db {
             "UPDATE chapters SET title=?3, goal=?4, beats_json=?5, updated_at=?6 WHERE novel_id=?1 AND idx=?2",
             params![novel_id, idx, title, goal, serde_json::to_string(beats)?, now()],
         )?;
+        Self::reindex_chapter_locked(&conn, novel_id, idx)?;
         Ok(())
     }
 
@@ -947,6 +1222,8 @@ impl Db {
                 params![id, new_idx, now()],
             )?;
         }
+        // 章号已整体重排：重建本书检索索引（索引里存的是旧章号）
+        Self::reindex_novel_locked(conn, novel_id)?;
         Ok(())
     }
 
@@ -1178,6 +1455,128 @@ mod tests {
         let db3 = Db::open(&path).unwrap();
         assert_eq!(db3.latest_run(&novel_id).unwrap().unwrap().status, "failed");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fts_search_matches_chinese_substring_and_syncs_on_edit() {
+        use crate::models::ChapterPlan;
+        let dir = tmp_dir("fts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("检索测试", "auto", "").unwrap();
+        db.upsert_chapter_plan(
+            &novel.id,
+            &ChapterPlan { idx: 1, title: "青铜钥匙".into(), goal: String::new(), beats: vec![] },
+        )
+        .unwrap();
+        db.save_chapter_content(
+            &novel.id,
+            1,
+            "他在旧宅的抽屉里发现了一把青铜钥匙，钥匙上刻着鸢尾花纹。",
+            "done",
+        )
+        .unwrap();
+        db.upsert_chapter_plan(
+            &novel.id,
+            &ChapterPlan { idx: 2, title: "远航".into(), goal: String::new(), beats: vec![] },
+        )
+        .unwrap();
+        db.save_chapter_content(&novel.id, 2, "海面上起了雾，灯塔的光在雾里散成一片。", "done")
+            .unwrap();
+
+        // 中文子串（多字词）检索：命中且带上下文摘录
+        let hits = db.search_chapters(&novel.id, "青铜钥匙", 10).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].0, 1);
+        assert_eq!(hits[0].1, "青铜钥匙");
+        assert!(hits[0].2.contains("青铜钥匙"), "摘录应包含命中词：{}", hits[0].2);
+        // 另一个词命中第二章
+        let hits2 = db.search_chapters(&novel.id, "灯塔", 10).unwrap();
+        assert_eq!(hits2.len(), 1);
+        assert_eq!(hits2[0].0, 2);
+        // 章名也可检索
+        let hits3 = db.search_chapters(&novel.id, "远航", 10).unwrap();
+        assert!(hits3.iter().any(|h| h.0 == 2), "{hits3:?}");
+        // 无命中
+        assert!(db.search_chapters(&novel.id, "完全不存在的词组", 10).unwrap().is_empty());
+
+        // 改写正文后索引同步：仅存在于旧正文的词消失；标题仍在索引（章节名可检索）
+        db.save_chapter_content(&novel.id, 1, "抽屉里已经什么都没有了。", "done")
+            .unwrap();
+        assert!(
+            db.search_chapters(&novel.id, "鸢尾花纹", 10).unwrap().is_empty(),
+            "旧正文中的词应从索引消失"
+        );
+        assert!(!db.search_chapters(&novel.id, "抽屉", 10).unwrap().is_empty());
+        assert!(
+            db.search_chapters(&novel.id, "青铜钥匙", 10).unwrap().iter().any(|h| h.0 == 1),
+            "章节名仍在索引中"
+        );
+
+        // 章节重排后章号同步
+        db.move_chapter(&novel.id, 1, 1).unwrap();
+        let hits4 = db.search_chapters(&novel.id, "灯塔", 10).unwrap();
+        assert!(hits4.iter().any(|h| h.0 == 1), "重排后应指向新章号：{hits4:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_fixed_cap_keeps_open_and_latest_fixed() {
+        use crate::models::{cap_review_fixed, Review, ReviewIssue};
+        let mut issues: Vec<ReviewIssue> = (0..15)
+            .map(|i| ReviewIssue {
+                severity: "low".into(),
+                note: format!("fixed-{i}"),
+                quote: String::new(),
+                status: "fixed".into(),
+            })
+            .collect();
+        issues.push(ReviewIssue {
+            severity: "high".into(),
+            note: "open-1".into(),
+            quote: String::new(),
+            status: "open".into(),
+        });
+        let mut review = Review { ok: false, issues };
+        cap_review_fixed(&mut review, 10);
+        assert_eq!(review.issues.iter().filter(|i| i.status == "fixed").count(), 10);
+        assert_eq!(review.issues.iter().filter(|i| i.status == "open").count(), 1);
+        let notes: Vec<&str> = review
+            .issues
+            .iter()
+            .filter(|i| i.status == "fixed")
+            .map(|i| i.note.as_str())
+            .collect();
+        assert!(notes.contains(&"fixed-14"), "应保留最新的 fixed");
+        assert!(!notes.contains(&"fixed-0"), "应丢弃最早的 fixed");
+
+        // 上游 save_chapter_review 走同一裁剪（写库后再读）
+        let dir = tmp_dir("cap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("留档上限测试", "auto", "").unwrap();
+        db.upsert_chapter_plan(
+            &novel.id,
+            &crate::models::ChapterPlan { idx: 1, title: "第一章".into(), goal: String::new(), beats: vec![] },
+        )
+        .unwrap();
+        let big = Review {
+            ok: true,
+            issues: (0..13)
+                .map(|i| ReviewIssue {
+                    severity: "low".into(),
+                    note: format!("f-{i}"),
+                    quote: String::new(),
+                    status: "fixed".into(),
+                })
+                .collect(),
+        };
+        db.save_chapter_review(&novel.id, 1, &big).unwrap();
+        let stored = db.get_chapter(&novel.id, 1).unwrap().unwrap().review_json.unwrap();
+        let parsed: Review = serde_json::from_str(&stored).unwrap();
+        assert_eq!(parsed.issues.len(), 10, "入库时 fixed 应裁剪到 10 条");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -567,6 +567,7 @@ fn mock_complete(user: &str) -> anyhow::Result<String> {
             "genre": "奇幻",
             "logline": format!("围绕「{}」展开的一段命运之旅。", short),
             "protagonist": "林深 —— 一个被卷入浪潮的普通人",
+            "worldview": "近代沿海孤城，风讯台维系航海秩序；识潮人可听见深海讯号。",
             "style": "节奏明快，第三人称限知视角，网文笔法"
         })
         .to_string());
@@ -606,6 +607,13 @@ fn mock_complete(user: &str) -> anyhow::Result<String> {
     if user.contains("TASK:foreshadow_audit") {
         // 离线演示不臆造回收结论
         return Ok(serde_json::json!({"resolved": []}).to_string());
+    }
+    if user.contains("TASK:volume_summary") {
+        let to = extract_number_after(user, "to=").unwrap_or(0);
+        return Ok(serde_json::json!({
+            "summary": format!("（模拟）本卷行至第 {to} 章：主角逐步逼近真相，关键伏笔多条埋设，仍有悬念待解。")
+        })
+        .to_string());
     }
     if user.contains("TASK:review") {
         return Ok(serde_json::json!({

@@ -235,6 +235,7 @@ async fn run_inner(
             logline: str_field(&v, "logline", ""),
             protagonist: str_field(&v, "protagonist", ""),
             style: str_field(&v, "style", ""),
+            worldview: str_field(&v, "worldview", ""),
         };
         engine.db.update_novel_brief(novel_id, &brief)?;
         novel = engine.db.get_novel(novel_id)?.unwrap_or(novel);
@@ -262,6 +263,7 @@ async fn run_inner(
             logline: novel.logline.clone(),
             protagonist: novel.protagonist.clone(),
             style: novel.style.clone(),
+            worldview: novel.worldview.clone(),
         };
         let prev_all: Vec<(i64, String)> = existing
             .iter()
@@ -412,6 +414,7 @@ async fn run_inner(
             logline: novel.logline.clone(),
             protagonist: novel.protagonist.clone(),
             style: novel.style.clone(),
+            worldview: novel.worldview.clone(),
         };
         let plan = ChapterPlan {
             idx: ch.idx,
@@ -421,7 +424,18 @@ async fn run_inner(
         };
         let ledger = ledger_context(&engine.db, novel_id, idx).unwrap_or_default();
         let recent = recent_summaries_context(&engine.db, novel_id, idx).unwrap_or_default();
-        let context = format!("{recent}{ledger}");
+        // 写前事实预检（本地规则，零 token）：矛盾点在生成前提醒模型
+        let warnings = preflight_warnings(&engine.db, novel_id, idx, &plan);
+        let preflight = if warnings.is_empty() {
+            String::new()
+        } else {
+            engine.hub.publish(novel_id, EngineEvent::Stage {
+                stage: "draft".into(),
+                message: format!("写前预检：{} 条提醒已注入提示词", warnings.len()),
+            });
+            format!("【写前预检提醒（务必避免以下问题）】\n- {}\n", warnings.join("\n- "))
+        };
+        let context = format!("{preflight}{recent}{ledger}");
         let (sys, usr) = crate::prompts::chapter_prompt(
             &brief,
             &novel.book_outline,
@@ -587,14 +601,39 @@ async fn run_inner(
             Err(e) => tracing::warn!("chapter {idx} extract failed: {e:#}"),
         }
 
+        // 卷级摘要：每写满 VOLUME_SPAN 章归并一条（长书记忆；失败不阻断）
+        if idx % VOLUME_SPAN == 0 {
+            if let Err(e) = generate_volume_summary(&engine, novel_id, idx / VOLUME_SPAN).await {
+                tracing::warn!("volume summary at {idx} failed: {e:#}");
+            }
+        }
+
         engine.db.save_chapter_content(novel_id, idx, &content, "done")?;
         engine.db.update_run(run_id, "running", "draft", idx, None)?;
         wrote_in_run += 1;
     }
 
-    // 伏笔自动审核（仅当本轮确实写了新章）：用摘要判定未回收伏笔是否已被后文实质回收
+    // 伏笔自动审核（按设置间隔；1 = 每批都跑，N = 已完成章号逢 N 的倍数，0 = 关闭）
     if wrote_in_run > 0 {
-        let _ = audit_foreshadowings(&engine, novel_id).await;
+        let every = engine
+            .db
+            .pipeline_settings()
+            .unwrap_or_default()
+            .audit_every();
+        let last_idx = engine
+            .db
+            .list_chapter_metas(novel_id)
+            .map(|cs| {
+                cs.iter()
+                    .filter(|c| c.status == "done")
+                    .map(|c| c.idx)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        if every > 0 && (every == 1 || last_idx % every == 0) {
+            let _ = audit_foreshadowings(&engine, novel_id).await;
+        }
     }
 
     engine.db.update_run(run_id, "done", "done", chapters, None)?;
@@ -643,20 +682,159 @@ pub fn apply_extraction(
     (chars, fores)
 }
 
-/// 最近章节回顾：取当前章之前、带摘要的最近 5 章拼成上下文
+/// 卷大小：每写满 VOLUME_SPAN 章归并一条卷级摘要（长书回顾）
+const VOLUME_SPAN: i64 = 20;
+
+/// 前情回顾：已完结卷的卷级摘要（最近 3 卷）+ 当前章之前带摘要的最近 5 章
 fn recent_summaries_context(db: &crate::db::Db, novel_id: &str, current_idx: i64) -> anyhow::Result<String> {
+    let mut s = String::new();
+    let volumes = db.list_volume_summaries(novel_id)?;
+    let mut vols: Vec<&crate::models::VolumeSummary> = volumes
+        .iter()
+        .filter(|v| v.upto_chapter < current_idx && !v.summary.trim().is_empty())
+        .collect();
+    if vols.len() > 3 {
+        vols.drain(0..vols.len() - 3);
+    }
+    if !vols.is_empty() {
+        s.push_str("前情回顾（卷摘要）：\n");
+        for v in vols {
+            s.push_str(&format!(
+                "- 第{}卷（至第{}章）：{}\n",
+                v.volume_idx,
+                v.upto_chapter,
+                v.summary.trim()
+            ));
+        }
+    }
     let chapters = db.list_chapters(novel_id)?;
     let mut lines: Vec<String> = chapters
         .iter()
         .filter(|c| c.idx < current_idx && !c.summary.trim().is_empty())
         .map(|c| format!("第{}章 {}：{}", c.idx, c.title, c.summary.trim()))
         .collect();
-    if lines.is_empty() {
-        return Ok(String::new());
+    if !lines.is_empty() {
+        let keep = lines.len().saturating_sub(5);
+        lines.drain(0..keep);
+        s.push_str(&format!("最近章节回顾：\n{}\n", lines.join("\n")));
     }
-    let keep = lines.len().saturating_sub(5);
-    lines.drain(0..keep);
-    Ok(format!("最近章节回顾：\n{}\n", lines.join("\n")))
+    Ok(s)
+}
+
+/// 写前事实预检（本地规则，零 token）：把与台账/近章矛盾的章纲点出来，随提示词注入。
+/// 规则：① 章纲提到已死亡/退场角色（可能是回忆，但值得核对）；
+///       ② 与最近 5 章目标高度重复（字符二元组 Jaccard ≥ 0.6，提示可能重复桥段）。
+fn preflight_warnings(
+    db: &crate::db::Db,
+    novel_id: &str,
+    idx: i64,
+    plan: &ChapterPlan,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let text = format!("{} {}", plan.goal, plan.beats.join(" "));
+    if let Ok(chars) = db.list_characters(novel_id) {
+        for c in chars.iter().filter(|c| c.status == "dead" || c.status == "leave") {
+            let name = c.name.trim();
+            if !name.is_empty() && text.contains(name) {
+                warnings.push(format!(
+                    "章纲提到已{}的角色「{}」：请确认是回忆/闪回，或调整章纲",
+                    if c.status == "dead" { "死亡" } else { "退场" },
+                    name
+                ));
+            }
+        }
+    }
+    if let Ok(recent) = db.list_chapter_metas(novel_id) {
+        for p in recent
+            .iter()
+            .filter(|c| c.idx < idx && c.idx > idx - 6 && !c.goal.trim().is_empty())
+        {
+            let sim = goal_similarity(plan.goal.trim(), p.goal.trim());
+            if sim >= 0.6 {
+                warnings.push(format!(
+                    "本章目标与第{}章目标高度相似（{:.0}%）：注意避免重复桥段",
+                    p.idx,
+                    sim * 100.0
+                ));
+            }
+        }
+    }
+    warnings
+}
+
+/// 目标相似度：字符二元组 Jaccard（短文本也适用）
+fn goal_similarity(a: &str, b: &str) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let bigrams = |s: &str| -> std::collections::HashSet<(char, char)> {
+        let v: Vec<char> = s.chars().collect();
+        v.windows(2).map(|w| (w[0], w[1])).collect()
+    };
+    let (ba, bb) = (bigrams(a), bigrams(b));
+    if ba.is_empty() || bb.is_empty() {
+        return 0.0;
+    }
+    let inter = ba.intersection(&bb).count() as f64;
+    let union = ba.union(&bb).count() as f64;
+    if union == 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+/// 归并一卷（volume_idx 从 1 起，覆盖 (v-1)*SPAN+1 ..= v*SPAN）为一条卷级摘要。
+/// 摘要为空的任务静默跳过；失败由调用方记录。
+async fn generate_volume_summary(
+    engine: &Arc<Engine>,
+    novel_id: &str,
+    volume_idx: i64,
+) -> anyhow::Result<()> {
+    let from = (volume_idx - 1) * VOLUME_SPAN + 1;
+    let to = volume_idx * VOLUME_SPAN;
+    let chapters = engine.db.list_chapters(novel_id)?;
+    let items: Vec<(i64, String, String)> = chapters
+        .iter()
+        .filter(|c| c.idx >= from && c.idx <= to && !c.summary.trim().is_empty())
+        .map(|c| (c.idx, c.title.clone(), c.summary.trim().to_string()))
+        .collect();
+    if items.is_empty() {
+        return Ok(());
+    }
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "extract".into(),
+        message: format!("归并第 {from}~{to} 章卷级摘要…"),
+    });
+    let settings = engine.llm_settings()?;
+    let llm = Llm::new(settings.clone());
+    let ov = engine.prompt_overrides();
+    let (sys, usr) = crate::prompts::volume_summary_prompt(from, to, &items, &ov);
+    let out = llm.complete(&sys, &usr).await?;
+    record_usage(
+        &engine.db,
+        Some(novel_id),
+        None,
+        "volume_summary",
+        &settings,
+        &out.usage,
+    );
+    let raw = out.text;
+    let summary = extract_json_object(&raw)
+        .and_then(|v| v["summary"].as_str().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| raw.trim().chars().take(300).collect());
+    if summary.trim().is_empty() {
+        return Ok(());
+    }
+    engine
+        .db
+        .upsert_volume_summary(novel_id, volume_idx, to, summary.trim())?;
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "extract".into(),
+        message: format!("第 {volume_idx} 卷摘要已生成（第 {from}~{to} 章）"),
+    });
+    Ok(())
 }
 
 /// 组装台账上下文：活跃角色事实（最近 6 人 × 3 条）+ 未回收伏笔（最多 8 条，标注已拖延章数）
@@ -993,14 +1171,9 @@ async fn audit_foreshadowings(engine: &Arc<Engine>, novel_id: &str) -> anyhow::R
         .collect::<Vec<_>>()
         .join("\n");
     let sum_text: String = summaries.join("\n").chars().take(6000).collect();
-    let sys = "你是小说连续性审核助手。只输出一个 JSON 对象，不要输出其他文字、不要使用 Markdown 代码块。";
-    let usr = format!(
-        "TASK:foreshadow_audit\n未回收伏笔清单：\n{list}\n\n各章摘要：\n{sum_text}\n\n\
-请判断哪些伏笔已经在后文被实质回收（事件落地、谜底揭开或明确交代，而非仅仅被提及）。\n\
-输出 JSON：{{\"resolved\": [{{\"title\": \"伏笔标题\", \"chapter_idx\": 回收所在章号, \"evidence\": \"一句话依据\"}}]}}\n\
-只报告有把握的；没有把握就返回空数组。\n"
-    );
-    match llm.complete(sys, &usr).await {
+    let ov = engine.prompt_overrides();
+    let (sys, usr) = crate::prompts::foreshadow_audit_prompt(&list, &sum_text, &ov);
+    match llm.complete(&sys, &usr).await {
         Ok(out) => {
             record_usage(
                 &engine.db,
@@ -1244,6 +1417,106 @@ mod tests {
         // 非 JSON / 缺字段：静默返回 0
         assert_eq!(apply_foreshadow_audit(&engine.db, &open, "not json"), 0);
         assert_eq!(apply_foreshadow_audit(&engine.db, &open, r#"{"resolved":[]}"#), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preflight_flags_dead_character_and_duplicate_goal() {
+        let dir = tmp_dir("preflight");
+        let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+        let novel = engine.db.create_novel("预检测试", "auto", "").unwrap();
+        engine
+            .db
+            .upsert_character(&novel.id, "老陈", "配角", "dead", &[])
+            .unwrap();
+        for i in 1..=2i64 {
+            engine
+                .db
+                .upsert_chapter_plan(
+                    &novel.id,
+                    &crate::models::ChapterPlan {
+                        idx: i,
+                        title: format!("第{i}章"),
+                        goal: "主角在码头与老陈对峙".into(),
+                        beats: vec!["开场".into()],
+                    },
+                )
+                .unwrap();
+        }
+        let plan = crate::models::ChapterPlan {
+            idx: 3,
+            title: "第3章".into(),
+            goal: "主角在码头与老陈对峙".into(),
+            beats: vec!["对峙升级".into()],
+        };
+        let warnings = preflight_warnings(&engine.db, &novel.id, 3, &plan);
+        assert!(
+            warnings.iter().any(|w| w.contains("老陈")),
+            "应提示已死亡角色：{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("高度相似")),
+            "应提示与近章目标重复：{warnings:?}"
+        );
+        // 无矛盾时返回空
+        let clean = crate::models::ChapterPlan {
+            idx: 3,
+            title: "第3章".into(),
+            goal: "主角独自登船前往雾港".into(),
+            beats: vec!["启程".into()],
+        };
+        let none = preflight_warnings(&engine.db, &novel.id, 3, &clean);
+        assert!(none.is_empty(), "{none:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn volume_summary_generates_and_injects_into_context() {
+        let dir = tmp_dir("volume");
+        let engine = std::sync::Arc::new(Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap());
+        engine
+            .db
+            .set_llm_settings(&crate::models::LlmSettings::default())
+            .unwrap();
+        let novel = engine.db.create_novel("卷摘要测试", "auto", "").unwrap();
+        for i in 1..=20i64 {
+            engine
+                .db
+                .upsert_chapter_plan(
+                    &novel.id,
+                    &crate::models::ChapterPlan {
+                        idx: i,
+                        title: format!("第{i}章"),
+                        goal: String::new(),
+                        beats: vec![],
+                    },
+                )
+                .unwrap();
+            engine
+                .db
+                .save_chapter_content(&novel.id, i, "正文内容", "done")
+                .unwrap();
+            engine
+                .db
+                .set_chapter_summary(&novel.id, i, &format!("第{i}章摘要：某事发生"))
+                .unwrap();
+        }
+        generate_volume_summary(&engine, &novel.id, 1).await.unwrap();
+        let vols = engine.db.list_volume_summaries(&novel.id).unwrap();
+        assert_eq!(vols.len(), 1, "应生成一条卷摘要");
+        assert_eq!(vols[0].volume_idx, 1);
+        assert_eq!(vols[0].upto_chapter, 20);
+        assert!(!vols[0].summary.trim().is_empty());
+        // 注入检查：第 25 章（下一卷）应看到卷摘要
+        let ctx = recent_summaries_context(&engine.db, &novel.id, 25).unwrap();
+        assert!(ctx.contains("前情回顾（卷摘要）"), "{ctx}");
+        // 用量任务记录
+        let groups = engine.db.usage_by_task(&novel.id).unwrap();
+        assert!(
+            groups.iter().any(|g| g.key == "volume_summary"),
+            "应记录卷摘要用量：{:?}",
+            groups.iter().map(|g| g.key.clone()).collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

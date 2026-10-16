@@ -622,3 +622,30 @@ mark.add { background: hsl(var(--success) / .2); color: inherit; border-radius: 
     transition-duration: .01ms !important;
   }
 }
+
+/* ---------- 作品总纲弹层（书架卡） ---------- */
+.outline-row { display: grid; grid-template-columns: 84px 1fr; gap: 10px; padding: 9px 0; border-bottom: 1px dashed hsl(var(--border)); }
+.outline-row:last-child { border-bottom: 0; }
+.outline-k { color: hsl(var(--muted-foreground)); font-size: 12.5px; padding-top: 2px; }
+.outline-v { font-size: 13.5px; line-height: 1.75; word-break: break-word; }
+
+/* ---------- 全文检索 ---------- */
+.search-input { max-width: 260px; flex: 1; min-width: 120px; }
+.search-results {
+  border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) - 3px);
+  margin: 0 0 12px; max-height: 320px; overflow-y: auto; background: hsl(var(--card));
+}
+.search-hit { display: flex; gap: 9px; align-items: baseline; padding: 9px 12px; cursor: pointer; border-bottom: 1px dashed hsl(var(--border)); }
+.search-hit:last-child { border-bottom: 0; }
+.search-hit:hover { background: hsl(var(--primary) / .05); }
+.search-hit-title { font-size: 13px; font-weight: 600; white-space: nowrap; }
+.search-hit-excerpt { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+
+/* ---------- 平板 / 横屏（≥900px）：更宽的阅读与编辑区 ---------- */
+@media (min-width: 900px) {
+  #reader-backdrop .dialog { width: min(1020px, 94vw); }
+  .editor-area { min-height: 54vh; }
+}
+@media (min-width: 1280px) {
+  .content { padding: 26px 34px; }
+}

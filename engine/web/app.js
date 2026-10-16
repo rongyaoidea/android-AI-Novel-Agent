@@ -305,6 +305,7 @@ function renderShelf() {
       </div>
       <div class="row">
         <button class="btn btn-primary btn-sm" data-act="open">进入工作台</button>
+        <button class="btn btn-outline btn-sm" data-act="outline"><svg class="ic"><use href="#i-book"/></svg>总纲</button>
         <a class="btn btn-outline btn-sm" data-act="export" href="/api/novels/${esc(n.id)}/export">导出 TXT</a>
         <button class="btn btn-ghost btn-sm btn-danger" data-act="delete">删除</button>
       </div>
@@ -331,6 +332,11 @@ function bindShelf() {
       location.hash = `#/novel/${id}`;
       return;
     }
+    if (kind === "outline") {
+      const item = state.shelfItems.find((x) => x.novel.id === id);
+      if (item) openOutline(item);
+      return;
+    }
     if (kind === "delete") {
       e.preventDefault();
       const title = card.querySelector("h3").textContent;
@@ -352,6 +358,53 @@ function bindShelf() {
   });
   $("#shelf-create").onclick = () => { location.hash = "#/create"; };
   $("#shelf-refresh").onclick = () => loadShelf().catch((e) => toast(e.message, true));
+}
+
+/* ---------------- 作品总纲（书架卡：查看世界观 / 全书走向 / 立项要点） ---------------- */
+
+function openOutline(item) {
+  const n = item.novel || {};
+  const title = (n.title && n.title.trim()) || (n.idea || "").slice(0, 16) || "（未命名）";
+  $("#outline-title").textContent = `${title} · 总纲`;
+  const chips = [];
+  if (n.genre) chips.push(`<span class="chip">${esc(n.genre)}</span>`);
+  if (n.style_preset) {
+    const s = styleById(n.style_preset);
+    chips.push(`<span class="chip">${esc(s ? s.name : n.style_preset)}</span>`);
+  }
+  if (n.mode === "staged") chips.push(`<span class="chip">按阶段确认</span>`);
+  chips.push(statusChip(n.status));
+  $("#outline-chips").innerHTML = chips.join("");
+  const cell = (v) => esc(String(v)).replace(/\n/g, "<br>");
+  const rows = [
+    ["世界观", n.worldview],
+    ["全书走向", n.book_outline],
+    ["一句话卖点", n.logline],
+    ["主角", n.protagonist],
+    ["写法基调", n.style],
+    ["原始想法", n.idea],
+  ].filter(([, v]) => v && String(v).trim());
+  $("#outline-body").innerHTML = rows.length
+    ? rows
+        .map(([k, v]) => `<div class="outline-row"><div class="outline-k">${k}</div><div class="outline-v">${cell(v)}</div></div>`)
+        .join("")
+    : `<p class="muted" style="margin:0;">立项方案还没生成：点「进入工作台」开始创作后，AI 会补全世界观与全书走向。</p>`;
+  $("#outline-progress").textContent =
+    `已完成 ${item.chapters_done || 0} 章 · 共 ${item.words || 0} 字` +
+    (item.chapters_target ? ` · 目标 ${item.chapters_target} 章` : "") +
+    (item.run_status ? ` · ${RUN_STATUS[item.run_status] || item.run_status}` : "");
+  $("#outline-open").onclick = () => {
+    $("#outline-backdrop").hidden = true;
+    location.hash = `#/novel/${n.id}`;
+  };
+  $("#outline-backdrop").hidden = false;
+}
+
+function bindOutline() {
+  $("#outline-close").onclick = () => { $("#outline-backdrop").hidden = true; };
+  $("#outline-backdrop").addEventListener("click", (e) => {
+    if (e.target === $("#outline-backdrop")) $("#outline-backdrop").hidden = true;
+  });
 }
 
 /* ---------------- 新建作品 ---------------- */
@@ -730,6 +783,7 @@ const USAGE_TASK_LABEL = {
   rewrite: "重写本章",
   extract: "资料整理",
   foreshadow_audit: "伏笔审核",
+  volume_summary: "卷级摘要",
   test: "连通测试",
 };
 
@@ -831,7 +885,11 @@ async function renderForeshadowings() {
     ? items.map((f) => `
       <tr>
         <td>${esc(f.title)}</td>
-        <td><span class="chip ${f.status === "open" ? "chip-warning" : "chip-success"}">${f.status === "open" ? "未回收" : "已回收"}</span></td>
+        <td><span class="chip ${f.status === "open" ? "chip-warning" : "chip-success"}">${f.status === "open" ? "未回收" : "已回收"}</span>${
+          f.status !== "open" && /AI 自动审核/.test(f.notes || "")
+            ? `<span class="chip chip-info" title="${esc(f.notes)}">AI 审核</span>`
+            : ""
+        }</td>
         <td class="num">${f.planted_chapter > 0 ? `第${f.planted_chapter}章` : "手动"}</td>
         <td class="num">${f.resolved_chapter ? `第${f.resolved_chapter}章` : "—"}</td>
         <td class="facts-cell">${f.notes ? esc(f.notes) : "—"}</td>
@@ -845,6 +903,44 @@ async function renderForeshadowings() {
 }
 
 function bindNovel() {
+  // 全文检索（FTS5，服务端建索引）
+  const searchInput = $("#chapter-search");
+  const searchBox = $("#chapter-search-results");
+  if (searchInput && searchBox) {
+    let timer = null;
+    searchInput.addEventListener("input", () => {
+      clearTimeout(timer);
+      const q = searchInput.value.trim();
+      if (!q) {
+        searchBox.hidden = true;
+        searchBox.innerHTML = "";
+        return;
+      }
+      timer = setTimeout(async () => {
+        try {
+          const r = await api(`/api/novels/${state.novelId}/search?q=${encodeURIComponent(q)}`);
+          const items = r.items || [];
+          searchBox.hidden = false;
+          searchBox.innerHTML = items.length
+            ? items
+                .map(
+                  (it) =>
+                    `<div class="search-hit" data-idx="${it.idx}"><span class="chip chip-info">第${it.idx}章</span><span class="search-hit-title">${esc(it.title || "")}</span><span class="search-hit-excerpt muted">${esc(it.excerpt || "")}</span></div>`,
+                )
+                .join("")
+            : `<p class="muted" style="margin:0;">没有找到「${esc(q)}」</p>`;
+        } catch (err) {
+          toast(err.message, true);
+        }
+      }, 220);
+    });
+    searchBox.addEventListener("click", (e) => {
+      const hit = e.target.closest("[data-idx]");
+      if (!hit) return;
+      searchBox.hidden = true;
+      openEditor(parseInt(hit.dataset.idx, 10)).catch((err) => toast(err.message, true));
+    });
+  }
   $("#chapter-rows").addEventListener("click", async (e) => {
     const read = e.target.closest("[data-read]");
     if (read) { openEditor(parseInt(read.dataset.read, 10)).catch((err) => toast(err.message, true)); return; }
@@ -2001,6 +2097,12 @@ async function loadSettingsForm() {
     $("#set-auto-fix").checked = !!p.auto_fix_review;
     $("#set-budget").value = p.monthly_budget_tokens > 0 ? p.monthly_budget_tokens : "";
     $("#set-auto-batch").value = p.auto_batch && p.auto_batch !== 10 ? p.auto_batch : "";
+    const auditEvery = typeof p.foreshadow_audit_every === "number" ? p.foreshadow_audit_every : 1;
+    const sel = $("#set-audit-every");
+    if (sel) {
+      sel.value = String(auditEvery);
+      if (sel.value !== String(auditEvery)) sel.value = "1"; // 特殊值不在选项里时回退默认
+    }
   } catch {
     /* 忽略：保持默认勾选状态 */
   }
@@ -2121,11 +2223,13 @@ function bindSettings() {
     const budget = Math.max(0, parseInt($("#set-budget").value || "0", 10) || 0);
     const batchRaw = parseInt($("#set-auto-batch").value || "10", 10) || 10;
     const batch = Math.min(50, Math.max(1, batchRaw));
+    const auditEvery = Math.min(100, Math.max(0, parseInt($("#set-audit-every").value || "1", 10) || 0));
     try {
       await apiSend("/api/settings/pipeline", "PUT", {
         auto_fix_review: $("#set-auto-fix").checked,
         monthly_budget_tokens: budget,
         auto_batch: batch,
+        foreshadow_audit_every: auditEvery,
       });
       const el = $("#pipeline-status");
       if (el) {
@@ -2145,19 +2249,36 @@ function bindSettings() {
   $("#set-auto-batch").addEventListener("change", () =>
     savePipeline(`每批章节数已设为 ${Math.min(50, Math.max(1, parseInt($("#set-auto-batch").value || "10", 10) || 10))}`),
   );
+  $("#set-audit-every").addEventListener("change", () => {
+    const v = parseInt($("#set-audit-every").value, 10) || 0;
+    savePipeline(v === 0 ? "已关闭例行伏笔审核（一键处理时仍会审核）" : `伏笔审核已设为：每 ${v} 章一次`);
+  });
 }
 
 /* ---------------- 主题 / 引擎状态 ---------------- */
+
+/** 主题联动原生状态栏（Android 壳注入 window.AiNovelNative；纯浏览器环境为空操作） */
+function notifyNativeTheme(dark) {
+  try {
+    if (window.AiNovelNative && typeof window.AiNovelNative.setDark === "function") {
+      window.AiNovelNative.setDark(dark);
+    }
+  } catch {
+    /* 忽略：非安卓环境 */
+  }
+}
 
 function bindTheme() {
   const saved = localStorage.getItem("ainovel.theme");
   const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
   const dark = saved ? saved === "dark" : prefersDark;
   document.documentElement.classList.toggle("dark", dark);
+  notifyNativeTheme(dark);
   $("#theme-toggle").onclick = () => {
     const next = !document.documentElement.classList.contains("dark");
     document.documentElement.classList.toggle("dark", next);
     localStorage.setItem("ainovel.theme", next ? "dark" : "light");
+    notifyNativeTheme(next);
   };
 }
 
@@ -2177,6 +2298,7 @@ async function loadHealth() {
 function init() {
   bindTheme();
   bindShelf();
+  bindOutline();
   bindCreate();
   bindNovel();
   bindEditor();

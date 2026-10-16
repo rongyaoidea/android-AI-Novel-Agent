@@ -38,6 +38,7 @@ mod tests {
             protagonist: "主角".into(),
             style: "基调".into(),
             book_outline: "走向".into(),
+            worldview: "世界观".into(),
             status: "drafted".into(),
             mode: "auto".into(),
             style_preset: String::new(),

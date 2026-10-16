@@ -106,6 +106,21 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Web 主题 → 原生状态栏联动：页面调用 window.AiNovelNative.setDark(true/false)
+        web.addJavascriptInterface(
+            object {
+                @android.webkit.JavascriptInterface
+                fun setDark(dark: Boolean) {
+                    runOnUiThread {
+                        val controller = WindowCompat.getInsetsController(window, root)
+                        controller.isAppearanceLightStatusBars = !dark
+                        controller.isAppearanceLightNavigationBars = !dark
+                    }
+                }
+            },
+            "AiNovelNative",
+        )
+
         requestNotificationPermission()
         startForegroundService(Intent(this, EngineService::class.java))
         pollAndLoad(0)

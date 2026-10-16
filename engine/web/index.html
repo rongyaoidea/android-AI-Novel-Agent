@@ -224,8 +224,10 @@
         <div class="panel" id="tab-chapters">
           <div class="panel-head">
             <h3 class="panel-title">章节</h3>
+            <input id="chapter-search" class="input-sm search-input" placeholder="全文检索：人名 / 道具 / 台词…" />
             <button class="btn btn-outline btn-sm" id="insert-chapter"><svg class="ic"><use href="#i-plus"/></svg>插入章节</button>
           </div>
+          <div id="chapter-search-results" class="search-results" hidden></div>
           <div class="table-wrap">
             <table class="table">
               <thead>
@@ -360,8 +362,19 @@
             <label for="set-auto-batch">自动连载每批章节数（1–50，默认 10）</label>
             <input id="set-auto-batch" type="number" min="1" max="50" placeholder="10" />
           </div>
+          <div class="field" style="max-width:340px;">
+            <label for="set-audit-every">伏笔自动审核频率</label>
+            <select id="set-audit-every">
+              <option value="1">每批收尾都审核（默认）</option>
+              <option value="5">每 5 章审核一次</option>
+              <option value="10">每 10 章审核一次</option>
+              <option value="20">每 20 章审核一次</option>
+              <option value="0">关闭（仅「AI 处理全部审校」时审核）</option>
+            </select>
+          </div>
           <p class="muted" style="margin:0;font-size:12px;">
             伏笔回收与资料整理均为自动：每章写后自动抽取台账；生成每章时会注入「未回收伏笔（含已拖延章数）」，回收后自动标记。
+            伏笔自动审核会用章节摘要批量判定未回收伏笔是否已被后文实质回收（一次 LLM 调用）。
             达到月度预算后自动连载会自动暂停（工作量以各厂商 token 计，不含价格折算）。
           </p>
         </div>
@@ -382,7 +395,7 @@
             <h3 class="panel-title">提示词模板</h3>
             <span class="muted" id="prompt-status"></span>
           </div>
-          <p class="muted" style="margin:0;">8 个写作任务的提示词均可自定义；占位符写作 <code>{{name}}</code>，点变量即可插入。修改立即对后续生成生效，可随时恢复默认。</p>
+          <p class="muted" style="margin:0;">10 个写作任务的提示词均可自定义；占位符写作 <code>{{name}}</code>，点变量即可插入。修改立即对后续生成生效，可随时恢复默认。</p>
           <div id="prompt-list"></div>
         </div>
       </section>
@@ -517,6 +530,22 @@
         <thead><tr><th>位置</th><th class="num">调用</th><th class="num">输入</th><th class="num">命中</th><th class="num">未命中</th><th class="num">输出</th><th class="num">合计</th></tr></thead>
         <tbody id="usage-chapter-rows"></tbody>
       </table>
+    </div>
+  </div>
+</div>
+
+<!-- 作品总纲（书架卡查看：世界观 / 全书走向 / 立项要点） -->
+<div class="dialog-backdrop" id="outline-backdrop" hidden>
+  <div class="dialog" style="width:min(640px,94vw);">
+    <div class="dialog-head">
+      <h3 id="outline-title">作品总纲</h3>
+      <button class="btn btn-ghost" id="outline-close">关闭</button>
+    </div>
+    <div class="chips" id="outline-chips"></div>
+    <div id="outline-body"></div>
+    <div class="row">
+      <button class="btn btn-primary" id="outline-open"><svg class="ic"><use href="#i-pen"/></svg>进入工作台</button>
+      <span class="muted" id="outline-progress"></span>
     </div>
   </div>
 </div>

@@ -109,6 +109,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/settings/pipeline", get(get_pipeline).put(put_pipeline))
         .route("/api/novels", get(list_novels).post(create_novel))
         .route("/api/novels/:id", get(get_novel).patch(patch_novel).delete(delete_novel))
+        .route("/api/novels/:id/search", get(search_novel))
         .route("/api/novels/:id/chapters", post(insert_chapter))
         .route(
             "/api/novels/:id/chapters/:idx",
@@ -335,8 +336,11 @@ async fn get_pipeline(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::V
 
 async fn put_pipeline(
     State(e): State<Arc<Engine>>,
-    Json(s): Json<crate::models::PipelineSettings>,
+    Json(mut s): Json<crate::models::PipelineSettings>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
+    // 宽容归一化，防止越界值入库
+    s.auto_batch = s.batch();
+    s.foreshadow_audit_every = s.audit_every();
     e.db.set_pipeline_settings(&s).map_err(err)?;
     Ok(Json(json!({"ok": true})))
 }
@@ -396,7 +400,8 @@ async fn get_novel(
         .get_novel(&id)
         .map_err(err)?
         .ok_or_else(|| not_found("novel"))?;
-    let chapters = e.db.list_chapters(&id).map_err(err)?;
+    // 轻量列表：不加载正文（300+ 章时省内存与带宽），正文走章节详情接口
+    let chapters = e.db.list_chapter_metas(&id).map_err(err)?;
     let run = e.db.latest_run(&id).map_err(err)?;
     let chapters_json: Vec<serde_json::Value> = chapters
         .into_iter()
@@ -407,13 +412,42 @@ async fn get_novel(
                 "goal": c.goal,
                 "beats": c.beats,
                 "status": c.status,
-                "words": c.content.chars().count(),
-                "preview": c.content.chars().take(60).collect::<String>(),
+                "words": c.words,
+                "preview": c.preview,
                 "review": c.review_json,
             })
         })
         .collect();
     Ok(Json(json!({"novel": novel, "chapters": chapters_json, "run": run})))
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: String,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// 全文检索（FTS5；中文逐字索引，支持包含式子串检索）
+async fn search_novel(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Query(p): Query<SearchParams>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    let q = p.q.trim();
+    if q.is_empty() {
+        return Ok(Json(json!({"items": []})));
+    }
+    let limit = p.limit.unwrap_or(30).clamp(1, 100);
+    let hits = e.db.search_chapters(&id, q, limit).map_err(err)?;
+    let items: Vec<serde_json::Value> = hits
+        .into_iter()
+        .map(|(idx, title, excerpt)| json!({"idx": idx, "title": title, "excerpt": excerpt}))
+        .collect();
+    Ok(Json(json!({"items": items})))
 }
 
 #[derive(Deserialize)]

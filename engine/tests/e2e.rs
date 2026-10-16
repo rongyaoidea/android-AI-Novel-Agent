@@ -1247,7 +1247,7 @@ async fn prompt_overrides_endpoints() {
     engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
     let app = api::build_router(engine.clone());
 
-    // 1) 目录：8 个任务，默认模板齐全，初始无覆盖
+    // 1) 目录：10 个任务，默认模板齐全，初始无覆盖
     let resp = app
         .clone()
         .oneshot(
@@ -1261,7 +1261,7 @@ async fn prompt_overrides_endpoints() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
     let items = v["items"].as_array().unwrap();
-    assert_eq!(items.len(), 8, "任务数量应为 8");
+    assert_eq!(items.len(), 10, "任务数量应为 10");
     for t in items {
         assert!(!t["default_system"].as_str().unwrap().is_empty(), "{}", t["id"]);
         assert!(!t["default_user"].as_str().unwrap().is_empty(), "{}", t["id"]);
@@ -2131,6 +2131,155 @@ async fn review_all_endpoint() {
         issues.iter().any(|i| i["status"] == "open"),
         "mock 复核问题未减少，应仍为 open: {review}"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 等一次运行完成（mock 流水线通用）
+async fn wait_run_done(app: axum::Router, novel_id: &str) {
+    for _ in 0..900 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        let status = v["run"]["status"].as_str().unwrap_or("");
+        if status == "done" {
+            return;
+        }
+        assert_ne!(status, "failed", "run failed: {v}");
+    }
+    panic!("run 未在时限内完成");
+}
+
+/// 全文检索 + 作品总纲字段 + 列表瘦身（v0.8.0）
+#[tokio::test]
+async fn chapter_search_and_novel_meta() {
+    fn pct(s: &str) -> String {
+        s.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-search-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "全文检索测试", "chapters": 2}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    // 列表接口瘦身：不含 content，但有 preview / words；总纲含世界观
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(format!("/api/novels/{novel_id}")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    let ch0 = &v["chapters"][0];
+    assert!(ch0.get("content").is_none(), "列表不应返回正文：{ch0}");
+    assert!(!ch0["preview"].as_str().unwrap_or("").is_empty(), "{ch0}");
+    assert!(ch0["words"].as_i64().unwrap_or(0) > 0, "{ch0}");
+    assert!(
+        !v["novel"]["worldview"].as_str().unwrap_or("").is_empty(),
+        "立项应生成世界观：{v}"
+    );
+
+    // 检索命中：两章 mock 正文都含「模拟模式」
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/search?q={}", pct("模拟模式")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let items = v["items"].as_array().unwrap();
+    assert!(items.len() >= 2, "{v}");
+    assert!(
+        items
+            .iter()
+            .all(|it| it["excerpt"].as_str().unwrap_or("").contains("模拟")),
+        "摘录应包含命中词：{v}"
+    );
+
+    // 无命中
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/search?q={}", pct("不存在词组xyz")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["items"].as_array().unwrap().len(), 0, "{v}");
+
+    // 写作偏好回环：伏笔审核间隔
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/settings/pipeline")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "auto_fix_review": true,
+                        "monthly_budget_tokens": 0,
+                        "auto_batch": 10,
+                        "foreshadow_audit_every": 5
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/api/settings/pipeline").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["foreshadow_audit_every"], 5, "{v}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

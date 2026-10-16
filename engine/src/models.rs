@@ -11,6 +11,9 @@ pub struct Novel {
     pub protagonist: String,
     pub style: String,
     pub book_outline: String,
+    /// 世界观设定（立项时生成；旧库为空）
+    #[serde(default)]
+    pub worldview: String,
     pub status: String,
     /// "auto"（全自动）| "staged"（按阶段确认）
     pub mode: String,
@@ -119,6 +122,9 @@ pub struct Brief {
     pub logline: String,
     pub protagonist: String,
     pub style: String,
+    /// 世界观设定（60 字以内；旧格式输出可以为空）
+    #[serde(default)]
+    pub worldview: String,
 }
 
 /// 章节计划（LLM 结构化输出）
@@ -152,6 +158,56 @@ pub struct ReviewIssue {
 
 pub fn default_issue_status() -> String {
     "open".to_string()
+}
+
+/// fixed 意见留档上限：超出时保留最近的 N 条（防止 review_json 无限膨胀）。
+/// open 意见永不裁剪。
+pub const MAX_FIXED_ISSUES: usize = 10;
+
+pub fn cap_review_fixed(review: &mut Review, max_fixed: usize) {
+    let fixed_total = review.issues.iter().filter(|i| i.status == "fixed").count();
+    if fixed_total <= max_fixed {
+        return;
+    }
+    // 先收集 fixed 的原始下标，保留最后 max_fixed 条
+    let fixed_idx: Vec<usize> = review
+        .issues
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.status == "fixed")
+        .map(|(i, _)| i)
+        .collect();
+    let drop_count = fixed_total - max_fixed;
+    let dropped: std::collections::BTreeSet<usize> =
+        fixed_idx.into_iter().take(drop_count).collect();
+    let mut keep = Vec::with_capacity(review.issues.len());
+    for (i, issue) in review.issues.drain(..).enumerate() {
+        if !dropped.contains(&i) {
+            keep.push(issue);
+        }
+    }
+    review.issues = keep;
+}
+
+/// 卷级摘要（每 20 章归并一条，供长书回顾注入）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeSummary {
+    pub volume_idx: i64,
+    pub upto_chapter: i64,
+    pub summary: String,
+}
+
+/// 章节列表轻量条目（不含正文，列表接口用；正文走章节详情）
+#[derive(Debug, Clone, Serialize)]
+pub struct ChapterMeta {
+    pub idx: i64,
+    pub title: String,
+    pub goal: String,
+    pub beats: Vec<String>,
+    pub status: String,
+    pub words: i64,
+    pub preview: String,
+    pub review_json: Option<String>,
 }
 
 /// 书架条目：作品 + 进度统计 + 最近一次运行
@@ -233,15 +289,26 @@ pub struct PipelineSettings {
     /// 自动连载每批章节数（1–50，默认 10）
     #[serde(default = "default_auto_batch")]
     pub auto_batch: i64,
+    /// 伏笔自动审核间隔（章）：1 = 每批收尾都跑；N = 章节号逢 N 的倍数才跑；0 = 关闭（默认 1）
+    #[serde(default = "default_audit_every")]
+    pub foreshadow_audit_every: i64,
 }
 
 fn default_auto_batch() -> i64 {
     10
 }
 
+fn default_audit_every() -> i64 {
+    1
+}
+
 impl PipelineSettings {
     pub fn batch(&self) -> i64 {
         self.auto_batch.clamp(1, 50)
+    }
+
+    pub fn audit_every(&self) -> i64 {
+        self.foreshadow_audit_every.clamp(0, 100)
     }
 }
 
@@ -251,6 +318,7 @@ impl Default for PipelineSettings {
             auto_fix_review: true,
             monthly_budget_tokens: 0,
             auto_batch: default_auto_batch(),
+            foreshadow_audit_every: default_audit_every(),
         }
     }
 }
