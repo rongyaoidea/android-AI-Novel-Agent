@@ -41,6 +41,8 @@ mod tests {
             status: "drafted".into(),
             mode: "auto".into(),
             style_preset: String::new(),
+            target_chapters: 0,
+            auto_continue: false,
             created_at: "t".into(),
             updated_at: "t".into(),
         };

@@ -19,7 +19,7 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-const NOVEL_COLS: &str = "id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at,style_preset";
+const NOVEL_COLS: &str = "id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at,style_preset,target_chapters,auto_continue";
 const CHAPTER_COLS: &str = "id,novel_id,idx,title,goal,beats_json,content,summary,status,review_json,created_at,updated_at,style_report";
 const RUN_COLS: &str = "id,novel_id,status,stage,chapter_cursor,chapters_target,error,created_at,updated_at";
 
@@ -162,6 +162,18 @@ impl Db {
             "style_report",
             "style_report TEXT NOT NULL DEFAULT ''",
         )?;
+        Self::ensure_column(
+            &conn,
+            "novels",
+            "target_chapters",
+            "target_chapters INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::ensure_column(
+            &conn,
+            "novels",
+            "auto_continue",
+            "auto_continue INTEGER NOT NULL DEFAULT 0",
+        )?;
         // 旧库升级：补 chapters.summary 列
         Self::ensure_column(&conn, "chapters", "summary", "summary TEXT NOT NULL DEFAULT ''")?;
         // 章节结构编辑的中断兜底：把负区占位 idx 还原
@@ -260,6 +272,8 @@ impl Db {
             created_at: now(),
             updated_at: now(),
             style_preset: style_preset.trim().to_string(),
+            target_chapters: 0,
+            auto_continue: false,
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -285,6 +299,8 @@ impl Db {
             created_at: row.get(10)?,
             updated_at: row.get(11)?,
             style_preset: row.get(12)?,
+            target_chapters: row.get(13)?,
+            auto_continue: row.get(14)?,
         })
     }
 
@@ -311,12 +327,12 @@ impl Db {
         let rows = stmt.query_map([], |row| {
             Ok(NovelListItem {
                 novel: Self::map_novel(row)?,
-                chapters_done: row.get(13)?,
-                words: row.get(14)?,
-                run_status: row.get(15)?,
-                run_stage: row.get(16)?,
-                chapters_target: row.get(17)?,
-                last_error: row.get(18)?,
+                chapters_done: row.get(15)?,
+                words: row.get(16)?,
+                run_status: row.get(17)?,
+                run_stage: row.get(18)?,
+                chapters_target: row.get(19)?,
+                last_error: row.get(20)?,
             })
         })?;
         let mut out = Vec::new();
@@ -559,6 +575,37 @@ impl Db {
             params![id, style_preset.trim(), now()],
         )?;
         Ok(())
+    }
+
+    /// 设置全书目标章节数（0 = 清除）
+    pub fn set_novel_target(&self, id: &str, target: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE novels SET target_chapters=?2, updated_at=?3 WHERE id=?1",
+            params![id, target.max(0), now()],
+        )?;
+        Ok(())
+    }
+
+    /// 开启/停止自动连载
+    pub fn set_novel_auto_continue(&self, id: &str, on: bool) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE novels SET auto_continue=?2, updated_at=?3 WHERE id=?1",
+            params![id, if on { 1 } else { 0 }, now()],
+        )?;
+        Ok(())
+    }
+
+    /// 指定时间点之后的累计 token 用量（用于月度预算护栏；未知口径不计）
+    pub fn usage_total_since(&self, since: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let v: Option<i64> = conn.query_row(
+            "SELECT SUM(total_tokens) FROM llm_usage WHERE created_at >= ?1",
+            [since],
+            |r| r.get(0),
+        )?;
+        Ok(v.unwrap_or(0))
     }
 
     // ---------- 章节：手动编辑 ----------

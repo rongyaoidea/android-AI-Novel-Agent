@@ -83,10 +83,82 @@ impl Default for EventHub {
     }
 }
 
+/// 自动连载：每批章节数（批间有运行检查点，便于崩溃恢复与进度可见）
+pub const AUTO_BATCH: i64 = 10;
+
+/// 自动连载的下一批目标截止章号 = min(已规划最大章号 + 每批章数, 全书目标)
+pub fn auto_batch_target(
+    db: &crate::db::Db,
+    novel_id: &str,
+    target: i64,
+    batch: i64,
+) -> anyhow::Result<i64> {
+    let chapters = db.list_chapters(novel_id)?;
+    let max_idx = chapters.iter().map(|c| c.idx).max().unwrap_or(0);
+    Ok((max_idx + batch.clamp(1, 50)).min(target.max(0)))
+}
+
+/// 运行成功收尾：若开启自动连载且未达目标且未超预算 → 自动启动下一批。
+/// 停止条件：目标达成（自动关闭）/ 预算耗尽（自动关闭并提示）/ 手动关闭。
+fn maybe_chain_auto(engine: &Arc<Engine>, novel_id: &str) -> anyhow::Result<()> {
+    let Some(novel) = engine.db.get_novel(novel_id)? else {
+        return Ok(());
+    };
+    if !novel.auto_continue {
+        return Ok(());
+    }
+    let target = novel.target_chapters;
+    if target <= 0 {
+        return Ok(());
+    }
+    let done_through = engine
+        .db
+        .list_chapters(novel_id)?
+        .iter()
+        .filter(|c| c.status == "done" && !c.content.trim().is_empty())
+        .map(|c| c.idx)
+        .max()
+        .unwrap_or(0);
+    if done_through >= target {
+        engine.db.set_novel_auto_continue(novel_id, false)?;
+        engine.hub.publish(novel_id, EngineEvent::Stage {
+            stage: "done".into(),
+            message: format!("自动连载完成：已达到目标 {target} 章"),
+        });
+        return Ok(());
+    }
+    // 预算护栏
+    let settings = engine.db.pipeline_settings().unwrap_or_default();
+    if settings.monthly_budget_tokens > 0 {
+        let used = engine
+            .db
+            .usage_total_since(&crate::api::month_start_utc())
+            .unwrap_or(0);
+        if used >= settings.monthly_budget_tokens {
+            engine.db.set_novel_auto_continue(novel_id, false)?;
+            engine.hub.publish(novel_id, EngineEvent::Stage {
+                stage: "budget".into(),
+                message: format!(
+                    "本月 Token 预算已达上限（{used}/{budget}），自动连载已暂停",
+                    budget = settings.monthly_budget_tokens
+                ),
+            });
+            return Ok(());
+        }
+    }
+    let next = auto_batch_target(&engine.db, novel_id, target, settings.batch())?;
+    tracing::info!("auto-continue: 启动下一批（至第 {next} 章）");
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "auto".into(),
+        message: format!("自动连载：继续写下一批（至第 {next} 章，已完成 {done_through} 章）…"),
+    });
+    spawn(engine.clone(), novel_id, next)?;
+    Ok(())
+}
+
 /// 创建一次运行并在后台执行；立即返回 run_id。
 /// 断点续跑：重复调用同一 novel 时，已完成的章节会跳过。
-pub fn spawn(engine: Arc<Engine>, novel_id: &str, chapters: i64) -> anyhow::Result<String> {
-    let run = engine.db.create_run(novel_id, chapters)?;
+pub fn spawn(engine: Arc<Engine>, novel_id: &str, chapters: i64) -> anyhow::Result<String> {    let run = engine.db.create_run(novel_id, chapters)?;
     let run_id = run.id.clone();
     engine.db.set_novel_status(novel_id, "writing")?;
     engine.hub.publish(novel_id, EngineEvent::RunStarted {
@@ -133,10 +205,28 @@ async fn run_inner(
             crate::styles::find(&novel.style_preset),
             &ov,
         );
-        let out = llm.complete(&sys, &usr).await?;
-        record_usage(&engine.db, Some(novel_id), None, "brief", &settings, &out.usage);
-        let raw = out.text;
-        let v = extract_json_object(&raw).ok_or_else(|| {
+        // JSON 解析失败自动重试一次（自愈）
+        let mut raw = String::new();
+        let mut parsed: Option<serde_json::Value> = None;
+        for attempt in 1..=2u8 {
+            let out = llm.complete(&sys, &usr).await?;
+            record_usage(&engine.db, Some(novel_id), None, "brief", &settings, &out.usage);
+            raw = out.text;
+            match extract_json_object(&raw) {
+                Some(v) => {
+                    parsed = Some(v);
+                    break;
+                }
+                None if attempt < 2 => {
+                    engine.hub.publish(novel_id, EngineEvent::Stage {
+                        stage: "brief".into(),
+                        message: "立项输出不是 JSON，自动重试一次…".into(),
+                    });
+                }
+                None => {}
+            }
+        }
+        let v = parsed.ok_or_else(|| {
             anyhow::anyhow!("brief 输出不是 JSON：{}", raw.chars().take(200).collect::<String>())
         })?;
         let brief = Brief {
@@ -187,10 +277,28 @@ async fn run_inner(
             crate::styles::find(&novel.style_preset),
             &ov,
         );
-        let out = llm.complete(&sys, &usr).await?;
-        record_usage(&engine.db, Some(novel_id), None, "outline", &settings, &out.usage);
-        let raw = out.text;
-        let v = extract_json_object(&raw).ok_or_else(|| {
+        // JSON 解析失败自动重试一次（自愈）
+        let mut raw = String::new();
+        let mut parsed: Option<serde_json::Value> = None;
+        for attempt in 1..=2u8 {
+            let out = llm.complete(&sys, &usr).await?;
+            record_usage(&engine.db, Some(novel_id), None, "outline", &settings, &out.usage);
+            raw = out.text;
+            match extract_json_object(&raw) {
+                Some(v) => {
+                    parsed = Some(v);
+                    break;
+                }
+                None if attempt < 2 => {
+                    engine.hub.publish(novel_id, EngineEvent::Stage {
+                        stage: "outline".into(),
+                        message: "章节规划输出不是 JSON，自动重试一次…".into(),
+                    });
+                }
+                None => {}
+            }
+        }
+        let v = parsed.ok_or_else(|| {
             anyhow::anyhow!("outline 输出不是 JSON：{}", raw.chars().take(200).collect::<String>())
         })?;
         if novel.book_outline.trim().is_empty() {
@@ -240,6 +348,26 @@ async fn run_inner(
         if engine.db.get_novel(novel_id)?.is_none() {
             // 作品已被删除：静默结束本次运行
             return Ok(());
+        }
+        // 预算护栏：超限则优雅收尾（已写章节保留；自动连载由收尾逻辑关闭）
+        {
+            let pipeline_settings = engine.db.pipeline_settings().unwrap_or_default();
+            if pipeline_settings.monthly_budget_tokens > 0 {
+                let used = engine
+                    .db
+                    .usage_total_since(&crate::api::month_start_utc())
+                    .unwrap_or(0);
+                if used >= pipeline_settings.monthly_budget_tokens {
+                    engine.hub.publish(novel_id, EngineEvent::Stage {
+                        stage: "budget".into(),
+                        message: format!(
+                            "本月 Token 预算已达上限（{used}/{budget}），本次运行提前收尾",
+                            budget = pipeline_settings.monthly_budget_tokens
+                        ),
+                    });
+                    break;
+                }
+            }
         }
         let ch = match engine.db.get_chapter(novel_id, idx)? {
             Some(c) => c,
@@ -302,33 +430,54 @@ async fn run_inner(
             crate::styles::find(&novel.style_preset),
             &ov,
         );
-        // 流式输出按 ~80 字聚合后再推送，降低 SSE 事件与前端渲染压力
-        let mut buf = String::new();
-        let hub = engine.hub.clone();
-        let streamed = llm
-            .stream(&sys, &usr, |delta: &str| {
-                buf.push_str(delta);
-                if buf.chars().count() >= 80 {
-                    let chunk = std::mem::take(&mut buf);
-                    hub.publish(novel_id, EngineEvent::Token {
-                        chapter_idx: idx,
-                        delta: chunk,
-                    });
-                }
-            })
-            .await?;
-        record_usage(&engine.db, Some(novel_id), Some(idx), "chapter", &settings, &streamed.usage);
-        let content = streamed.text;
-        if !buf.is_empty() {
-            let chunk = std::mem::take(&mut buf);
-            engine.hub.publish(novel_id, EngineEvent::Token {
-                chapter_idx: idx,
-                delta: chunk,
-            });
-        }
-        let content = content.trim().to_string();
-        if content.is_empty() {
-            anyhow::bail!("第 {idx} 章生成内容为空");
+        // 流式输出按 ~80 字聚合后再推送；空内容自动重试一次（章节级自愈）
+        let mut content = String::new();
+        for attempt in 1..=2u8 {
+            let mut buf = String::new();
+            let hub = engine.hub.clone();
+            let streamed = llm
+                .stream(&sys, &usr, |delta: &str| {
+                    buf.push_str(delta);
+                    if buf.chars().count() >= 80 {
+                        let chunk = std::mem::take(&mut buf);
+                        hub.publish(
+                            novel_id,
+                            EngineEvent::Token {
+                                chapter_idx: idx,
+                                delta: chunk,
+                            },
+                        );
+                    }
+                })
+                .await?;
+            record_usage(
+                &engine.db,
+                Some(novel_id),
+                Some(idx),
+                "chapter",
+                &settings,
+                &streamed.usage,
+            );
+            if !buf.is_empty() {
+                let chunk = std::mem::take(&mut buf);
+                engine.hub.publish(novel_id, EngineEvent::Token {
+                    chapter_idx: idx,
+                    delta: chunk,
+                });
+            }
+            let text = streamed.text.trim().to_string();
+            if !text.is_empty() {
+                content = text;
+                break;
+            }
+            if attempt < 2 {
+                engine.hub.publish(novel_id, EngineEvent::Stage {
+                    stage: "draft".into(),
+                    message: format!("第 {idx} 章返回空内容，自动重试一次…"),
+                });
+            } else {
+                anyhow::bail!("第 {idx} 章生成内容为空（已自动重试）");
+            }
         }
 
         // ---- 文风一致性检查（本地、零 token）----
@@ -602,6 +751,9 @@ async fn run_inner(
     engine.hub.publish(novel_id, EngineEvent::RunFinished {
         run_id: run_id.to_string(),
     });
+
+    // 自动连载：达标/超预算/手动停止则在此收尾，否则启动下一批
+    maybe_chain_auto(&engine, novel_id)?;
     Ok(())
 }
 

@@ -1778,3 +1778,229 @@ async fn stage_events_and_auto_fix() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 自动连载：分批续写至目标自动停止；月度 Token 预算耗尽自动暂停
+#[tokio::test]
+async fn auto_continue_chain_and_budget() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-auto-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    let wait_done = |app: axum::Router, id: String| async move {
+        let mut status = String::new();
+        for _ in 0..900 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(format!("/api/novels/{id}")).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let v = json_body(resp).await;
+            status = v["run"]["status"].as_str().unwrap_or("").to_string();
+            if status == "done" {
+                return v;
+            }
+            assert_ne!(status, "failed", "run failed: {}", v["run"]["error"]);
+        }
+        panic!("run did not finish: {status}");
+    };
+
+    // ---- ① 自动连载：1 章起步 → 目标 3 章 ----
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "自动连载测试", "chapters": 1}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let n1 = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    let v = wait_done(app.clone(), n1.clone()).await;
+    assert_eq!(v["novel"]["target_chapters"], 1, "创建时应设定目标章节数");
+    assert_eq!(v["novel"]["auto_continue"], false);
+
+    // 每批 1 章（默认 10）：让续写链走两步，覆盖 auto 阶段事件
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/settings/pipeline")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"auto_fix_review": true, "monthly_budget_tokens": 0, "auto_batch": 1})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 调大目标并启动自动连载
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/novels/{n1}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"target_chapters": 3}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().method("POST").uri(format!("/api/novels/{n1}/auto")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["target"], 3);
+    assert_eq!(v["batch_until"], 2, "每批 1 章：已完成 1 章 → 本批写到第 2 章");
+
+    // 等连载收尾（自动写第 2、3 章并自动关闭开关）
+    let mut finished = false;
+    for _ in 0..900 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(format!("/api/novels/{n1}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        let auto = v["novel"]["auto_continue"].as_bool().unwrap_or(false);
+        let status = v["run"]["status"].as_str().unwrap_or("");
+        let done = v["chapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["status"] == "done")
+            .count();
+        if !auto && status == "done" && done == 3 {
+            finished = true;
+            break;
+        }
+        assert_ne!(status, "failed", "chain run failed");
+    }
+    assert!(finished, "自动连载未在时限内达到目标");
+
+    // 两个运行（首批 + 自动批）与自动连载阶段事件
+    let runs = engine.db.list_runs(50).unwrap();
+    let count = runs.iter().filter(|it| it.run.novel_id == n1).count();
+    assert!(count >= 3, "每批 1 章 → 首批 + 2 个自动批，实际 {count}");
+    let stages: Vec<String> = engine.hub.history(&n1)
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::Stage { stage, .. } => Some(stage.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(stages.contains(&"auto".to_string()), "{stages:?}");
+    assert!(stages.contains(&"done".to_string()), "{stages:?}");
+
+    // ---- ② 预算护栏：预算 1 token，启动自动连载后立即暂停 ----
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/settings/pipeline")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"auto_fix_review": true, "monthly_budget_tokens": 1, "auto_batch": 10}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "预算护栏测试", "chapters": 1}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let n2 = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_done(app.clone(), n2.clone()).await;
+
+    // 调大目标 → 启动自动连载 → 预算已耗尽（首个检查点即停）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/novels/{n2}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"target_chapters": 2}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().method("POST").uri(format!("/api/novels/{n2}/auto")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 等待：批次运行因预算提前收尾 → 自动连载关闭
+    let mut stopped = false;
+    for _ in 0..400 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(format!("/api/novels/{n2}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        if !v["novel"]["auto_continue"].as_bool().unwrap_or(true) {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "预算耗尽后自动连载应自动暂停");
+    let stages2: Vec<String> = engine.hub.history(&n2)
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::Stage { stage, .. } => Some(stage.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(stages2.contains(&"budget".to_string()), "应有预算护栏事件: {stages2:?}");
+
+    // 月度用量接口
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/api/usage").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert!(v["used"].as_i64().unwrap_or(0) > 0);
+    assert_eq!(v["over_budget"], true);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

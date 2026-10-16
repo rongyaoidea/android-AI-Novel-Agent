@@ -16,6 +16,12 @@ pub struct Novel {
     pub mode: String,
     /// 文风预设 id（见 styles.rs；空串 = 不限）
     pub style_preset: String,
+    /// 全书目标章节数（0 = 未设定）
+    #[serde(default)]
+    pub target_chapters: i64,
+    /// 自动连载：运行完成后自动续写下一批，直到目标达成 / 失败 / 预算上限
+    #[serde(default)]
+    pub auto_continue: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -214,12 +220,30 @@ pub struct UsageGroup {
 pub struct PipelineSettings {
     /// 审校出现高/中危问题时自动修复一次（减少人工介入）
     pub auto_fix_review: bool,
+    /// 每月 Token 预算上限（0 = 不限）；达到上限后自动连载暂停
+    #[serde(default)]
+    pub monthly_budget_tokens: i64,
+    /// 自动连载每批章节数（1–50，默认 10）
+    #[serde(default = "default_auto_batch")]
+    pub auto_batch: i64,
+}
+
+fn default_auto_batch() -> i64 {
+    10
+}
+
+impl PipelineSettings {
+    pub fn batch(&self) -> i64 {
+        self.auto_batch.clamp(1, 50)
+    }
 }
 
 impl Default for PipelineSettings {
     fn default() -> Self {
         Self {
             auto_fix_review: true,
+            monthly_budget_tokens: 0,
+            auto_batch: default_auto_batch(),
         }
     }
 }

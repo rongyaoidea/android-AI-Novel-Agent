@@ -128,6 +128,8 @@ const STAGE_LABEL = {
   review: "章节审校",
   autofix: "自动修复",
   extract: "资料整理",
+  auto: "自动连载",
+  budget: "预算护栏",
   done: "全部完成",
   failed: "已中断",
 };
@@ -377,7 +379,7 @@ function bindCreate() {
     e.preventDefault();
     const idea = $("#create-idea").value.trim();
     if (!idea) { toast("请先写一句灵感", true); return; }
-    const chapters = Math.min(50, Math.max(1, parseInt($("#create-chapters").value || "3", 10) || 3));
+    const chapters = Math.min(999, Math.max(1, parseInt($("#create-chapters").value || "3", 10) || 3));
     const mode = $("#create-mode").value;
     const style_preset = getStylePick();
     const btn = $("#create-submit");
@@ -568,9 +570,9 @@ function renderNovel() {
   ].join("");
   $("#novel-meta").textContent = [n.logline, n.protagonist && `主角：${n.protagonist}`, n.style].filter(Boolean).join(" · ") || n.idea || "";
 
-  const target = (run && run.chapters_target) || Math.max(chs.length, 3);
+  const target = n.target_chapters > 0 ? n.target_chapters : (run && run.chapters_target) || Math.max(chs.length, 3);
   if (!$("#novel-target").dataset.touched) {
-    $("#novel-target").value = Math.max(chs.length, target);
+    $("#novel-target").value = target;
   }
   $("#novel-export").href = withToken(`/api/novels/${n.id}/export`);
 
@@ -580,6 +582,17 @@ function renderNovel() {
   runBtn.disabled = running;
   runBtn.textContent = running ? "创作中…" : paused ? "确认并继续" : "继续创作";
   runBtn.classList.toggle("attention", paused);
+
+  // 自动连载按钮：连载中显示「停止连载」
+  const autoBtn = $("#novel-auto");
+  const autoOn = !!n.auto_continue;
+  autoBtn.innerHTML = autoOn
+    ? `${ic("i-x")}停止连载`
+    : `${ic("i-refresh")}自动连载`;
+  autoBtn.classList.toggle("btn-danger", autoOn);
+  autoBtn.title = autoOn
+    ? "停止自动连载：当前批次写完后不再自动续写"
+    : `自动连载：每批最多 10 章，写完自动续写直到目标 ${target} 章（遇失败/预算上限自动暂停）`;
 
   // 推进方式切换
   $("#mode-toggle").innerHTML = `
@@ -723,13 +736,24 @@ function fmtTokens(v) {
 
 async function openUsage() {
   const u = await api(`/api/novels/${state.novelId}/usage`);
+  let month = null;
+  try {
+    month = await api("/api/usage");
+  } catch {
+    /* 忽略：月度护栏数据获取失败不影响明细 */
+  }
   const t = u.totals || {};
   const hitRate =
     t.input && t.cache_hit !== null && t.cache_hit !== undefined
       ? `（${Math.round((t.cache_hit / t.input) * 100)}%）`
       : "";
   $("#usage-stats").innerHTML = [
-    `<span class="chip">调用 ${t.calls || 0} 次</span>`,
+    month
+      ? `<span class="chip ${month.over_budget ? "chip-danger" : "chip-info"}">本月累计 ${fmtTokens(month.used)}${
+          month.budget > 0 ? ` / 预算 ${fmtTokens(month.budget)}` : "（预算不限）"
+        }</span>`
+      : "",
+    `<span class="chip">本书调用 ${t.calls || 0} 次</span>`,
     `<span class="chip">输入 ${fmtTokens(t.input)}</span>`,
     `<span class="chip ${t.cache_hit ? "chip-success" : ""}">缓存命中 ${fmtTokens(t.cache_hit)}${hitRate}</span>`,
     `<span class="chip">未命中 ${fmtTokens(t.cache_miss)}</span>`,
@@ -769,6 +793,7 @@ function renderChapters() {
           ${c.status === "planned"
             ? `<button class="btn btn-outline btn-sm" data-plan="${c.idx}">改规划</button>`
             : `<button class="icon-btn" data-read="${c.idx}" title="阅读 / 编辑">${ic("i-eye")}</button>`}
+          <button class="icon-btn" data-copy="${c.idx}" title="一键复制（标题+正文，粘贴到作家平台）">${ic("i-copy")}</button>
           <button class="icon-btn" data-move="${c.idx}" data-dir="up" title="上移">${ic("i-up")}</button>
           <button class="icon-btn" data-move="${c.idx}" data-dir="down" title="下移">${ic("i-down")}</button>
           <button class="icon-btn danger" data-del="${c.idx}" title="删除本章">${ic("i-x")}</button>
@@ -819,6 +844,8 @@ function bindNovel() {
   $("#chapter-rows").addEventListener("click", async (e) => {
     const read = e.target.closest("[data-read]");
     if (read) { openEditor(parseInt(read.dataset.read, 10)).catch((err) => toast(err.message, true)); return; }
+    const copy = e.target.closest("[data-copy]");
+    if (copy) { copyChapter(parseInt(copy.dataset.copy, 10)).catch((err) => toast(err.message, true)); return; }
     const plan = e.target.closest("[data-plan]");
     if (plan) { editPlan(parseInt(plan.dataset.plan, 10)).catch((err) => toast(err.message, true)); return; }
     const move = e.target.closest("[data-move]");
@@ -951,6 +978,33 @@ function bindNovel() {
     });
   };
   $("#novel-target").addEventListener("input", (e) => { e.target.dataset.touched = "1"; });
+  $("#novel-target").addEventListener("change", async (e) => {
+    const v = Math.min(999, Math.max(1, parseInt(e.target.value || "1", 10) || 1));
+    e.target.value = v;
+    e.target.dataset.touched = "";
+    try {
+      await apiSend(`/api/novels/${state.novelId}`, "PATCH", { target_chapters: v });
+      toast(`目标章节数已设为 ${v} 章`);
+      await refreshNovel();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+  $("#novel-auto").onclick = async () => {
+    const on = !!state.novel?.novel?.auto_continue;
+    try {
+      if (on) {
+        await api(`/api/novels/${state.novelId}/auto`, { method: "DELETE" });
+        toast("已停止自动连载（当前批次写完后不再续写）");
+      } else {
+        const r = await api(`/api/novels/${state.novelId}/auto`, { method: "POST" });
+        toast(`自动连载已开始：每批 ≤10 章，直到第 ${r.target} 章`);
+      }
+      await refreshNovel();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
   $("#novel-run").onclick = async () => {
     const chapters = Math.min(50, Math.max(1, parseInt($("#novel-target").value || "3", 10) || 3));
     try {
@@ -1062,6 +1116,52 @@ async function editForeshadowing(id) {
 }
 
 /* ---------------- 章节编辑器 ---------------- */
+
+/* ---------------- 一键复制（粘贴到作家平台） ---------------- */
+
+/** 复制到剪贴板：优先 Clipboard API，回退 execCommand（WebView 两种都可用） */
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* 回退 */
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/** 章节导出文本：第一行「第N章 标题」，空行后正文 —— 直接粘贴即可 */
+function chapterExportText(idx, title, content) {
+  const name = (title || "").trim();
+  const head = name
+    ? (/^第\s*\S{0,10}章/.test(name) ? name : `第${idx}章 ${name}`)
+    : `第${idx}章`;
+  return `${head}\n\n${(content || "").trim()}\n`;
+}
+
+/** 列表里一键复制（取已保存正文） */
+async function copyChapter(idx) {
+  const c = await api(`/api/novels/${state.novelId}/chapters/${idx}`);
+  if (!c.content || !c.content.trim()) throw new Error(`第${idx}章还没有正文`);
+  const ok = await copyText(chapterExportText(idx, c.title, c.content));
+  if (!ok) throw new Error("复制失败（剪贴板不可用）");
+  toast(`已复制第${idx}章（标题+正文），可直接粘贴到作家平台`);
+}
 
 async function openEditor(idx) {
   const c = await api(`/api/novels/${state.novelId}/chapters/${idx}`);
@@ -1203,6 +1303,24 @@ function bindEditor() {
     }
   });
   $("#reader-save").onclick = () => { saveChapter(); };
+  // 复制全章（含编辑器里的未保存修改），便于直接粘贴到作家平台
+  const readerCopyBtn = $("#reader-copy");
+  if (readerCopyBtn) {
+    readerCopyBtn.onclick = async () => {
+      const ta = $("#reader-content");
+      const idx = parseInt(ta.dataset.idx || "0", 10) || 0;
+      const titleLine = $("#reader-title").textContent.trim();
+      if (!ta.value.trim()) {
+        toast("本章还没有正文", true);
+        return;
+      }
+      const ok = await copyText(`${titleLine}\n\n${ta.value.trim()}\n`);
+      toast(
+        ok ? `已复制第${idx}章（含未保存修改），可直接粘贴到作家平台` : "复制失败（剪贴板不可用）",
+        !ok,
+      );
+    };
+  }
   $("#reader-recheck").onclick = async () => {
     if (state.editorDirty) {
       if (!confirm("先保存当前修改，再重新审校？")) return;
@@ -1854,6 +1972,8 @@ async function loadSettingsForm() {
   try {
     const p = await api("/api/settings/pipeline");
     $("#set-auto-fix").checked = !!p.auto_fix_review;
+    $("#set-budget").value = p.monthly_budget_tokens > 0 ? p.monthly_budget_tokens : "";
+    $("#set-auto-batch").value = p.auto_batch && p.auto_batch !== 10 ? p.auto_batch : "";
   } catch {
     /* 忽略：保持默认勾选状态 */
   }
@@ -1969,17 +2089,35 @@ function bindSettings() {
     }
   });
 
-  // 写作偏好：审校问题自动修复
-  $("#set-auto-fix").addEventListener("change", async () => {
-    const on = $("#set-auto-fix").checked;
+  // 写作偏好：审校问题自动修复 + 月度 Token 预算 + 每批章节数（同一接口，保存时带上全部字段）
+  const savePipeline = async (statusEl) => {
+    const budget = Math.max(0, parseInt($("#set-budget").value || "0", 10) || 0);
+    const batchRaw = parseInt($("#set-auto-batch").value || "10", 10) || 10;
+    const batch = Math.min(50, Math.max(1, batchRaw));
     try {
-      await apiSend("/api/settings/pipeline", "PUT", { auto_fix_review: on });
-      $("#pipeline-status").textContent = on ? "已开启自动修复" : "已关闭自动修复";
-      setTimeout(() => { $("#pipeline-status").textContent = ""; }, 2500);
+      await apiSend("/api/settings/pipeline", "PUT", {
+        auto_fix_review: $("#set-auto-fix").checked,
+        monthly_budget_tokens: budget,
+        auto_batch: batch,
+      });
+      const el = $("#pipeline-status");
+      if (el) {
+        el.textContent = statusEl || "已保存";
+        setTimeout(() => { el.textContent = ""; }, 2500);
+      }
     } catch (err) {
       $("#pipeline-status").textContent = "保存失败：" + err.message;
     }
-  });
+  };
+  $("#set-auto-fix").addEventListener("change", () =>
+    savePipeline($("#set-auto-fix").checked ? "已开启自动修复" : "已关闭自动修复"),
+  );
+  $("#set-budget").addEventListener("change", () =>
+    savePipeline($("#set-budget").value ? "预算已保存" : "预算已设为不限"),
+  );
+  $("#set-auto-batch").addEventListener("change", () =>
+    savePipeline(`每批章节数已设为 ${Math.min(50, Math.max(1, parseInt($("#set-auto-batch").value || "10", 10) || 10))}`),
+  );
 }
 
 /* ---------------- 主题 / 引擎状态 ---------------- */

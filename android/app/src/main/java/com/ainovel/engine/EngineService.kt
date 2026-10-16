@@ -110,7 +110,12 @@ class EngineService : Service() {
             runStates[id] = runStatus
             if (prev == null || prev == runStatus) continue
             when (runStatus) {
-                "done" -> notifyEvent("《$title》生成完成", "本次运行已完成，点击查看章节")
+                "done" -> {
+                    // 自动连载进行中（批次完成还会续写）不打扰；最终完成才通知
+                    if (!novel.optBoolean("auto_continue", false)) {
+                        notifyEvent("《$title》生成完成", "本次运行已完成，点击查看章节")
+                    }
+                }
                 "failed" -> notifyEvent("《$title》运行中断", item.optString("last_error").ifBlank { "点击查看详情" })
                 "paused" -> notifyEvent("《$title》待确认", "章节规划已生成，确认后继续创作")
             }

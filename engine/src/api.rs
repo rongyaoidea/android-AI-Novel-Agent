@@ -123,6 +123,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/novels/:id/chapters/:idx/extract", post(extract_chapter))
         .route("/api/novels/:id/health", get(novel_health))
         .route("/api/novels/:id/run", post(run_novel))
+        .route(
+            "/api/novels/:id/auto",
+            post(start_auto).delete(stop_auto),
+        )
+        .route("/api/usage", get(monthly_usage))
         .route("/api/novels/:id/events", get(events))
         .route("/api/novels/:id/export", get(export_novel))
         .route("/api/novels/:id/characters", get(list_characters).post(add_character))
@@ -369,8 +374,11 @@ async fn create_novel(
         .map(|p| p.id)
         .unwrap_or("");
     let novel = e.db.create_novel(idea, mode, style).map_err(err)?;
+    // 目标章节数 = 创建时填写的数量（后续可改；自动连载体以其为准）
+    let target = b.chapters.clamp(1, 999);
+    e.db.set_novel_target(&novel.id, target).map_err(err)?;
     let run_id = pipeline::spawn(e.clone(), &novel.id, b.chapters.clamp(1, 50)).map_err(err)?;
-    Ok(Json(json!({"novel_id": novel.id, "run_id": run_id})))
+    Ok(Json(json!({"novel_id": novel.id, "run_id": run_id, "target_chapters": target})))
 }
 
 async fn list_novels(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, ApiErr> {
@@ -414,6 +422,12 @@ struct PatchNovelBody {
     /// 文风预设 id（空串 = 不限；非法值返回 400）
     #[serde(default)]
     style_preset: Option<String>,
+    /// 全书目标章节数（0 = 清除）
+    #[serde(default)]
+    target_chapters: Option<i64>,
+    /// 自动连载开关
+    #[serde(default)]
+    auto_continue: Option<bool>,
 }
 
 async fn patch_novel(
@@ -438,6 +452,15 @@ async fn patch_novel(
             })?
         };
         e.db.set_novel_style(&id, normalized).map_err(err)?;
+    }
+    if let Some(target) = b.target_chapters {
+        if !(0..=999).contains(&target) {
+            return Err((StatusCode::BAD_REQUEST, "目标章节数需在 0~999".to_string()));
+        }
+        e.db.set_novel_target(&id, target).map_err(err)?;
+    }
+    if let Some(auto) = b.auto_continue {
+        e.db.set_novel_auto_continue(&id, auto).map_err(err)?;
     }
     Ok(Json(json!({"ok": true})))
 }
@@ -1022,6 +1045,94 @@ async fn run_novel(
     }
     let run_id = pipeline::spawn(e.clone(), &id, b.chapters.clamp(1, 50)).map_err(err)?;
     Ok(Json(json!({"run_id": run_id})))
+}
+
+// ---------- 自动连载 / 月度用量 ----------
+
+/// 本月起点（UTC，RFC3339 前缀；与 usage.created_at 同格式可直接字符串比较）
+pub fn month_start_utc() -> String {
+    use chrono::Datelike;
+    let now = chrono::Utc::now();
+    format!("{:04}-{:02}-01T00:00:00+00:00", now.year(), now.month())
+}
+
+/// 启动自动连载：先写一批（≤10 章），运行完成后自动续写直到
+/// 目标章节数达成 / 运行失败 / 月度 Token 预算耗尽 / 手动停止。
+async fn start_auto(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let novel = e
+        .db
+        .get_novel(&id)
+        .map_err(err)?
+        .ok_or_else(|| not_found("novel"))?;
+    if let Some(run) = e.db.latest_run(&id).map_err(err)? {
+        if run.status == "running" {
+            return Err((
+                StatusCode::CONFLICT,
+                "已有运行进行中，请等待完成或先停止".to_string(),
+            ));
+        }
+    }
+    let target = if novel.target_chapters > 0 {
+        novel.target_chapters
+    } else {
+        // 未设目标：按当前进度再写一批（10 章）
+        let chapters = e.db.list_chapters(&id).map_err(err)?;
+        chapters.iter().map(|c| c.idx).max().unwrap_or(0) + pipeline::AUTO_BATCH
+    };
+    e.db.set_novel_target(&id, target).map_err(err)?;
+    let done_through = e
+        .db
+        .list_chapters(&id)
+        .map_err(err)?
+        .iter()
+        .filter(|c| c.status == "done" && !c.content.trim().is_empty())
+        .map(|c| c.idx)
+        .max()
+        .unwrap_or(0);
+    if done_through >= target {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("已达成目标章节数（{target} 章），如需继续请先调大目标"),
+        ));
+    }
+    e.db.set_novel_auto_continue(&id, true).map_err(err)?;
+    let batch = e.db.pipeline_settings().map_err(err)?.batch();
+    let batch_until = pipeline::auto_batch_target(&e.db, &id, target, batch).map_err(err)?;
+    let run_id = pipeline::spawn(e.clone(), &id, batch_until).map_err(err)?;
+    Ok(Json(json!({
+        "ok": true,
+        "run_id": run_id,
+        "batch_until": batch_until,
+        "target": target,
+    })))
+}
+
+/// 停止自动连载（当前批次写完后不再自动续写）
+async fn stop_auto(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    e.db.set_novel_auto_continue(&id, false).map_err(err)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+/// 本月累计用量与预算（自动连载的护栏数据）
+async fn monthly_usage(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, ApiErr> {
+    let since = month_start_utc();
+    let used = e.db.usage_total_since(&since).map_err(err)?;
+    let budget = e.db.pipeline_settings().map_err(err)?.monthly_budget_tokens;
+    Ok(Json(json!({
+        "since": since,
+        "used": used,
+        "budget": budget,
+        "over_budget": budget > 0 && used >= budget,
+    })))
 }
 
 async fn events(
