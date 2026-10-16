@@ -85,6 +85,8 @@ impl StyleReport {
                 note: format!("文风检查：{} —— {}", c.name, c.detail),
                 quote: String::new(),
                 status: "open".to_string(),
+                is_new: false,
+                stale: false,
             })
             .collect()
     }

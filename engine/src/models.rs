@@ -154,10 +154,44 @@ pub struct ReviewIssue {
     /// 意见状态："open"（仍存在，AI 可再处理）/ "fixed"（AI 已按此修复，旧记录保留供追溯）
     #[serde(default = "default_issue_status")]
     pub status: String,
+    /// 本条是否为本轮复核「新发现」（对照上一轮意见后新增的）
+    #[serde(default)]
+    pub is_new: bool,
+    /// 引用句是否已无法在当前正文中定位（正文改过 / 模型引用不逐字）
+    #[serde(default)]
+    pub stale: bool,
 }
 
 pub fn default_issue_status() -> String {
     "open".to_string()
+}
+
+/// 引用句能否在当前正文中定位到（忽略空白差异；长引用允许只命中前缀）
+pub fn quote_located(content: &str, quote: &str) -> bool {
+    let q = quote.trim();
+    if q.is_empty() {
+        return true; // 没有引用不算失效
+    }
+    if content.contains(q) {
+        return true;
+    }
+    // 忽略空白差异（草稿保存/换行差异很常见）
+    let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    let (cs, qs) = (strip(content), strip(q));
+    if cs.contains(&qs) {
+        return true;
+    }
+    // 长引文可能被改写了尾部：从长到短尝试前缀（≥8 字能定位即可）
+    let qs_len = qs.chars().count();
+    let mut take = qs_len.min(16);
+    while take >= 8 {
+        let head: String = qs.chars().take(take).collect();
+        if cs.contains(&head) {
+            return true;
+        }
+        take -= 1;
+    }
+    false
 }
 
 /// fixed 意见留档上限：超出时保留最近的 N 条（防止 review_json 无限膨胀）。

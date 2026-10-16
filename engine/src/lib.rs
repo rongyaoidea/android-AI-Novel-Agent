@@ -23,6 +23,8 @@ pub struct Engine {
     pub config: config::AppConfig,
     pub hub: pipeline::EventHub,
     pub secret: Option<crypto::SecretBox>,
+    /// 请求停止中的作品（手动停止：流式生成即断；其它步骤在下一检查点退出）
+    stop_flags: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Engine {
@@ -44,7 +46,28 @@ impl Engine {
             config,
             hub: pipeline::EventHub::new(),
             secret,
+            stop_flags: std::sync::Mutex::new(std::collections::HashSet::new()),
         }))
+    }
+
+    /// 请求停止某本作品的创作（配合 UI「停止」按钮与自动连载开关）
+    pub fn request_stop(&self, novel_id: &str) {
+        if let Ok(mut s) = self.stop_flags.lock() {
+            s.insert(novel_id.to_string());
+        }
+    }
+
+    pub fn stop_requested(&self, novel_id: &str) -> bool {
+        self.stop_flags
+            .lock()
+            .map(|s| s.contains(novel_id))
+            .unwrap_or(false)
+    }
+
+    pub fn clear_stop(&self, novel_id: &str) {
+        if let Ok(mut s) = self.stop_flags.lock() {
+            s.remove(novel_id);
+        }
     }
 
     pub fn auth_token(&self) -> Option<&str> {

@@ -38,6 +38,7 @@
   <symbol id="i-up" viewBox="0 0 24 24"><path d="M6.2 14.5 Q12 8.7 17.8 14.5"/></symbol>
   <symbol id="i-down" viewBox="0 0 24 24"><path d="M6.2 9.5 Q12 15.3 17.8 9.5"/></symbol>
   <symbol id="i-x" viewBox="0 0 24 24"><path d="M6.4 6.7 Q12 11.7 17.6 17.3 M17.4 6.5 Q12.2 11.8 6.3 17.2"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><path d="M7.6 7.1 Q12 6.9 16.4 7.05 Q16.6 12 16.5 16.9 Q12 17.1 7.55 16.95 Q7.4 12 7.6 7.1 Z"/></symbol>
   <symbol id="i-check" viewBox="0 0 24 24"><path d="M5.2 12.7 Q7.9 15.5 9.8 17.5 Q13.6 11.4 18.9 6.7"/></symbol>
   <symbol id="i-refresh" viewBox="0 0 24 24">
     <path d="M19.1 12 a7.2 7.2 0 1 1 -2.5 -5.5"/>
@@ -176,6 +177,7 @@
           <div class="novel-head-actions">
             <input id="novel-target" class="input-sm" type="number" min="1" max="999" title="全书目标章节数（自动连载体以其为准）" />
             <button class="btn btn-primary" id="novel-run">继续创作</button>
+            <button class="btn btn-outline" id="novel-stop" disabled title="停止当前创作：流式生成立即中断，已写章节全部保留"><svg class="ic"><use href="#i-stop"/></svg>停止</button>
             <button class="btn btn-outline" id="novel-auto"><svg class="ic"><use href="#i-refresh"/></svg>自动连载</button>
             <button class="btn btn-outline" id="novel-review-all"><svg class="ic"><use href="#i-check"/></svg>AI 处理全部审校</button>
             <button class="btn btn-outline" id="novel-health"><svg class="ic"><use href="#i-pulse"/></svg>书籍体检</button>

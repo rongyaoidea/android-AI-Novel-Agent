@@ -2283,3 +2283,163 @@ async fn chapter_search_and_novel_meta() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 停止按钮：请求停止进行中的运行 → 运行暂停（已写章节保留）→ 可断点续写
+#[tokio::test]
+async fn stop_novel_interrupts_run_and_can_resume() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-stop-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "停止测试", "chapters": 50}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+
+    // 立刻请求停止；mock 很快时可能来不及命中 running（两种路径都接受，不误报）
+    let mut stopping = false;
+    for _ in 0..600 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/novels/{novel_id}/stop"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_body(resp).await;
+        if v["stopping"].as_bool().unwrap_or(false) {
+            stopping = true;
+            break;
+        }
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        if v["run"]["status"].as_str().unwrap_or("") != "running" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // 等运行落定
+    for _ in 0..900 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        if v["run"]["status"].as_str().unwrap_or("") != "running" {
+            break;
+        }
+    }
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    let status = v["run"]["status"].as_str().unwrap_or("").to_string();
+    assert!(
+        status == "paused" || status == "done",
+        "停止后运行应落定为 paused/done：{v}"
+    );
+    assert!(
+        !v["novel"]["auto_continue"].as_bool().unwrap_or(true),
+        "停止请求应关闭自动连载：{v}"
+    );
+
+    if stopping {
+        assert_eq!(status, "paused", "收到停止请求后运行应为 paused：{v}");
+        assert_eq!(v["run"]["stage"], "stopped", "{v}");
+        let msgs: Vec<String> = engine
+            .hub
+            .history(&novel_id)
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::RunPaused { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("停止")),
+            "应有停止的 RunPaused 提示：{msgs:?}"
+        );
+        let done: i64 = v["chapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["status"] == "done")
+            .count() as i64;
+        assert!(done < 50, "应确实中断而非全部写完：{done}");
+
+        // 断点续写：停止标记已清除，可继续手动创作并正常完成
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/novels/{novel_id}/run"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"chapters": 2}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        wait_run_done(app.clone(), &novel_id).await;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        assert_eq!(v["run"]["status"], "done", "断点续写应正常完成：{v}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

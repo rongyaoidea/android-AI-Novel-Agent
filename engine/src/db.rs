@@ -601,6 +601,49 @@ impl Db {
             params![novel_id, idx, content, status, now()],
         )?;
         Self::reindex_chapter_locked(&conn, novel_id, idx)?;
+        Self::refresh_review_staleness_locked(&conn, novel_id, idx)?;
+        Ok(())
+    }
+
+    /// 正文变化后刷新审校意见引用的有效性（stale = 引用在当前正文中定位不到）。
+    /// 「已修复」条目是历史留档，不参与标记。
+    fn refresh_review_staleness_locked(
+        conn: &Connection,
+        novel_id: &str,
+        idx: i64,
+    ) -> anyhow::Result<()> {
+        let row = conn.query_row(
+            "SELECT content, review_json FROM chapters WHERE novel_id=?1 AND idx=?2",
+            params![novel_id, idx],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        );
+        let (content, raw) = match row {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let Some(raw) = raw else { return Ok(()) };
+        let Ok(mut review) = serde_json::from_str::<Review>(&raw) else {
+            return Ok(());
+        };
+        let mut changed = false;
+        for issue in review.issues.iter_mut() {
+            let stale = if issue.status == "fixed" {
+                false
+            } else {
+                !crate::models::quote_located(&content, &issue.quote)
+            };
+            if issue.stale != stale {
+                issue.stale = stale;
+                changed = true;
+            }
+        }
+        if changed {
+            conn.execute(
+                "UPDATE chapters SET review_json=?3 WHERE novel_id=?1 AND idx=?2",
+                params![novel_id, idx, serde_json::to_string(&review)?],
+            )?;
+        }
         Ok(())
     }
 
@@ -905,6 +948,10 @@ impl Db {
             )?;
         }
         Self::reindex_chapter_locked(&conn, novel_id, idx)?;
+        if content.is_some() {
+            // 手动编辑正文后：刷新审校意见引用有效性
+            Self::refresh_review_staleness_locked(&conn, novel_id, idx)?;
+        }
         Ok(())
     }
 
@@ -1531,6 +1578,8 @@ mod tests {
                 note: format!("fixed-{i}"),
                 quote: String::new(),
                 status: "fixed".into(),
+                is_new: false,
+                stale: false,
             })
             .collect();
         issues.push(ReviewIssue {
@@ -1538,6 +1587,8 @@ mod tests {
             note: "open-1".into(),
             quote: String::new(),
             status: "open".into(),
+            is_new: false,
+            stale: false,
         });
         let mut review = Review { ok: false, issues };
         cap_review_fixed(&mut review, 10);
@@ -1570,6 +1621,8 @@ mod tests {
                     note: format!("f-{i}"),
                     quote: String::new(),
                     status: "fixed".into(),
+                    is_new: false,
+                    stale: false,
                 })
                 .collect(),
         };
@@ -1577,6 +1630,46 @@ mod tests {
         let stored = db.get_chapter(&novel.id, 1).unwrap().unwrap().review_json.unwrap();
         let parsed: Review = serde_json::from_str(&stored).unwrap();
         assert_eq!(parsed.issues.len(), 10, "入库时 fixed 应裁剪到 10 条");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_staleness_refreshes_when_content_changes() {
+        use crate::models::{ChapterPlan, Review, ReviewIssue};
+        let dir = tmp_dir("stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("引用失效测试", "auto", "").unwrap();
+        db.upsert_chapter_plan(
+            &novel.id,
+            &ChapterPlan { idx: 1, title: "第一章".into(), goal: String::new(), beats: vec![] },
+        )
+        .unwrap();
+        db.save_chapter_content(&novel.id, 1, "他把青铜钥匙插进锁孔，轻轻一转。", "done")
+            .unwrap();
+        let review = Review {
+            ok: false,
+            issues: vec![ReviewIssue {
+                severity: "medium".into(),
+                note: "节奏".into(),
+                quote: "把青铜钥匙插进锁孔".into(),
+                status: "open".into(),
+                is_new: false,
+                stale: false,
+            }],
+        };
+        db.save_chapter_review(&novel.id, 1, &review).unwrap();
+        // 保存正文（同内容）不改变标记
+        db.save_chapter_content(&novel.id, 1, "他把青铜钥匙插进锁孔，轻轻一转。", "done")
+            .unwrap();
+        let stored = db.get_chapter(&novel.id, 1).unwrap().unwrap().review_json.unwrap();
+        let parsed: Review = serde_json::from_str(&stored).unwrap();
+        assert!(!parsed.issues[0].stale, "引用仍能定位，不应标记");
+        // 手动改正文 → 引用失效，自动标记 stale
+        db.save_chapter_edit(&novel.id, 1, Some("窗外雨停了。"), None).unwrap();
+        let stored = db.get_chapter(&novel.id, 1).unwrap().unwrap().review_json.unwrap();
+        let parsed: Review = serde_json::from_str(&stored).unwrap();
+        assert!(parsed.issues[0].stale, "引用对不上后应标记 stale");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

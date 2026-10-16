@@ -130,6 +130,8 @@ const STAGE_LABEL = {
   extract: "资料整理",
   auto: "自动连载",
   budget: "预算护栏",
+  stop: "正在停止",
+  stopped: "已停止",
   done: "全部完成",
   failed: "已中断",
 };
@@ -630,10 +632,16 @@ function renderNovel() {
 
   const running = !!(run && run.status === "running");
   const paused = !!(run && run.status === "paused");
+  const stopped = paused && run.stage === "stopped";
+  const awaiting = paused && !stopped;
   const runBtn = $("#novel-run");
   runBtn.disabled = running;
-  runBtn.textContent = running ? "创作中…" : paused ? "确认并继续" : "继续创作";
-  runBtn.classList.toggle("attention", paused);
+  runBtn.textContent = running ? "创作中…" : awaiting ? "确认并继续" : "继续创作";
+  runBtn.classList.toggle("attention", awaiting);
+
+  // 停止按钮：仅创作运行时可用
+  const stopBtn = $("#novel-stop");
+  if (stopBtn) stopBtn.disabled = !running;
 
   // 自动连载按钮：连载中显示「停止连载」
   const autoBtn = $("#novel-auto");
@@ -655,7 +663,7 @@ function renderNovel() {
   const done = chs.filter((c) => c.status === "done").length;
   const pct = target > 0 ? Math.min(100, Math.round((done / target) * 100)) : 0;
   $("#run-chips").innerHTML = [
-    run ? `<span class="chip ${run.status === "failed" ? "chip-danger" : run.status === "paused" ? "chip-warning" : run.status === "done" ? "chip-success" : "chip-info"}">${esc(RUN_STATUS[run.status] || run.status)}</span>` : `<span class="chip">尚未运行</span>`,
+    run ? `<span class="chip ${run.status === "failed" ? "chip-danger" : paused ? "chip-warning" : run.status === "done" ? "chip-success" : "chip-info"}">${esc(stopped ? "已停止" : RUN_STATUS[run.status] || run.status)}</span>` : `<span class="chip">尚未运行</span>`,
     `<span class="chip">进度 ${done}/${target} 章</span>`,
     run ? `<span class="chip">当前阶段：${esc(STAGE_LABEL[run.stage] || run.stage)}</span>` : "",
   ].join("");
@@ -663,13 +671,15 @@ function renderNovel() {
   $("#run-progress").classList.toggle("running", running);
   $("#run-note").textContent = run && run.error
     ? "已中断：" + run.error
-    : paused
+    : awaiting
       ? "已暂停：章节规划已生成。到下方「章节」里检查/修改章纲，然后点「确认并继续」开始写正文。"
-      : running
-        ? "AI 正在按「立项 → 规划 → 正文 → 审校」推进，可离开本页，任务在后台继续。"
-        : run && run.status === "done"
-          ? `最近一次运行已完成，共 ${done} 章。`
-          : "点击「继续创作」开始或推进本书。";
+      : stopped
+        ? "已停止：上次创作被手动停止，已写章节全部保留。点「继续创作」可随时断点续写。"
+        : running
+          ? "AI 正在按「立项 → 规划 → 正文 → 审校」推进，可离开本页，任务在后台继续；点「停止」可中断（已写章节保留）。"
+          : run && run.status === "done"
+            ? `最近一次运行已完成，共 ${done} 章。`
+            : "点击「继续创作」开始或推进本书。";
 
   // 步骤条
   $("#novel-steps").innerHTML = computeSteps(data).map((s, i) => `
@@ -1122,9 +1132,27 @@ function bindNovel() {
       $("#novel-run").disabled = true;
       $("#novel-run").textContent = "创作中…";
       $("#novel-run").classList.remove("attention");
+      const stopBtn = $("#novel-stop");
+      if (stopBtn) stopBtn.disabled = false;
     } catch (err) {
       toast(err.message, true);
       refreshNovel();
+    }
+  };
+  $("#novel-stop").onclick = async () => {
+    const btn = $("#novel-stop");
+    btn.disabled = true;
+    try {
+      const r = await apiSend(`/api/novels/${state.novelId}/stop`, "POST");
+      toast(
+        r.stopping
+          ? "已请求停止：生成随即将中断，已写章节全部保留"
+          : "当前没有进行中的创作（已关闭自动连载）",
+      );
+      await refreshNovel();
+    } catch (err) {
+      toast(err.message, true);
+      btn.disabled = false;
     }
   };
   $("#novel-delete").onclick = async () => {
@@ -1322,7 +1350,14 @@ function renderReviewChips(raw) {
   const openChips = open
     .map((it, i) => {
       const cls = it.severity === "high" ? "chip-danger" : it.severity === "medium" ? "chip-warning" : "";
-      return `<span class="chip chip-filter ${cls}" data-fix="${i}" title="仍存在：点击可按这条意见再修一次">${ic("i-flag")}${esc(it.note || it.severity)}</span>`;
+      const tags = [];
+      if (it.is_new) tags.push("新发现");
+      if (it.stale) tags.push("引用已变");
+      const prefix = tags.length ? `${tags.join("·")}：` : "";
+      const title = it.stale
+        ? `${it.is_new ? "复核新发现。" : "仍存在。"}此意见引用的原文与当前正文对不上（稿子改过或模型引用不逐字）：点击会尽力重新定位；定位失败可先「重新审校」。${it.quote ? `引用：${it.quote}` : ""}`
+        : `${it.is_new ? "复核新发现（上一轮没有这条）。" : "仍存在。"}点击可按这条意见再修一次。${it.quote ? `引用：${it.quote}` : ""}`;
+      return `<span class="chip chip-filter ${cls}${it.stale ? " chip-stale" : ""}" data-fix="${i}" title="${esc(title)}">${ic("i-flag")}${esc(prefix + (it.note || it.severity))}</span>`;
     })
     .join("");
   const fixedChips = fixed
@@ -1549,23 +1584,76 @@ function applyPolish() {
 }
 
 /** 按一条审校意见直接修文（优先定位意见引用的原文片段） */
+/** 在正文中定位引文：精确 → 去掉首尾引号 → 忽略空白差异 → 前缀（引文尾部被改写） */
+function locateQuote(value, quote) {
+  const raw = (quote || "").trim();
+  if (!raw) return null;
+  const cands = [
+    raw,
+    raw.replace(/^[「『“"'（(【\[]+/, "").replace(/[」』”"'）)】\]]+$/, ""),
+  ].filter((q) => q && q.length >= 4);
+  // 精确匹配
+  for (const q of cands) {
+    const pos = value.indexOf(q);
+    if (pos >= 0) return { start: pos, end: pos + q.length, exact: true };
+  }
+  // 忽略空白差异 + 前缀匹配：建立「非空白字符 → 原文下标」映射
+  const chars = [];
+  const idx = [];
+  for (let i = 0; i < value.length; i++) {
+    if (!/\s/.test(value[i])) {
+      chars.push(value[i]);
+      idx.push(i);
+    }
+  }
+  const vnorm = chars.join("");
+  const qnorm = (s) => s.replace(/\s+/g, "");
+  for (const q of cands) {
+    const qn = qnorm(q);
+    if (qn.length < 4) continue;
+    let p = vnorm.indexOf(qn);
+    let take = qn.length;
+    if (p < 0) {
+      for (let len = Math.min(qn.length, 16); len >= 8; len -= 2) {
+        p = vnorm.indexOf(qn.slice(0, len));
+        if (p >= 0) {
+          take = len;
+          break;
+        }
+      }
+    }
+    if (p < 0) continue;
+    const start = idx[p];
+    const end = idx[Math.min(p + take - 1, idx.length - 1)] + 1;
+    return { start, end, exact: false };
+  }
+  return null;
+}
+
+/** 按一条审校意见直接修文（优先定位意见引用的原文片段；引用失效时尽力重新定位） */
 async function fixIssue(issue) {
   const ta = $("#reader-content");
   let start = ta.selectionStart;
   let end = ta.selectionEnd;
   let text = ta.value.slice(start, end).trim();
   if (text.length < 8 && issue.quote) {
-    const pos = ta.value.indexOf(issue.quote);
-    if (pos >= 0) {
-      start = pos;
-      end = pos + issue.quote.length;
-      text = issue.quote;
+    const hit = locateQuote(ta.value, issue.quote);
+    if (hit) {
+      start = hit.start;
+      end = hit.end;
+      text = ta.value.slice(start, end).trim();
       ta.focus();
       ta.setSelectionRange(start, end);
+      if (!hit.exact) toast("引文与原文有出入，已自动定位到最接近的段落");
     }
   }
   if (text.length < 8) {
-    toast("没有定位到对应原文，请手动选中要修的段落", true);
+    toast(
+      issue.stale
+        ? "这条意见引用的原文已对不上当前正文：可先「重新审校」刷新意见，或手动选中相关段落再修"
+        : "没有定位到对应原文，请手动选中要修的段落",
+      true,
+    );
     return;
   }
   const idx = parseInt(ta.dataset.idx || "0", 10);

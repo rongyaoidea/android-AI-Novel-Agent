@@ -104,6 +104,12 @@ fn maybe_chain_auto(engine: &Arc<Engine>, novel_id: &str) -> anyhow::Result<()> 
     let Some(novel) = engine.db.get_novel(novel_id)? else {
         return Ok(());
     };
+    // 手动停止：不启动下一批（并清掉标记，避免影响之后的手动「继续创作」）
+    if engine.stop_requested(novel_id) {
+        engine.clear_stop(novel_id);
+        engine.db.set_novel_auto_continue(novel_id, false)?;
+        return Ok(());
+    }
     if !novel.auto_continue {
         return Ok(());
     }
@@ -156,10 +162,45 @@ fn maybe_chain_auto(engine: &Arc<Engine>, novel_id: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// 等待「手动停止」信号（250ms 轮询；与流式生成共享 select，实现中途中断）
+async fn wait_for_stop(engine: &Arc<Engine>, novel_id: &str) {
+    loop {
+        if engine.stop_requested(novel_id) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// 手动停止的统一收尾：清标记 + 运行置 paused（stage=stopped）+ 推 RunPaused 事件
+fn pause_for_stop(
+    engine: &Arc<Engine>,
+    novel_id: &str,
+    run_id: &str,
+    cursor: i64,
+    message: Option<String>,
+) -> anyhow::Result<()> {
+    engine.clear_stop(novel_id);
+    engine
+        .db
+        .update_run(run_id, "paused", "stopped", cursor.max(0), None)?;
+    engine.hub.publish(novel_id, EngineEvent::RunPaused {
+        run_id: run_id.to_string(),
+        novel_id: novel_id.to_string(),
+        message: message.unwrap_or_else(|| {
+            "已按你的请求停止创作；已写章节全部保留，点「继续创作」可随时续写".to_string()
+        }),
+    });
+    Ok(())
+}
+
 /// 创建一次运行并在后台执行；立即返回 run_id。
 /// 断点续跑：重复调用同一 novel 时，已完成的章节会跳过。
 pub fn spawn(engine: Arc<Engine>, novel_id: &str, chapters: i64) -> anyhow::Result<String> {    let run = engine.db.create_run(novel_id, chapters)?;
     let run_id = run.id.clone();
+    // 手动停止标记在这里同步清除（任务启动前）：避免刚创建就被上一轮的残留标记误停，
+    // 同时保证「创建之后到达的停止请求」一定生效（不会被任务启动时清掉）。
+    engine.clear_stop(novel_id);
     engine.db.set_novel_status(novel_id, "writing")?;
     engine.hub.publish(novel_id, EngineEvent::RunStarted {
         run_id: run_id.clone(),
@@ -352,6 +393,11 @@ async fn run_inner(
             // 作品已被删除：静默结束本次运行
             return Ok(());
         }
+        // 手动停止：在章与章之间退出（已写章节全部保留）
+        if engine.stop_requested(novel_id) {
+            pause_for_stop(&engine, novel_id, run_id, idx - 1, None)?;
+            return Ok(());
+        }
         // 预算护栏：超限则优雅收尾（已写章节保留；自动连载由收尾逻辑关闭）
         {
             let pipeline_settings = engine.db.pipeline_settings().unwrap_or_default();
@@ -446,12 +492,13 @@ async fn run_inner(
             &ov,
         );
         // 流式输出按 ~80 字聚合后再推送；空内容自动重试一次（章节级自愈）
+        // 与「停止」信号共享 select：手动停止时立即中断流式生成
         let mut content = String::new();
         for attempt in 1..=2u8 {
             let mut buf = String::new();
             let hub = engine.hub.clone();
-            let streamed = llm
-                .stream(&sys, &usr, |delta: &str| {
+            let streamed = tokio::select! {
+                r = llm.stream(&sys, &usr, |delta: &str| {
                     buf.push_str(delta);
                     if buf.chars().count() >= 80 {
                         let chunk = std::mem::take(&mut buf);
@@ -463,8 +510,20 @@ async fn run_inner(
                             },
                         );
                     }
-                })
-                .await?;
+                }) => r?,
+                _ = wait_for_stop(&engine, novel_id) => {
+                    pause_for_stop(
+                        &engine,
+                        novel_id,
+                        run_id,
+                        idx - 1,
+                        Some(format!(
+                            "已停止：第 {idx} 章写到一半被手动中止（本章草稿未保存），已写章节保留"
+                        )),
+                    )?;
+                    return Ok(());
+                }
+            };
             record_usage(
                 &engine.db,
                 Some(novel_id),
@@ -515,8 +574,8 @@ async fn run_inner(
                 );
                 let mut buf2 = String::new();
                 let hub2 = engine.hub.clone();
-                let streamed2 = llm
-                    .stream(&sys, &usr_retry, |delta: &str| {
+                let streamed2 = tokio::select! {
+                    r = llm.stream(&sys, &usr_retry, |delta: &str| {
                         buf2.push_str(delta);
                         if buf2.chars().count() >= 80 {
                             let chunk = std::mem::take(&mut buf2);
@@ -525,8 +584,20 @@ async fn run_inner(
                                 delta: chunk,
                             });
                         }
-                    })
-                    .await?;
+                    }) => r?,
+                    _ = wait_for_stop(&engine, novel_id) => {
+                        pause_for_stop(
+                            &engine,
+                            novel_id,
+                            run_id,
+                            idx - 1,
+                            Some(format!(
+                                "已停止：第 {idx} 章重写中被手动中止，已写章节保留"
+                            )),
+                        )?;
+                        return Ok(());
+                    }
+                };
                 record_usage(
                     &engine.db,
                     Some(novel_id),
@@ -915,11 +986,15 @@ pub async fn review_and_fix_chapter(
                                         note: str_field(it, "note", ""),
                                         quote: str_field(it, "quote", ""),
                                         status: "open".to_string(),
+                                        is_new: false,
+                                        stale: false,
                                     })
                                     .collect()
                             })
                             .unwrap_or_default(),
                     };
+                    // 校验引用可定位性：模型引用不逐字 / 稿子改动后，标记 stale（UI 会提示）
+                    mark_quote_flags(&content, &mut review.issues);
 
                     // ---- 自动修复（减少人工介入）----
                     // 审校出现高/中危问题时：按意见自动修订一次并复核，仅在问题变少时采用新稿。
@@ -932,7 +1007,10 @@ pub async fn review_and_fix_chapter(
                         .filter(|n| !n.is_empty())
                         .take(6)
                         .collect();
-                    if pipeline_settings.auto_fix_review && !fixable.is_empty() {
+                    if pipeline_settings.auto_fix_review
+                        && !fixable.is_empty()
+                        && !engine.stop_requested(novel_id)
+                    {
                         engine.hub.publish(novel_id, EngineEvent::Stage {
                             stage: "autofix".into(),
                             message: format!(
@@ -990,6 +1068,8 @@ pub async fn review_and_fix_chapter(
                                                                         it, "quote", "",
                                                                     ),
                                                                     status: "open".to_string(),
+                                                                    is_new: false,
+                                                                    stale: false,
                                                                 })
                                                                 .collect()
                                                         })
@@ -1011,8 +1091,10 @@ pub async fn review_and_fix_chapter(
                                         let before = review.issues.len();
                                         let previous_issues = review.issues.clone();
                                         content = fixed;
-                                        // 状态化合并：不再出现的旧意见标记为 fixed，新意见为 open
-                                        let latest = rechecked.unwrap_or_default();
+                                        // 状态化合并：模糊匹配同名意见（不产生重复条目），
+                                        // 不再出现的旧意见标记 fixed，多出来的标记「新发现」
+                                        let mut latest = rechecked.unwrap_or_default();
+                                        mark_quote_flags(&content, &mut latest);
                                         review.issues =
                                             merge_issue_statuses(&previous_issues, &latest);
                                         let open_left =
@@ -1047,7 +1129,8 @@ pub async fn review_and_fix_chapter(
                                         engine.hub.publish(novel_id, EngineEvent::Stage {
                                             stage: "autofix".into(),
                                             message: format!(
-                                                "第 {idx} 章自动修复未改善，保留原稿"
+                                                "第 {idx} 章自动修复未比原稿更好，保留原稿（仍存在 {} 条意见，可打开章节逐条处理或点「重新审校」）",
+                                                review.issues.iter().filter(|i| i.status != "fixed").count()
                                             ),
                                         });
                                     }
@@ -1099,43 +1182,103 @@ fn medium_high_count(review: &Review) -> usize {
 }
 
 /// 汇总审校意见状态（旧 → 新）：
-/// - 旧意见仍出现在新列表 → open（采用新表述）
+/// - 旧意见在「新列表」里找到同义条目（模糊匹配：文案高相似 / 互相包含 / 引用互含）→ open（采用新表述，不产生重复条目）
 /// - 旧意见不再出现 → fixed（保留旧文案，供追溯「已修复了什么」）
-/// - 新列表中新增的意见 → open
+/// - 新列表中多出来的意见 → open 且标记 is_new（「新发现」）
 /// - 旧列表里已是 fixed 的条目继续保留
 pub fn merge_issue_statuses(previous: &[ReviewIssue], latest: &[ReviewIssue]) -> Vec<ReviewIssue> {
-    let norm = |s: &str| -> String {
-        s.chars()
-            .filter(|c| !c.is_whitespace())
-            .take(24)
-            .collect()
-    };
     let mut out: Vec<ReviewIssue> = Vec::new();
+    let mut matched: Vec<bool> = vec![false; latest.len()];
     for p in previous {
         if p.status == "fixed" {
             out.push(p.clone());
             continue;
         }
-        match latest.iter().find(|l| norm(&l.note) == norm(&p.note)) {
-            Some(l) => out.push(ReviewIssue {
-                status: "open".into(),
-                ..l.clone()
-            }),
+        let hit = latest
+            .iter()
+            .enumerate()
+            .find(|(i, l)| !matched[*i] && issues_match(p, l));
+        match hit {
+            Some((i, l)) => {
+                matched[i] = true;
+                out.push(ReviewIssue {
+                    status: "open".into(),
+                    is_new: false,
+                    ..l.clone()
+                });
+            }
             None => out.push(ReviewIssue {
                 status: "fixed".into(),
                 ..p.clone()
             }),
         }
     }
-    for l in latest {
-        if !previous.iter().any(|p| norm(&p.note) == norm(&l.note)) {
+    for (i, l) in latest.iter().enumerate() {
+        if !matched[i] {
             out.push(ReviewIssue {
                 status: "open".into(),
+                is_new: true,
                 ..l.clone()
             });
         }
     }
     out
+}
+
+/// 两条意见是否指向同一问题：文案相似 / 互相包含 / 引用互相包含
+fn issues_match(prev: &ReviewIssue, latest: &ReviewIssue) -> bool {
+    if notes_similar(&prev.note, &latest.note) {
+        return true;
+    }
+    let (pq, lq) = (prev.quote.trim(), latest.quote.trim());
+    if !pq.is_empty() && !lq.is_empty() {
+        if pq == lq {
+            return true;
+        }
+        let (long, short) = if pq.chars().count() >= lq.chars().count() {
+            (pq, lq)
+        } else {
+            (lq, pq)
+        };
+        if short.chars().count() >= 6 && long.contains(short) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 意见文案相似：完全相同 / 一方包含另一方（≥8 字） / 字符二元组 Jaccard ≥ 0.6（≥6 字）
+fn notes_similar(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let (long, short) = if a.chars().count() >= b.chars().count() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    if short.chars().count() >= 8 && long.contains(short) {
+        return true;
+    }
+    if a.chars().count() < 6 || b.chars().count() < 6 {
+        return false;
+    }
+    goal_similarity(a, b) >= 0.6
+}
+
+/// 校验并标记意见引用的可定位性（stale = 引用在当前正文中找不到）
+pub fn mark_quote_flags(content: &str, issues: &mut [ReviewIssue]) {
+    for i in issues.iter_mut() {
+        if i.status == "fixed" {
+            i.stale = false;
+            continue;
+        }
+        i.stale = !crate::models::quote_located(content, &i.quote);
+    }
 }
 
 /// 伏笔自动审核：用章节摘要批量判断哪些未回收伏笔已被后文实质回收，自动标记。
@@ -1329,6 +1472,8 @@ mod tests {
             note: note.into(),
             quote: String::new(),
             status: status.into(),
+            is_new: false,
+            stale: false,
         }
     }
 
@@ -1371,6 +1516,75 @@ mod tests {
         assert!(merged.iter().all(|i| i.status == "fixed"));
         assert!(merged.iter().any(|i| i.note == "旧问题A"));
         assert!(merged.iter().any(|i| i.note == "旧问题B"));
+    }
+
+    #[test]
+    fn merge_matches_rephrased_issue_without_duplicates() {
+        // 复核用不同措辞描述同一个问题：应归并成一条 open，不应出现「已修复 + 新发现」双条
+        let previous = vec![issue(
+            "medium",
+            "第3章与第7章的时间线冲突：主角同日出现在两地",
+            "open",
+        )];
+        let latest = vec![issue(
+            "medium",
+            "时间线冲突：主角在第3章与第7章同日出现在两地",
+            "open",
+        )];
+        let merged = merge_issue_statuses(&previous, &latest);
+        assert_eq!(merged.len(), 1, "同义意见应归并：{merged:?}");
+        assert_eq!(merged[0].status, "open");
+        assert!(!merged[0].is_new, "归并命中的不是新发现");
+        // 完全新增的意见 → open + is_new
+        let latest2 = vec![issue(
+            "low",
+            "反复使用“不由得”这个词，口头禅重复",
+            "open",
+        )];
+        let merged2 = merge_issue_statuses(&previous, &latest2);
+        assert_eq!(merged2.len(), 2, "{merged2:?}");
+        assert!(merged2.iter().any(|i| i.note.contains("不由得") && i.is_new));
+        assert!(merged2.iter().any(|i| i.note.contains("时间线") && i.status == "fixed"));
+    }
+
+    #[test]
+    fn quote_located_and_mark_flags() {
+        use crate::models::quote_located;
+        assert!(quote_located("他把钥匙插进锁孔。", "把钥匙插进锁孔"));
+        assert!(quote_located("他把钥匙 插进锁孔。", "把钥匙插进锁孔"), "忽略空白差异");
+        // 长引用被改写尾部：前缀能定位
+        assert!(quote_located(
+            "他把青铜钥匙插进锁孔，轻轻一转。",
+            "他把青铜钥匙插进锁孔，用力一转"
+        ));
+        assert!(!quote_located("他把钥匙插进锁孔。", "窗外的雨停了"));
+
+        let mut issues = vec![
+            issue("medium", "节奏问题", "open"),
+            issue("low", "已修复的旧条", "fixed"),
+        ];
+        issues[0].quote = "不存在的引文".into();
+        issues[1].quote = "同样不存在的引文".into();
+        mark_quote_flags("他把钥匙插进锁孔。", &mut issues);
+        assert!(issues[0].stale, "引用对不上正文应标记 stale");
+        assert!(!issues[1].stale, "已修复条目不参与 stale 标记");
+        let mut ok_issue = vec![issue("low", "可定位", "open")];
+        ok_issue[0].quote = "把钥匙".into();
+        mark_quote_flags("他把钥匙插进锁孔。", &mut ok_issue);
+        assert!(!ok_issue[0].stale);
+    }
+
+    #[test]
+    fn stop_flags_roundtrip() {
+        let dir = tmp_dir("stop");
+        let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+        let id = "novel-x";
+        assert!(!engine.stop_requested(id));
+        engine.request_stop(id);
+        assert!(engine.stop_requested(id));
+        engine.clear_stop(id);
+        assert!(!engine.stop_requested(id));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

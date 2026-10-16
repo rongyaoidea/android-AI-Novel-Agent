@@ -110,6 +110,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/novels", get(list_novels).post(create_novel))
         .route("/api/novels/:id", get(get_novel).patch(patch_novel).delete(delete_novel))
         .route("/api/novels/:id/search", get(search_novel))
+        .route("/api/novels/:id/stop", post(stop_novel))
         .route("/api/novels/:id/chapters", post(insert_chapter))
         .route(
             "/api/novels/:id/chapters/:idx",
@@ -450,6 +451,28 @@ async fn search_novel(
     Ok(Json(json!({"items": items})))
 }
 
+/// 停止创作：中断进行中的运行（流式生成即断；其它步骤在下一检查点退出），并关闭自动连载。
+/// 已写章节全部保留；之后点「继续创作」可断点续写。
+async fn stop_novel(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    let running = matches!(e.db.latest_run(&id).map_err(err)?, Some(r) if r.status == "running");
+    // 先关自动连载（即使当前批次很快写完，也不会再续下一批）
+    e.db.set_novel_auto_continue(&id, false).map_err(err)?;
+    if running {
+        e.request_stop(&id);
+        e.hub.publish(&id, pipeline::EngineEvent::Stage {
+            stage: "stop".into(),
+            message: "收到停止请求：正在中断当前生成…".into(),
+        });
+    }
+    Ok(Json(json!({"ok": true, "stopping": running})))
+}
+
 #[derive(Deserialize)]
 struct PatchNovelBody {
     #[serde(default)]
@@ -768,7 +791,7 @@ async fn review_chapter(
     let v = crate::llm::extract_json_object(&raw).ok_or_else(|| {
         (StatusCode::INTERNAL_SERVER_ERROR, "复核输出不是 JSON".to_string())
     })?;
-    let new_issues: Vec<crate::models::ReviewIssue> = v["issues"]
+    let mut new_issues: Vec<crate::models::ReviewIssue> = v["issues"]
         .as_array()
         .map(|a| {
             a.iter()
@@ -777,10 +800,14 @@ async fn review_chapter(
                     note: it["note"].as_str().unwrap_or("").to_string(),
                     quote: it["quote"].as_str().unwrap_or("").to_string(),
                     status: "open".to_string(),
+                    is_new: false,
+                    stale: false,
                 })
                 .collect()
         })
         .unwrap_or_default();
+    // 校验引用可定位性（对当前正文），供 UI 提示「引用已变化」
+    pipeline::mark_quote_flags(&ch.content, &mut new_issues);
     // 与上次审校对比：不再出现的旧意见标记为 fixed（保留记录供追溯），新意见为 open
     let previous_issues: Vec<crate::models::ReviewIssue> = ch
         .review_json
