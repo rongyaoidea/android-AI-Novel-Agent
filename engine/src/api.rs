@@ -106,6 +106,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/settings/llm", get(get_llm).put(put_llm))
         .route("/api/settings/llm/test", post(test_llm))
         .route("/api/settings/llm/models", post(list_llm_models))
+        .route("/api/settings/pipeline", get(get_pipeline).put(put_pipeline))
         .route("/api/novels", get(list_novels).post(create_novel))
         .route("/api/novels/:id", get(get_novel).patch(patch_novel).delete(delete_novel))
         .route("/api/novels/:id/chapters", post(insert_chapter))
@@ -318,6 +319,20 @@ async fn list_llm_models(
         Ok(models) => Ok(Json(json!({"ok": true, "models": models}))),
         Err(e2) => Ok(Json(json!({"ok": false, "message": format!("{e2}")}))),
     }
+}
+
+/// 写作流水线偏好（自动修复审校问题等）
+async fn get_pipeline(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, ApiErr> {
+    let s = e.db.pipeline_settings().map_err(err)?;
+    Ok(Json(serde_json::to_value(s).map_err(err)?))
+}
+
+async fn put_pipeline(
+    State(e): State<Arc<Engine>>,
+    Json(s): Json<crate::models::PipelineSettings>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    e.db.set_pipeline_settings(&s).map_err(err)?;
+    Ok(Json(json!({"ok": true})))
 }
 
 // ---------- 小说 ----------

@@ -32,6 +32,9 @@ const state = {
   promptTask: null,
   shelfSort: "updated",
   shelfQuery: "",
+  liveStage: null,
+  stageSince: null,
+  stageTimer: null,
 };
 
 /* ---------------- 工具 ---------------- */
@@ -123,6 +126,8 @@ const STAGE_LABEL = {
   await_confirm: "待确认",
   draft: "正文生成",
   review: "章节审校",
+  autofix: "自动修复",
+  extract: "资料整理",
   done: "全部完成",
   failed: "已中断",
 };
@@ -532,8 +537,18 @@ function computeSteps(data) {
     { name: "写作章节正文", done: draftDone },
     { name: "审校并保存", done: reviewDone || finished },
   ];
+  // 实时阶段 → 步骤高亮（比落库的 run.stage 更细：review/autofix/extract 都归到第 4 步）
+  const STAGE_TO_STEP = { brief: 0, outline: 1, draft: 2, review: 3, autofix: 3, extract: 3 };
   let activeIdx = -1;
-  if (running || paused) activeIdx = steps.findIndex((s) => !s.done);
+  if (running || paused) {
+    const live = state.liveStage && STAGE_TO_STEP[state.liveStage];
+    activeIdx = live !== undefined && live !== null ? live : steps.findIndex((s) => !s.done);
+    // 已有进度的后续阶段不应倒退：若实时步骤已完成，取第一个未完成
+    if (activeIdx >= 0 && steps[activeIdx].done) {
+      const first = steps.findIndex((s) => !s.done);
+      activeIdx = first === -1 ? activeIdx : first;
+    }
+  }
   return steps.map((s, i) => ({ ...s, state: s.done ? "done" : i === activeIdx ? "active" : "pending" }));
 }
 
@@ -1552,6 +1567,7 @@ function handleEvent(ev) {
       break;
     case "stage":
       novelLog(ev.message);
+      showStageStatus(ev.stage, ev.message);
       break;
     case "token": {
       const pre = $("#stream-pre");
@@ -1581,18 +1597,57 @@ function handleEvent(ev) {
       novelLog(ev.message);
       toast("已暂停：章节规划待确认");
       $("#stream-live").classList.remove("on");
+      hideStageStatus();
       refreshNovel();
       break;
     case "run_finished":
       novelLog("本次运行完成");
       $("#stream-live").classList.remove("on");
+      hideStageStatus();
       refreshNovel();
       break;
     case "run_failed":
       novelLog(`运行失败：${ev.error}`);
       $("#stream-live").classList.remove("on");
+      hideStageStatus();
       refreshNovel();
       break;
+  }
+}
+
+/* ---------------- 全阶段进度指示 ----------------
+ * 正文生成有 token 流可跟随；立项/规划/审校/自动修复/资料整理这些
+ * 「安静阶段」没有增量输出，这里用带秒表的实时状态行给用户可见反馈。
+ */
+function showStageStatus(stage, message) {
+  const box = $("#stream-status");
+  const text = $("#stream-status-text");
+  if (!box || !text) return;
+  state.liveStage = stage;
+  state.stageSince = Date.now();
+  box.hidden = false;
+  text.textContent = `${STAGE_LABEL[stage] || stage} · ${message}`;
+  $("#stream-live").classList.add("on");
+  if (!state.stageTimer) {
+    state.stageTimer = setInterval(() => {
+      const el = $("#stream-status-timer");
+      if (!el || !state.stageSince) return;
+      const secs = Math.round((Date.now() - state.stageSince) / 1000);
+      el.textContent = secs >= 2 ? `已 ${secs}s` : "";
+    }, 1000);
+  }
+  // 步骤条按实时阶段高亮
+  if (parseRoute().kind === "novel") renderNovel();
+}
+
+function hideStageStatus() {
+  const box = $("#stream-status");
+  if (box) box.hidden = true;
+  state.stageSince = null;
+  state.liveStage = null;
+  if (state.stageTimer) {
+    clearInterval(state.stageTimer);
+    state.stageTimer = null;
   }
 }
 
@@ -1794,6 +1849,13 @@ async function loadSettingsForm() {
     const el = $("#prompt-status");
     if (el) el.textContent = "提示词目录加载失败：" + err.message;
   }
+  // 写作偏好（自动修复等）
+  try {
+    const p = await api("/api/settings/pipeline");
+    $("#set-auto-fix").checked = !!p.auto_fix_review;
+  } catch {
+    /* 忽略：保持默认勾选状态 */
+  }
 }
 
 function bindSettings() {
@@ -1903,6 +1965,18 @@ function bindSettings() {
     if (v) {
       $("#set-model").value = v;
       $("#set-status").textContent = `已选择模型：${v}（记得保存）`;
+    }
+  });
+
+  // 写作偏好：审校问题自动修复
+  $("#set-auto-fix").addEventListener("change", async () => {
+    const on = $("#set-auto-fix").checked;
+    try {
+      await apiSend("/api/settings/pipeline", "PUT", { auto_fix_review: on });
+      $("#pipeline-status").textContent = on ? "已开启自动修复" : "已关闭自动修复";
+      setTimeout(() => { $("#pipeline-status").textContent = ""; }, 2500);
+    } catch (err) {
+      $("#pipeline-status").textContent = "保存失败：" + err.message;
     }
   });
 }

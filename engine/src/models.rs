@@ -208,3 +208,18 @@ pub struct UsageGroup {
     #[serde(flatten)]
     pub totals: UsageTotals,
 }
+
+/// 写作流水线偏好（本地保存，随备份迁移）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineSettings {
+    /// 审校出现高/中危问题时自动修复一次（减少人工介入）
+    pub auto_fix_review: bool,
+}
+
+impl Default for PipelineSettings {
+    fn default() -> Self {
+        Self {
+            auto_fix_review: true,
+        }
+    }
+}

@@ -5,6 +5,7 @@ use tower::ServiceExt;
 
 use ainovel_engine::config::AppConfig;
 use ainovel_engine::models::{ChapterPlan, LlmSettings};
+use ainovel_engine::pipeline::EngineEvent;
 use ainovel_engine::{api, Engine};
 
 async fn json_body(resp: axum::response::Response) -> serde_json::Value {
@@ -1604,7 +1605,6 @@ async fn llm_model_list_endpoint() {
         .db
         .set_llm_settings(&LlmSettings::default())
         .unwrap();
-    // mock 默认设置里的 base_url 是 openai 官方地址，先清空再测
     engine
         .db
         .set_llm_settings(&LlmSettings {
@@ -1628,6 +1628,153 @@ async fn llm_model_list_endpoint() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+/// 全阶段事件可见 + 审校自动修复 + 写作偏好开关
+#[tokio::test]
+async fn stage_events_and_auto_fix() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-autofix-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    // 写作偏好：默认开启自动修复
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/api/settings/pipeline").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["auto_fix_review"], true, "默认应开启自动修复: {v}");
+
+    // 跑一章（Mock 审校固定返回 1 条 medium → 触发一次自动修复）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "自动修复测试", "chapters": 1}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let n1 = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    let mut status = String::new();
+    for _ in 0..600 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(format!("/api/novels/{n1}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        status = v["run"]["status"].as_str().unwrap_or("").to_string();
+        if status == "done" {
+            break;
+        }
+        assert_ne!(status, "failed", "run failed: {}", v["run"]["error"]);
+    }
+    assert_eq!(status, "done");
+
+    // 关键阶段事件全部出现在历史（SSE 重连回放同源）
+    let hist = engine.hub.history(&n1);
+    let stages: Vec<String> = hist
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::Stage { stage, .. } => Some(stage.clone()),
+            _ => None,
+        })
+        .collect();
+    for want in ["brief", "outline", "draft", "review", "autofix", "extract"] {
+        assert!(stages.contains(&want.to_string()), "阶段事件 {want} 缺失: {stages:?}");
+    }
+
+    // 自动修复计入用量（每章一次）
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(format!("/api/novels/{n1}/usage")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let u = json_body(resp).await;
+    let calls_of = |v: &serde_json::Value, key: &str| -> i64 {
+        v["by_task"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["key"] == key)
+            .map(|g| g["calls"].as_i64().unwrap_or(0))
+            .unwrap_or(0)
+    };
+    assert_eq!(calls_of(&u, "auto_fix"), 1, "应有一次自动修复调用: {u}");
+
+    // 关掉自动修复：新书不再产生自动修复调用，也不再发出 autofix 阶段事件
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/settings/pipeline")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"auto_fix_review": false}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "关闭自动修复测试", "chapters": 1}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let n2 = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    let mut status2 = String::new();
+    for _ in 0..600 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(Request::builder().uri(format!("/api/novels/{n2}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        status2 = v["run"]["status"].as_str().unwrap_or("").to_string();
+        if status2 == "done" {
+            break;
+        }
+        assert_ne!(status2, "failed");
+    }
+    assert_eq!(status2, "done");
+
+    let hist2 = engine.hub.history(&n2);
+    let has_autofix = hist2.iter().any(|e| matches!(e, EngineEvent::Stage { stage, .. } if stage == "autofix"));
+    assert!(!has_autofix, "关闭后不应出现 autofix 阶段事件");
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(format!("/api/novels/{n2}/usage")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let u2 = json_body(resp).await;
+    assert_eq!(calls_of(&u2, "auto_fix"), 0, "关闭后不应有自动修复调用: {u2}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

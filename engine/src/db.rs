@@ -13,6 +13,7 @@ pub struct Db {
 
 pub const LLM_SETTINGS_KEY: &str = "llm";
 pub const PROMPT_OVERRIDES_KEY: &str = "prompt_overrides";
+pub const PIPELINE_SETTINGS_KEY: &str = "pipeline";
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -228,6 +229,18 @@ impl Db {
 
     pub fn set_prompt_overrides_json(&self, json: &str) -> anyhow::Result<()> {
         self.set_setting(PROMPT_OVERRIDES_KEY, json)
+    }
+
+    /// 写作流水线偏好（解析失败时回退默认值）
+    pub fn pipeline_settings(&self) -> anyhow::Result<PipelineSettings> {
+        Ok(match self.get_setting(PIPELINE_SETTINGS_KEY)? {
+            Some(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+            None => PipelineSettings::default(),
+        })
+    }
+
+    pub fn set_pipeline_settings(&self, s: &PipelineSettings) -> anyhow::Result<()> {
+        self.set_setting(PIPELINE_SETTINGS_KEY, &serde_json::to_string(s)?)
     }
 
     // ---------- novels ----------

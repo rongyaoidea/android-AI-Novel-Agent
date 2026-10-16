@@ -196,6 +196,11 @@
               <h3 class="panel-title">跟随生成 <span class="live-dot" id="stream-live" title="正在接收生成内容"></span></h3>
               <button class="btn btn-outline btn-sm" id="stream-clear">清空</button>
             </div>
+            <div class="stream-status" id="stream-status" hidden>
+              <span class="live-dot on"></span>
+              <span id="stream-status-text">—</span>
+              <span class="muted" id="stream-status-timer"></span>
+            </div>
             <pre class="stream muted" id="stream-pre">等待生成…</pre>
           </div>
           <div class="panel">
@@ -331,6 +336,19 @@
             </optgroup>
           </select>
           <span class="muted" style="font-size:12px;">Base URL 可只填到版本段（如 …/v1）；缺 /v1 会自动尝试补全，并在错误里给出已尝试的端点。</span>
+        </div>
+        <div class="panel" style="max-width:700px;">
+          <div class="panel-head">
+            <h3 class="panel-title">写作偏好</h3>
+            <span class="muted" id="pipeline-status"></span>
+          </div>
+          <label class="check-row" for="set-auto-fix">
+            <input type="checkbox" id="set-auto-fix" />
+            <span>审校问题自动修复：高/中危意见自动修订一次并复核（仅在问题变少时采用），尽量不需要人工介入</span>
+          </label>
+          <p class="muted" style="margin:0;font-size:12px;">
+            伏笔回收与资料整理均为自动：每章写后自动抽取台账；生成每章时会注入「未回收伏笔（含已拖延章数）」，回收后自动标记。
+          </p>
         </div>
         <div class="panel" style="max-width:700px;">
           <div class="panel-head">

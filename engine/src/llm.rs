@@ -606,7 +606,11 @@ fn mock_complete(user: &str) -> anyhow::Result<String> {
     if user.contains("TASK:review") {
         return Ok(serde_json::json!({
             "ok": true,
-            "issues": [{"severity": "info", "note": "模拟审校：未发现硬性缺口。", "quote": ""}]
+            "issues": [{
+                "severity": "medium",
+                "note": "模拟审校：建议微调一处段落节奏，避免匀速推进。",
+                "quote": ""
+            }]
         })
         .to_string());
     }
