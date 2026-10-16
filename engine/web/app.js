@@ -183,6 +183,14 @@ async function route() {
   closeDiff();
   closeForm();
   closeGen();
+  // 记住路由：Android 壳在 Activity 重建后会按此恢复页面（不至于跳回书架）
+  try {
+    if (window.AiNovelNative && typeof window.AiNovelNative.setRoute === "function") {
+      window.AiNovelNative.setRoute(location.hash || "#/shelf");
+    }
+  } catch {
+    /* 忽略：非安卓环境 */
+  }
 
   const r = parseRoute();
   const activeNav = r.kind === "novel" ? "#/shelf" : r.path;
@@ -211,7 +219,16 @@ async function route() {
   if (r.path === "#/create") await renderCreate();
   if (r.path === "#/runs") {
     await loadRuns();
-    state.pollTimer = setInterval(() => loadRuns().catch(() => {}), 5000);
+    // 期间可能已切走：不遗留孤儿轮询（间隔内再自查一次，双保险）
+    if (parseRoute().path !== "#/runs") return;
+    state.pollTimer = setInterval(() => {
+      if (parseRoute().path !== "#/runs") {
+        clearInterval(state.pollTimer);
+        state.pollTimer = null;
+        return;
+      }
+      loadRuns().catch(() => {});
+    }, 5000);
   }
   if (r.path === "#/settings") await loadSettingsForm();
 }
@@ -308,7 +325,7 @@ function renderShelf() {
       <div class="row">
         <button class="btn btn-primary btn-sm" data-act="open">进入工作台</button>
         <button class="btn btn-outline btn-sm" data-act="outline"><svg class="ic"><use href="#i-book"/></svg>总纲</button>
-        <a class="btn btn-outline btn-sm" data-act="export" href="/api/novels/${esc(n.id)}/export">导出 TXT</a>
+        <a class="btn btn-outline btn-sm" data-act="export" href="${esc(withToken(`/api/novels/${n.id}/export`))}">导出 TXT</a>
         <button class="btn btn-ghost btn-sm btn-danger" data-act="delete">删除</button>
       </div>
     </article>`;
@@ -615,6 +632,18 @@ function renderNovel() {
   const chs = data.chapters || [];
   const run = data.run;
 
+  // 切换作品时清掉上一本书的检索词与结果（避免显示错书的命中）
+  if (state.renderedNovelId !== n.id) {
+    state.renderedNovelId = n.id;
+    const searchInput = $("#chapter-search");
+    const searchBox = $("#chapter-search-results");
+    if (searchInput) searchInput.value = "";
+    if (searchBox) {
+      searchBox.hidden = true;
+      searchBox.innerHTML = "";
+    }
+  }
+
   $("#novel-title").textContent = (n.title && n.title.trim()) || "（未命名）";
   $("#novel-chips").innerHTML = [
     n.genre ? `<span class="chip">${esc(n.genre)}</span>` : "",
@@ -712,20 +741,22 @@ function renderTab() {
 /** 头部概览：未回收伏笔数（提示用）+ AI 审校处理量（只报"已处理多少"，不报待办） */
 async function refreshInsights() {
   if (!state.novelId) return;
+  const wantId = state.novelId;
   let openF = 0;
   try {
-    const f = await api(`/api/novels/${state.novelId}/foreshadowings`);
+    const f = await api(`/api/novels/${wantId}/foreshadowings`);
+    if (state.novelId !== wantId) return;
     state.foreshadowings = f.items || [];
     openF = state.foreshadowings.filter((x) => x.status === "open").length;
   } catch { /* 忽略 */ }
   let fixCalls = 0;
   try {
-    const u = await api(`/api/novels/${state.novelId}/usage`);
+    const u = await api(`/api/novels/${wantId}/usage`);
     fixCalls = (u.by_task || [])
       .filter((g) => g.key === "auto_fix")
       .reduce((sum, g) => sum + (g.calls || 0), 0);
   } catch { /* 忽略 */ }
-  if (parseRoute().kind !== "novel") return;
+  if (parseRoute().kind !== "novel" || state.novelId !== wantId) return;
   const reviewed = (state.novel?.chapters || []).filter((c) => c.review).length;
   const el = $("#novel-insights");
   if (!el) return;
@@ -918,6 +949,7 @@ function bindNovel() {
   const searchBox = $("#chapter-search-results");
   if (searchInput && searchBox) {
     let timer = null;
+    let seq = 0;
     searchInput.addEventListener("input", () => {
       clearTimeout(timer);
       const q = searchInput.value.trim();
@@ -926,9 +958,13 @@ function bindNovel() {
         searchBox.innerHTML = "";
         return;
       }
+      const wantNovel = state.novelId;
+      const mySeq = ++seq;
       timer = setTimeout(async () => {
         try {
-          const r = await api(`/api/novels/${state.novelId}/search?q=${encodeURIComponent(q)}`);
+          const r = await api(`/api/novels/${wantNovel}/search?q=${encodeURIComponent(q)}`);
+          // 只接受「最后一次输入」且仍在本作品页时的响应（慢请求不覆盖新结果）
+          if (mySeq !== seq || state.novelId !== wantNovel) return;
           const items = r.items || [];
           searchBox.hidden = false;
           searchBox.innerHTML = items.length
@@ -1301,7 +1337,11 @@ async function copyChapter(idx) {
 }
 
 async function openEditor(idx) {
-  const c = await api(`/api/novels/${state.novelId}/chapters/${idx}`);
+  const seq = (state.editorSeq = (state.editorSeq || 0) + 1);
+  const wantNovel = state.novelId;
+  const c = await api(`/api/novels/${wantNovel}/chapters/${idx}`);
+  // 请求飞行中又点了别的章节/切了作品：丢弃这次结果（避免显示错章）
+  if (state.editorSeq !== seq || state.novelId !== wantNovel) return;
   $("#reader-title").textContent = `第${c.idx}章 ${c.title || ""}`;
   renderReviewChips(c.review);
   renderStyleReport(c.style_report);
@@ -1407,8 +1447,8 @@ function renderStyleReport(report) {
     (failed.length ? `<span class="chip chip-filter" data-styledetail="1" title="点击查看细节">细节</span>` : "");
 }
 
-function draftKey(idx) {
-  return `ainovel.draft.${state.novelId}.${idx}`;
+function draftKey(idx, novelId = state.novelId) {
+  return `ainovel.draft.${novelId}.${idx}`;
 }
 
 function closeReader() {
@@ -1421,11 +1461,18 @@ async function saveChapter(silent = false) {
   const ta = $("#reader-content");
   const idx = parseInt(ta.dataset.idx || "0", 10);
   if (!idx) return false;
+  const sent = ta.value;
   try {
-    await apiSend(`/api/novels/${state.novelId}/chapters/${idx}`, "PUT", { content: ta.value });
-    state.editorDirty = false;
-    $("#reader-save").disabled = true;
-    try { localStorage.removeItem(draftKey(idx)); } catch { /* 忽略 */ }
+    await apiSend(`/api/novels/${state.novelId}/chapters/${idx}`, "PUT", { content: sent });
+    // 保存飞行期间又有新输入：保持脏标记，避免把未保存的内容当作已保存
+    if (ta.value === sent) {
+      state.editorDirty = false;
+      $("#reader-save").disabled = true;
+      try { localStorage.removeItem(draftKey(idx)); } catch { /* 忽略 */ }
+    } else {
+      state.editorDirty = true;
+      $("#reader-save").disabled = false;
+    }
     if (!silent) toast("已保存");
     await refreshNovel();
     return true;
@@ -1440,13 +1487,14 @@ function bindEditor() {
   ta.addEventListener("input", () => {
     state.editorDirty = true;
     $("#reader-save").disabled = false;
-    // 防丢稿：本地草稿（700ms 防抖）
+    // 防丢稿：本地草稿（700ms 防抖）；捕获当时的作品 id，避免切书后草稿串到别的作品
     clearTimeout(draftTimer);
+    const draftNovel = state.novelId;
     draftTimer = setTimeout(() => {
       const idx = parseInt(ta.dataset.idx || "0", 10);
       if (!idx) return;
       try {
-        localStorage.setItem(draftKey(idx), JSON.stringify({ content: ta.value, at: Date.now() }));
+        localStorage.setItem(draftKey(idx, draftNovel), JSON.stringify({ content: ta.value, at: Date.now() }));
       } catch { /* 忽略 */ }
     }, 700);
   });
@@ -1541,7 +1589,8 @@ async function runPolish(mode) {
     toast("没有产生修改，请调整选中内容或换个模式", true);
     return;
   }
-  state.polishRange = { start, end, text };
+  // 保存未 trim 的原始区间：应用时要与编辑器内容逐字比对，带首尾空白也能匹配
+  state.polishRange = { start, end, text: ta.value.slice(start, end) };
   state.polishResult = revised;
   state.polishLast = { mode, selection: text, instruction: $("#polish-instruction").value.trim() };
   $("#diff-feedback").value = "";
@@ -1668,7 +1717,7 @@ async function fixIssue(issue) {
     toast("没有产生修改，请手动选中相关段落再试", true);
     return;
   }
-  state.polishRange = { start, end, text };
+  state.polishRange = { start, end, text: ta.value.slice(start, end) };
   state.polishResult = revised;
   state.polishLast = { mode: "rewrite", selection: text, instruction: issue.note || "" };
   $("#diff-feedback").value = "";
@@ -1835,6 +1884,9 @@ function closeForm() {
 function bindFormDialog() {
   const submit = async () => {
     if (!formSubmit) return;
+    const btn = $("#form-save");
+    if (btn.disabled) return; // 连点保护：插入章节/新增条目不会被提交两次
+    btn.disabled = true;
     const values = {};
     $$("#form-fields [data-field]").forEach((el) => { values[el.dataset.field] = el.value; });
     try {
@@ -1842,6 +1894,8 @@ function bindFormDialog() {
       closeForm();
     } catch (err) {
       toast(err.message, true);
+    } finally {
+      btn.disabled = false;
     }
   };
   $("#form-save").onclick = submit;
@@ -1864,6 +1918,8 @@ function closeEvents() {
 function subscribe(id) {
   closeEvents();
   state.stream = { chapter: null, text: "" };
+  state.replaying = false;
+  hideStageStatus();
   $("#novel-log").innerHTML = "";
   const preStream = $("#stream-pre");
   preStream.textContent = "等待生成…";
@@ -1888,9 +1944,30 @@ function novelLog(line) {
 }
 
 function handleEvent(ev) {
+  // 历史回放（重连时服务端重放最近 300 条）：只记日志，不做重副作用，避免重渲染风暴；
+  // 回放结束后由 replay_done 统一刷新一次
+  if (ev.replay) {
+    state.replaying = true;
+    if (ev.type === "snapshot" && ev.run) {
+      novelLog(`已连接 · 当前运行：${RUN_STATUS[ev.run.status] || ev.run.status} / ${STAGE_LABEL[ev.run.stage] || ev.run.stage}`);
+      if (ev.run.status === "running") {
+        state.liveStage = ev.run.stage;
+        state.stageSince = Date.now();
+      }
+    } else if (ev.type === "stage") {
+      novelLog(ev.message);
+    } else if (ev.type === "chapter_saved") {
+      novelLog(`第${ev.chapter_idx}章已保存：${ev.title}（${ev.words} 字）`);
+    }
+    return;
+  }
   switch (ev.type) {
     case "snapshot":
       if (ev.run) novelLog(`已连接 · 当前运行：${RUN_STATUS[ev.run.status] || ev.run.status} / ${STAGE_LABEL[ev.run.stage] || ev.run.stage}`);
+      break;
+    case "replay_done":
+      state.replaying = false;
+      refreshNovel();
       break;
     case "run_started":
       novelLog(`运行开始（目标 ${ev.chapters} 章）`);
@@ -1898,6 +1975,12 @@ function handleEvent(ev) {
     case "stage":
       novelLog(ev.message);
       showStageStatus(ev.stage, ev.message);
+      // 审校处理等后台任务没有 run_finished：done 即收尾，停掉秒表与活跃指示
+      if (ev.stage === "done") {
+        $("#stream-live").classList.remove("on");
+        hideStageStatus();
+        refreshNovel();
+      }
       break;
     case "token": {
       const pre = $("#stream-pre");
@@ -1925,7 +2008,7 @@ function handleEvent(ev) {
       break;
     case "run_paused":
       novelLog(ev.message);
-      toast("已暂停：章节规划待确认");
+      toast(ev.message || "已暂停");
       $("#stream-live").classList.remove("on");
       hideStageStatus();
       refreshNovel();
@@ -1983,9 +2066,13 @@ function hideStageStatus() {
 
 async function refreshNovel() {
   if (!state.novelId) return;
+  const wantId = state.novelId;
   try {
-    state.novel = await api(`/api/novels/${state.novelId}`);
-    if (parseRoute().kind === "novel") renderNovel();
+    const data = await api(`/api/novels/${wantId}`);
+    // 请求飞行中可能已切换作品：只接受仍是当前作品的响应，避免旧数据回填
+    if (state.novelId !== wantId || parseRoute().kind !== "novel") return;
+    state.novel = data;
+    renderNovel();
   } catch { /* 忽略刷新失败 */ }
 }
 
@@ -2357,7 +2444,12 @@ function notifyNativeTheme(dark) {
 }
 
 function bindTheme() {
-  const saved = localStorage.getItem("ainovel.theme");
+  let saved = null;
+  try {
+    saved = localStorage.getItem("ainovel.theme");
+  } catch {
+    /* 存储不可用：跟随系统主题即可，不影响其它初始化 */
+  }
   const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
   const dark = saved ? saved === "dark" : prefersDark;
   document.documentElement.classList.toggle("dark", dark);
@@ -2365,7 +2457,11 @@ function bindTheme() {
   $("#theme-toggle").onclick = () => {
     const next = !document.documentElement.classList.contains("dark");
     document.documentElement.classList.toggle("dark", next);
-    localStorage.setItem("ainovel.theme", next ? "dark" : "light");
+    try {
+      localStorage.setItem("ainovel.theme", next ? "dark" : "light");
+    } catch {
+      /* 忽略 */
+    }
     notifyNativeTheme(next);
   };
 }

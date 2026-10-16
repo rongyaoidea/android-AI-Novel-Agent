@@ -37,6 +37,20 @@ class EngineService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
+    /**
+     * Android 15 (API 35) 起：dataSync 前台服务有「24h 内累计后台 6h」额度。
+     * 到限必须先停服务，否则系统直接抛 RemoteServiceException 杀进程。
+     * 这里主动收尾（已写章节由引擎落库），用户回到应用会自动重启服务。
+     */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        Log.w(TAG, "dataSync FGS 到限（startId=$startId, type=$fgsType）：主动停止前台服务")
+        try {
+            notifyEvent("后台运行时长已达上限", "创作引擎已转前台暂停；回到应用即可继续")
+        } catch (_: Exception) {
+        }
+        stopSelf()
+    }
+
     override fun onDestroy() {
         polling = false
         super.onDestroy()
@@ -108,7 +122,15 @@ class EngineService : Service() {
             val runStatus = item.optString("run_status")
             val prev = runStates[id]
             runStates[id] = runStatus
-            if (prev == null || prev == runStatus) continue
+            if (prev == null) {
+                // 首次见到该作品：只对「中断」发声（进程被杀重启后 db 把残留 running 标 failed，
+                // 正是最该提醒的场景）；done/paused 的历史状态不打扰
+                if (runStatus == "failed") {
+                    notifyEvent("《$title》运行中断", item.optString("last_error").ifBlank { "点击查看详情" })
+                }
+                continue
+            }
+            if (prev == runStatus) continue
             when (runStatus) {
                 "done" -> {
                     // 自动连载进行中（批次完成还会续写）不打扰；最终完成才通知

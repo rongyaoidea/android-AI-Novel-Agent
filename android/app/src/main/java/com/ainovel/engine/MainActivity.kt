@@ -41,11 +41,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var web: WebView
     private var pendingFilePathCallback: ValueCallback<Array<Uri>>? = null
 
+    /** 最近一次页面路由（#/novel/xxx 等）：Activity 重建后按此恢复，不至于跳回书架 */
+    @Volatile
+    private var lastRoute: String = "#/shelf"
+
     private val authToken: String by lazy { SecretStore.getOrCreateAuthToken(applicationContext) }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        lastRoute = savedInstanceState?.getString(STATE_ROUTE) ?: "#/shelf"
 
         web = WebView(this)
         // 关键 ①：insets 监听必须挂在外层容器上——WebView（Chromium）会自行消费系统 insets
@@ -107,6 +112,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Web 主题 → 原生状态栏联动：页面调用 window.AiNovelNative.setDark(true/false)
+        // 路由记忆 → Activity 重建后恢复页面：window.AiNovelNative.setRoute("#/novel/xxx")
         web.addJavascriptInterface(
             object {
                 @android.webkit.JavascriptInterface
@@ -115,6 +121,13 @@ class MainActivity : AppCompatActivity() {
                         val controller = WindowCompat.getInsetsController(window, root)
                         controller.isAppearanceLightStatusBars = !dark
                         controller.isAppearanceLightNavigationBars = !dark
+                    }
+                }
+
+                @android.webkit.JavascriptInterface
+                fun setRoute(route: String) {
+                    if (route.startsWith("#/")) {
+                        lastRoute = route
                     }
                 }
             },
@@ -200,8 +213,7 @@ class MainActivity : AppCompatActivity() {
             val ok = try {
                 Socket().use {
                     it.connect(InetSocketAddress("127.0.0.1", EngineService.PORT), 500)
-                }
-                true
+                } && engineHandshake()
             } catch (_: Exception) {
                 false
             }
@@ -218,9 +230,33 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    /** 令牌走查询参数：页面 JS 会暂存后从地址栏清掉，之后改为请求头 */
-    private fun uiUrl(): String =
-        "http://127.0.0.1:${EngineService.PORT}/?token=$authToken#/shelf"
+    /**
+     * 健康握手：确认 8787 上跑的确实是本应用引擎。
+     * 任何同机 App 都能绑回环端口；不做校验就会把访问令牌交给占用端口的第三方页面。
+     */
+    private fun engineHandshake(): Boolean {
+        return try {
+            val conn = URL("http://127.0.0.1:${EngineService.PORT}/api/health").openConnection() as HttpURLConnection
+            conn.connectTimeout = 1_000
+            conn.readTimeout = 1_000
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            conn.disconnect()
+            body.contains("\"name\":\"ainovel-engine\"")
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(STATE_ROUTE, lastRoute)
+    }
+
+    /** 令牌走查询参数：页面 JS 会暂存后从地址栏清掉，之后改为请求头；附带上次路由 */
+    private fun uiUrl(): String {
+        val frag = if (lastRoute.startsWith("#/")) lastRoute else "#/shelf"
+        return "http://127.0.0.1:${EngineService.PORT}/?token=$authToken$frag"
+    }
 
     @Suppress("DEPRECATION")
     override fun onBackPressed() {
@@ -234,5 +270,6 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val REQUEST_FILE = 2001
+        private const val STATE_ROUTE = "ainovel.lastRoute"
     }
 }

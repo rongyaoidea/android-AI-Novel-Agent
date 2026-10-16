@@ -425,39 +425,96 @@ impl Llm {
         let mut acc = String::new();
         let mut usage = TokenUsage::default();
         let mut buf = String::new();
+        let mut pending: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("LLM 流读取失败")?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim_end_matches('\r').to_string();
-                buf.drain(..=pos);
-                let Some(data) = line.strip_prefix("data:") else { continue };
-                let data = data.trim();
-                if data.is_empty() || data == "[DONE]" {
-                    continue;
+        // 单行解析：data: 行 → delta + usage
+        fn parse_line(
+            line: &str,
+            acc: &mut String,
+            usage: &mut TokenUsage,
+            on_delta: &mut dyn FnMut(&str),
+        ) {
+            let Some(data) = line.trim_end_matches('\r').strip_prefix("data:") else {
+                return;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                return;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
+                    if !delta.is_empty() {
+                        acc.push_str(delta);
+                        on_delta(delta);
+                    }
                 }
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                    if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
-                        if !delta.is_empty() {
-                            acc.push_str(delta);
-                            on_delta(delta);
-                        }
-                    }
-                    // 末尾 chunk 通常 choices 为空、只带 usage
-                    let u = parse_usage(&v);
-                    if u != TokenUsage::default() {
-                        usage = u;
-                    }
+                // 末尾 chunk 通常 choices 为空、只带 usage
+                let u = parse_usage(&v);
+                if u != TokenUsage::default() {
+                    *usage = u;
                 }
             }
         }
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("LLM 流读取失败")?;
+            pending.extend_from_slice(&chunk);
+            // 只解码「完整的 UTF-8 前缀」：多字节字符跨 chunk 时留到下一块，避免写入 �
+            let mut text = String::new();
+            loop {
+                match std::str::from_utf8(&pending) {
+                    Ok(s) => {
+                        text.push_str(s);
+                        pending.clear();
+                        break;
+                    }
+                    Err(e) => {
+                        let valid = e.valid_up_to();
+                        if valid > 0 {
+                            text.push_str(std::str::from_utf8(&pending[..valid]).unwrap_or(""));
+                            pending.drain(..valid);
+                        }
+                        if e.error_len().is_some() {
+                            // 明确的非法字节：跳过一个字节，避免死循环
+                            if !pending.is_empty() {
+                                pending.remove(0);
+                            }
+                        } else {
+                            break; // 尾部不完整，等下一块
+                        }
+                    }
+                }
+            }
+            buf.push_str(&text);
+            while let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].to_string();
+                buf.drain(..=pos);
+                parse_line(&line, &mut acc, &mut usage, &mut on_delta);
+            }
+        }
+        // 末尾可能没有换行的最后一帧（常见于只带 usage 的收尾帧）
+        if !buf.trim().is_empty() {
+            let line = buf.clone();
+            parse_line(&line, &mut acc, &mut usage, &mut on_delta);
+        }
         if acc.trim().is_empty() {
-            return Err(anyhow!("LLM 流式输出为空（模型未返回内容）"));
+            return Err(anyhow::Error::new(EmptyStreamError));
         }
         Ok(LlmOutput { text: acc, usage })
     }
 }
+
+/// 流式输出为空（模型 200 但未返回任何内容）。
+/// 单独的类型便于调用方识别并重试，而不是把整批运行判失败。
+#[derive(Debug)]
+pub struct EmptyStreamError;
+
+impl std::fmt::Display for EmptyStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LLM 流式输出为空（模型未返回内容）")
+    }
+}
+
+impl std::error::Error for EmptyStreamError {}
 
 /// 把不同厂商的 usage 结构归一化为 TokenUsage。
 /// - OpenAI 系：`prompt_tokens` 已包含缓存命中部分（`prompt_tokens_details.cached_tokens`）；
@@ -986,6 +1043,83 @@ mod tests {
         let err = llm.complete("system", "user").await.unwrap_err();
         assert!(format!("{err}").contains("500"), "错误应带状态码: {err}");
         assert_eq!(hits.load(Ordering::SeqCst), 3, "最多尝试 3 次");
+    }
+
+    /// 集成：流式解析的字节边界与收尾帧
+    /// ① 多字节字符跨 chunk 不产生 �；② 末行无换行的 usage 帧不丢；③ 空流返回可识别的 EmptyStreamError
+    #[tokio::test]
+    async fn stream_handles_chunk_splits_and_empty_output() {
+        use futures_util::stream;
+        // 「他」= E4 BB 96：让第一个 chunk 停在第一个字节之后
+        let head = "data: {\"choices\":[{\"delta\":{\"content\":\"".to_string();
+        let tail = "他\"}}]}\n\n".to_string();
+        let bytes = tail.as_bytes();
+        let pos = bytes.iter().position(|b| *b == 0xE4).expect("包含汉字");
+        let part1 = [head.as_bytes(), &bytes[..pos + 1]].concat();
+        let part2 = bytes[pos + 1..].to_vec();
+        // 收尾 usage 帧：故意不带结尾换行
+        let usage_json = serde_json::json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3}
+        })
+        .to_string();
+        let usage_frame = format!("data: {usage_json}");
+
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let p1 = part1.clone();
+                let p2 = part2.clone();
+                let uf = usage_frame.clone();
+                async move {
+                    let s = stream::iter(vec![
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(p1)),
+                        Ok(axum::body::Bytes::from(p2)),
+                        Ok(axum::body::Bytes::from(uf.into_bytes())),
+                    ]);
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from_stream(s))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let llm = llm_for(addr);
+        fn noop(_: &str) {}
+        let out = llm.stream("s", "u", noop).await.unwrap();
+        assert!(out.text.contains('他'), "跨 chunk 的多字节字符应完整：{:?}", out.text);
+        assert!(!out.text.contains('\u{FFFD}'), "不应出现替换字符：{:?}", out.text);
+        assert_eq!(out.usage.input, Some(7), "无换行的收尾 usage 帧也要解析");
+        assert_eq!(out.usage.output, Some(3));
+        assert_eq!(out.usage.total, Some(10));
+
+        // 空流（只有 [DONE]）→ EmptyStreamError（供上层的「空内容自动重试一次」识别）
+        let empty_app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from("data: [DONE]\n\n"))
+                    .unwrap()
+            }),
+        );
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener2, empty_app).await;
+        });
+        let llm2 = llm_for(addr2);
+        let err = llm2.stream("s", "u", noop).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<EmptyStreamError>().is_some(),
+            "应为可识别的空流错误：{err}"
+        );
     }
 
     // ---------- 端点解析与 404 回退 ----------

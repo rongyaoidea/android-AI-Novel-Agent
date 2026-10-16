@@ -2443,3 +2443,114 @@ async fn stop_novel_interrupts_run_and_can_resume() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 并发守卫：有运行进行中时不能恢复备份 / 启动审校 / 再次运行；审校处理进行中时不能重复入队
+#[tokio::test]
+async fn restore_and_review_concurrency_guards() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-guards-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "守卫测试", "chapters": 1}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    // 制造一个「进行中」的运行（不跑流水线，仅占位）
+    engine.db.create_run(&novel_id, 3).unwrap();
+    assert!(engine.db.any_running_run().unwrap().is_some());
+
+    // 恢复备份 → 409（不能把数据写进正在运行的库）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/restore")
+                .body(Body::from(b"whatever".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "运行中恢复备份应被拒绝");
+
+    // 再次发起创作 → 409
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/run"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"chapters": 1}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // 结束占位运行
+    let run = engine.db.latest_run(&novel_id).unwrap().unwrap();
+    engine.db.update_run(&run.id, "done", "done", 0, None).unwrap();
+
+    // 非法备份但无任务在跑 → 400（前置检查已放行，错误来自 zip 解析）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/restore")
+                .body(Body::from(b"not-a-zip".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 审校处理进行中：重复入队 → 409；释放后可入队
+    assert!(engine.begin_review(&novel_id));
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/review-all"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "重复审校处理应被拒绝");
+    engine.end_review(&novel_id);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/review-all"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

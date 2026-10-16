@@ -25,6 +25,8 @@ pub struct Engine {
     pub secret: Option<crypto::SecretBox>,
     /// 请求停止中的作品（手动停止：流式生成即断；其它步骤在下一检查点退出）
     stop_flags: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// 「AI 处理全部审校」进行中的作品（同一时刻只允许一个；也用于与创作运行互斥）
+    reviewing: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Engine {
@@ -47,7 +49,33 @@ impl Engine {
             hub: pipeline::EventHub::new(),
             secret,
             stop_flags: std::sync::Mutex::new(std::collections::HashSet::new()),
+            reviewing: std::sync::Mutex::new(std::collections::HashSet::new()),
         }))
+    }
+
+    /// 尝试占用「审校处理」名额（false = 已有审校处理在跑）
+    pub fn begin_review(&self, novel_id: &str) -> bool {
+        self.reviewing
+            .lock()
+            .map(|mut s| s.insert(novel_id.to_string()))
+            .unwrap_or(false)
+    }
+
+    pub fn end_review(&self, novel_id: &str) {
+        if let Ok(mut s) = self.reviewing.lock() {
+            s.remove(novel_id);
+        }
+    }
+
+    pub fn is_reviewing(&self, novel_id: &str) -> bool {
+        self.reviewing
+            .lock()
+            .map(|s| s.contains(novel_id))
+            .unwrap_or(false)
+    }
+
+    pub fn any_reviewing(&self) -> bool {
+        self.reviewing.lock().map(|s| !s.is_empty()).unwrap_or(false)
     }
 
     /// 请求停止某本作品的创作（配合 UI「停止」按钮与自动连载开关）

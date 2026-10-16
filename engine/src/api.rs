@@ -452,7 +452,7 @@ async fn search_novel(
 }
 
 /// 停止创作：中断进行中的运行（流式生成即断；其它步骤在下一检查点退出），并关闭自动连载。
-/// 已写章节全部保留；之后点「继续创作」可断点续写。
+/// 已写章节全部保留；之后点「继续创作」可断点续写。审校处理同样可被停止。
 async fn stop_novel(
     State(e): State<Arc<Engine>>,
     Path(id): Path<String>,
@@ -461,16 +461,17 @@ async fn stop_novel(
         return Err(not_found("novel"));
     }
     let running = matches!(e.db.latest_run(&id).map_err(err)?, Some(r) if r.status == "running");
+    let reviewing = e.is_reviewing(&id);
     // 先关自动连载（即使当前批次很快写完，也不会再续下一批）
     e.db.set_novel_auto_continue(&id, false).map_err(err)?;
-    if running {
+    if running || reviewing {
         e.request_stop(&id);
         e.hub.publish(&id, pipeline::EngineEvent::Stage {
             stage: "stop".into(),
             message: "收到停止请求：正在中断当前生成…".into(),
         });
     }
-    Ok(Json(json!({"ok": true, "stopping": running})))
+    Ok(Json(json!({"ok": true, "stopping": running || reviewing})))
 }
 
 #[derive(Deserialize)]
@@ -1014,8 +1015,10 @@ async fn novel_health(
     for c in &chapters {
         if let Some(raw) = c.review_json.as_deref() {
             if let Ok(r) = serde_json::from_str::<crate::models::Review>(raw) {
-                if !r.ok || !r.issues.is_empty() {
-                    review_warnings += r.issues.len().max(1);
+                // 只把「仍存在」的高/中危 LLM 审校意见算作待消化（fixed 留档与本地文风项不算）
+                let open = pipeline::medium_high_count(&r);
+                if open > 0 {
+                    review_warnings += open;
                     review_chapters.push(c.idx);
                 }
             }
@@ -1114,17 +1117,33 @@ async fn run_novel(
             ));
         }
     }
+    if e.is_reviewing(&id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "审校处理进行中，完成后再继续创作。".to_string(),
+        ));
+    }
     let run_id = pipeline::spawn(e.clone(), &id, b.chapters.clamp(1, 50)).map_err(err)?;
     Ok(Json(json!({"run_id": run_id})))
 }
 
 // ---------- 自动连载 / 月度用量 ----------
 
-/// 本月起点（UTC，RFC3339 前缀；与 usage.created_at 同格式可直接字符串比较）
-pub fn month_start_utc() -> String {
-    use chrono::Datelike;
-    let now = chrono::Utc::now();
-    format!("{:04}-{:02}-01T00:00:00+00:00", now.year(), now.month())
+/// 本月起点（本地时区换算为 UTC 的 RFC3339；与 usage.created_at 同格式可直接字符串比较）
+pub fn month_start_local() -> String {
+    use chrono::{Datelike, Local, TimeZone, Utc};
+    let now = Local::now();
+    let naive = now
+        .date_naive()
+        .with_day(1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .unwrap_or_else(|| now.naive_local());
+    Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .or_else(|| Local.from_local_datetime(&naive).latest())
+        .map(|dt| dt.with_timezone(&Utc).to_rfc3339())
+        .unwrap_or_else(|| Utc::now().to_rfc3339())
 }
 
 /// 启动自动连载：先写一批（≤10 章），运行完成后自动续写直到
@@ -1145,6 +1164,12 @@ async fn start_auto(
                 "已有运行进行中，请等待完成或先停止".to_string(),
             ));
         }
+    }
+    if e.is_reviewing(&id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "审校处理进行中，完成后再启动自动连载。".to_string(),
+        ));
     }
     let target = if novel.target_chapters > 0 {
         novel.target_chapters
@@ -1195,7 +1220,7 @@ async fn stop_auto(
 
 /// 本月累计用量与预算（自动连载的护栏数据）
 async fn monthly_usage(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, ApiErr> {
-    let since = month_start_utc();
+    let since = month_start_local();
     let used = e.db.usage_total_since(&since).map_err(err)?;
     let budget = e.db.pipeline_settings().map_err(err)?.monthly_budget_tokens;
     Ok(Json(json!({
@@ -1222,6 +1247,12 @@ async fn review_all(
             ));
         }
     }
+    if e.is_reviewing(&id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "已有一轮审校处理在进行中，请等待完成（或先停止）。".to_string(),
+        ));
+    }
     let queued = pipeline::spawn_review_all(e.clone(), &id).map_err(err)?;
     Ok(Json(json!({"ok": true, "queued": queued})))
 }
@@ -1232,22 +1263,31 @@ async fn events(
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
     let mut rx = e.hub.subscribe();
     let snapshot = e.db.latest_run(&id).ok().flatten();
-    // 重连回放：本运行的关键事件（Token 不入缓冲）
+    // 重连回放：本运行的关键事件（Token 不入缓冲）；回放事件带 replay 标记，
+    // 前端对回放只记日志、不做重副作用，收到 replay_done 后统一刷新一次
     let history = e.hub.history(&id);
     let stream = async_stream::stream! {
         if let Some(run) = snapshot {
-            let payload = json!({"type": "snapshot", "run": run}).to_string();
+            let payload = json!({"type": "snapshot", "run": run, "replay": true}).to_string();
             yield Ok(Event::default().event("engine").data(payload));
         }
         for ev in history {
-            if let Ok(s) = serde_json::to_string(&ev) {
-                yield Ok(Event::default().event("engine").data(s));
+            if let Ok(mut v) = serde_json::to_value(&ev) {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("replay".into(), json!(true));
+                }
+                yield Ok(Event::default().event("engine").data(v.to_string()));
             }
         }
+        yield Ok(Event::default().event("engine").data(json!({"type": "replay_done"}).to_string()));
         loop {
             match rx.recv().await {
-                Ok(ev) => {
-                    if let Ok(s) = serde_json::to_string(&ev) {
+                Ok(stamped) => {
+                    // 只转发本书事件：广播里含其他书的 Token 流（正文增量），不能串台
+                    if stamped.novel_id != id {
+                        continue;
+                    }
+                    if let Ok(s) = serde_json::to_string(&stamped.event) {
                         yield Ok(Event::default().event("engine").data(s));
                     }
                 }
@@ -1308,12 +1348,12 @@ fn default_active() -> String {
 
 async fn update_character(
     State(e): State<Arc<Engine>>,
-    Path((_id, cid)): Path<(String, String)>,
+    Path((id, cid)): Path<(String, String)>,
     Json(b): Json<CharacterUpdateBody>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
     let ok = e
         .db
-        .update_character(&cid, &b.role, &b.status, &b.facts)
+        .update_character(&id, &cid, &b.role, &b.status, &b.facts)
         .map_err(err)?;
     if !ok {
         return Err(not_found("character"));
@@ -1323,9 +1363,9 @@ async fn update_character(
 
 async fn delete_character(
     State(e): State<Arc<Engine>>,
-    Path((_id, cid)): Path<(String, String)>,
+    Path((id, cid)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
-    let ok = e.db.delete_character(&cid).map_err(err)?;
+    let ok = e.db.delete_character(&id, &cid).map_err(err)?;
     if !ok {
         return Err(not_found("character"));
     }
@@ -1381,14 +1421,14 @@ fn default_open() -> String {
 
 async fn update_foreshadowing(
     State(e): State<Arc<Engine>>,
-    Path((_id, fid)): Path<(String, String)>,
+    Path((id, fid)): Path<(String, String)>,
     Json(b): Json<ForeshadowingUpdateBody>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
     let status = if b.status == "resolved" { "resolved" } else { "open" };
     let resolved_chapter = if status == "resolved" { b.resolved_chapter } else { None };
     let ok = e
         .db
-        .update_foreshadowing(&fid, status, &b.notes, resolved_chapter)
+        .update_foreshadowing(&id, &fid, status, &b.notes, resolved_chapter)
         .map_err(err)?;
     if !ok {
         return Err(not_found("foreshadowing"));
@@ -1398,9 +1438,9 @@ async fn update_foreshadowing(
 
 async fn delete_foreshadowing(
     State(e): State<Arc<Engine>>,
-    Path((_id, fid)): Path<(String, String)>,
+    Path((id, fid)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
-    let ok = e.db.delete_foreshadowing(&fid).map_err(err)?;
+    let ok = e.db.delete_foreshadowing(&id, &fid).map_err(err)?;
     if !ok {
         return Err(not_found("foreshadowing"));
     }
@@ -1514,6 +1554,19 @@ async fn restore_db(
 ) -> Result<Json<serde_json::Value>, ApiErr> {
     if body.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "备份内容为空".to_string()));
+    }
+    // 恢复会整库覆盖：有任务在跑时必须先停（否则流水线会写进刚恢复的库）
+    if e.db.any_running_run().map_err(err)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "有创作运行进行中，请先停止并等待落定后再恢复备份。".to_string(),
+        ));
+    }
+    if e.any_reviewing() {
+        return Err((
+            StatusCode::CONFLICT,
+            "审校处理进行中，请等待完成（或先停止）后再恢复备份。".to_string(),
+        ));
     }
     let dir = std::env::temp_dir().join(format!("ainovel-restore-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).map_err(err)?;

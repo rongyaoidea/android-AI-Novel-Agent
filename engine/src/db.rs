@@ -221,35 +221,90 @@ impl Db {
         conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS chapter_fts USING fts5(novel_id UNINDEXED, chapter_idx UNINDEXED, title, body);",
         )?;
-        // 首次启用 / 从旧备份恢复后：回填索引（只在索引为空时做一次）
-        let fts_count: i64 = conn.query_row("SELECT COUNT(*) FROM chapter_fts", [], |r| r.get(0))?;
-        if fts_count == 0 {
-            let mut stmt =
-                conn.prepare("SELECT novel_id, idx, title, content FROM chapters WHERE content != ''")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?;
-            let mut n = 0usize;
-            for row in rows {
-                let (nid, idx, title, content) = row?;
-                conn.execute(
-                    "INSERT INTO chapter_fts(novel_id, chapter_idx, title, body) VALUES(?1,?2,?3,?4)",
-                    params![nid, idx, Self::fts_normalize(&title), Self::fts_normalize(&content)],
-                )?;
-                n += 1;
-            }
-            if n > 0 {
-                tracing::info!("全文索引已回填 {n} 章");
-            }
+        // ① 负区占位还原（必须早于 FTS 自愈，避免把负章号写进索引）。
+        //    极少数「旧版本重排写到一半崩溃」的库可能还原出冲突章号：逐行改用空闲位置，保证能启动。
+        let fixed = Self::recover_negative_indexes(&conn)?;
+        if fixed > 0 {
+            tracing::warn!("启动自愈：{fixed} 章的重排残留（负章号）已还原");
         }
-        // 章节结构编辑的中断兜底：把负区占位 idx 还原
-        conn.execute_batch("UPDATE chapters SET idx = -idx - 1 WHERE idx < 0;")?;
+        // ② FTS 自愈：与章节数不一致（首次启用 / 旧备份 / 崩溃残留 / 标题章缺失）的书重建索引
+        let mismatched: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT n.id FROM novels n
+                 WHERE (SELECT COUNT(*) FROM chapters c WHERE c.novel_id = n.id)
+                    != (SELECT COUNT(*) FROM chapter_fts f WHERE f.novel_id = n.id)",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            v
+        };
+        let mut healed = 0usize;
+        for nid in &mismatched {
+            Self::reindex_novel_locked(&conn, nid)?;
+            healed += 1;
+        }
+        if healed > 0 {
+            tracing::info!("全文索引已自愈 {healed} 本（回填/重建）");
+        }
         Ok(())
+    }
+
+    /// 把负区占位章号（重排中断残留）还原；与既有章号冲突时放到该书末尾空闲位置。
+    /// 还原后重建受影响作品的检索索引（章号变了，索引必须跟着走）。
+    fn recover_negative_indexes(conn: &Connection) -> anyhow::Result<usize> {
+        let mut stmt = conn.prepare(
+            "SELECT novel_id, id, idx FROM chapters WHERE idx < 0 ORDER BY novel_id ASC, idx DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut items: Vec<(String, String, i64)> = Vec::new();
+        for r in rows {
+            items.push(r?);
+        }
+        drop(stmt);
+        let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut fixed = 0usize;
+        for (nid, id, neg) in items {
+            let want = -neg - 1;
+            let free = want >= 1
+                && conn
+                    .query_row(
+                        "SELECT 1 FROM chapters WHERE novel_id=?1 AND idx=?2",
+                        params![nid, want],
+                        |_| Ok(true),
+                    )
+                    .optional()?
+                    .is_none();
+            let target = if free {
+                want
+            } else {
+                // 冲突兜底：放到该书末尾（保持可启动；用户可再用「上移/下移」调整）
+                conn.query_row(
+                    "SELECT COALESCE(MAX(idx), 0) + 1 FROM chapters WHERE novel_id=?1",
+                    params![nid],
+                    |r| r.get::<_, i64>(0),
+                )?
+                .max(1)
+            };
+            conn.execute(
+                "UPDATE chapters SET idx=?2 WHERE id=?1",
+                params![id, target],
+            )?;
+            touched.insert(nid);
+            fixed += 1;
+        }
+        for nid in &touched {
+            Self::reindex_novel_locked(conn, nid)?;
+        }
+        Ok(fixed)
     }
 
     /// FTS 归一化：CJK 逐字拆成独立 token（空格分隔），拉丁转小写，其余（标点/空白）作分隔符。
@@ -683,6 +738,29 @@ impl Db {
         Ok(())
     }
 
+    /// 章节摘要列表（只取 idx/title/summary，不加载正文；供回顾注入 / 卷摘要 / 伏笔审核复用）
+    pub fn list_chapter_summaries(
+        &self,
+        novel_id: &str,
+    ) -> anyhow::Result<Vec<(i64, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT idx, title, summary FROM chapters WHERE novel_id=?1 ORDER BY idx ASC",
+        )?;
+        let rows = stmt.query_map([novel_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// 章节列表（轻量：不含正文；正文按需走章节详情）
     pub fn list_chapter_metas(&self, novel_id: &str) -> anyhow::Result<Vec<crate::models::ChapterMeta>> {
         let conn = self.conn.lock().unwrap();
@@ -806,12 +884,34 @@ impl Db {
             updated_at: now(),
         };
         let conn = self.conn.lock().unwrap();
+        // 同一本书同时只允许一个运行（进程内单连接，检查+插入在同一把锁内，天然原子）
+        let running: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM runs WHERE novel_id=?1 AND status='running'",
+            [novel_id],
+            |row| row.get(0),
+        )?;
+        if running > 0 {
+            anyhow::bail!("已有创作运行进行中");
+        }
         conn.execute(
             "INSERT INTO runs(id, novel_id, status, stage, chapter_cursor, chapters_target, error, created_at, updated_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![r.id, r.novel_id, r.status, r.stage, r.chapter_cursor, r.chapters_target, r.error, r.created_at, r.updated_at],
         )?;
         Ok(r)
+    }
+
+    /// 是否存在进行中的运行（备份恢复前置检查用）；返回一本有运行的书
+    pub fn any_running_run(&self) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let v = conn
+            .query_row(
+                "SELECT novel_id FROM runs WHERE status='running' LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(v)
     }
 
     fn map_run(row: &Row<'_>) -> rusqlite::Result<Run> {
@@ -966,7 +1066,8 @@ impl Db {
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE chapters SET title=?3, goal=?4, beats_json=?5, updated_at=?6 WHERE novel_id=?1 AND idx=?2",
+            "UPDATE chapters SET title=?3, goal=?4, beats_json=?5, updated_at=?6
+             WHERE novel_id=?1 AND idx=?2 AND status='planned'",
             params![novel_id, idx, title, goal, serde_json::to_string(beats)?, now()],
         )?;
         Self::reindex_chapter_locked(&conn, novel_id, idx)?;
@@ -1016,6 +1117,7 @@ impl Db {
 
     pub fn update_character(
         &self,
+        novel_id: &str,
         id: &str,
         role: &str,
         status: &str,
@@ -1023,15 +1125,18 @@ impl Db {
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE characters SET role=?2, status=?3, facts=?4, updated_at=?5 WHERE id=?1",
-            params![id, role, status, serde_json::to_string(facts)?, now()],
+            "UPDATE characters SET role=?2, status=?3, facts=?4, updated_at=?5 WHERE id=?1 AND novel_id=?6",
+            params![id, role, status, serde_json::to_string(facts)?, now(), novel_id],
         )?;
         Ok(n > 0)
     }
 
-    pub fn delete_character(&self, id: &str) -> anyhow::Result<bool> {
+    pub fn delete_character(&self, novel_id: &str, id: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
-        Ok(conn.execute("DELETE FROM characters WHERE id=?1", [id])? > 0)
+        Ok(conn.execute(
+            "DELETE FROM characters WHERE id=?1 AND novel_id=?2",
+            params![id, novel_id],
+        )? > 0)
     }
 
     /// 写后抽取：合并角色事实（去重、保留最近 12 条）
@@ -1102,7 +1207,9 @@ impl Db {
                 continue;
             }
             let role = item["role"].as_str().unwrap_or("").trim();
-            let status = item["status"].as_str().unwrap_or("active").trim();
+            // 缺失 status 时用空串：upsert 会保留台账里的人工状态（如手工标记的 dead），
+            // 新角色则由 upsert 的插入分支兜底为 active
+            let status = item["status"].as_str().unwrap_or("").trim();
             let facts: Vec<String> = item["facts"]
                 .as_array()
                 .map(|a| {
@@ -1162,6 +1269,7 @@ impl Db {
 
     pub fn update_foreshadowing(
         &self,
+        novel_id: &str,
         id: &str,
         status: &str,
         notes: &str,
@@ -1169,15 +1277,19 @@ impl Db {
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE foreshadowings SET status=?2, notes=?3, resolved_chapter=?4, updated_at=?5 WHERE id=?1",
-            params![id, status, notes, resolved_chapter, now()],
+            "UPDATE foreshadowings SET status=?2, notes=?3, resolved_chapter=?4, updated_at=?5
+             WHERE id=?1 AND novel_id=?6",
+            params![id, status, notes, resolved_chapter, now(), novel_id],
         )?;
         Ok(n > 0)
     }
 
-    pub fn delete_foreshadowing(&self, id: &str) -> anyhow::Result<bool> {
+    pub fn delete_foreshadowing(&self, novel_id: &str, id: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock().unwrap();
-        Ok(conn.execute("DELETE FROM foreshadowings WHERE id=?1", [id])? > 0)
+        Ok(conn.execute(
+            "DELETE FROM foreshadowings WHERE id=?1 AND novel_id=?2",
+            params![id, novel_id],
+        )? > 0)
     }
 
     fn insert_foreshadowing_if_new(
@@ -1199,11 +1311,12 @@ impl Db {
 
     fn resolve_foreshadowing(&self, novel_id: &str, title: &str, chapter_idx: i64) -> anyhow::Result<usize> {
         let conn = self.conn.lock().unwrap();
+        // 用 instr 而非 LIKE：伏笔标题里的 % / _ 不应被当作通配符
         let hit: Option<String> = conn
             .query_row(
                 "SELECT id FROM foreshadowings
                  WHERE novel_id=?1 AND status='open'
-                   AND (title=?2 OR title LIKE '%'||?2||'%' OR ?2 LIKE '%'||title||'%')
+                   AND (title=?2 OR instr(title, ?2) > 0 OR instr(?2, title) > 0)
                  LIMIT 1",
                 params![novel_id, title],
                 |r| r.get(0),
@@ -1253,25 +1366,38 @@ impl Db {
     // ---------- 章节结构编辑 ----------
 
     /// 统一重排：先整体挪到负区（避免 UNIQUE(novel_id, idx) 冲突），再按新顺序写回。
-    /// 中断时由 migrate 的负区还原兜底。
+    /// 整个过程在事务里：中断则回滚，不会留下「写了一半」的负区状态。
     fn apply_chapter_order(
         conn: &Connection,
         novel_id: &str,
         order: &[(String, i64)],
     ) -> anyhow::Result<()> {
-        conn.execute(
-            "UPDATE chapters SET idx = -idx - 1 WHERE novel_id=?1",
-            params![novel_id],
-        )?;
-        for (id, new_idx) in order {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> anyhow::Result<()> {
             conn.execute(
-                "UPDATE chapters SET idx=?2, updated_at=?3 WHERE id=?1",
-                params![id, new_idx, now()],
+                "UPDATE chapters SET idx = -idx - 1 WHERE novel_id=?1",
+                params![novel_id],
             )?;
+            for (id, new_idx) in order {
+                conn.execute(
+                    "UPDATE chapters SET idx=?2, updated_at=?3 WHERE id=?1",
+                    params![id, new_idx, now()],
+                )?;
+            }
+            // 章号已整体重排：重建本书检索索引（索引里存的是旧章号）
+            Self::reindex_novel_locked(conn, novel_id)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
         }
-        // 章号已整体重排：重建本书检索索引（索引里存的是旧章号）
-        Self::reindex_novel_locked(conn, novel_id)?;
-        Ok(())
     }
 
     fn chapter_pairs_ordered(&self, conn: &Connection, novel_id: &str) -> anyhow::Result<Vec<(String, i64)>> {
@@ -1455,8 +1581,9 @@ impl Db {
                 None::<fn(rusqlite::backup::Progress)>,
             )?;
         }
-        // 恢复后补跑轻量迁移（兼容更早版本的备份）
+        // 恢复后补跑轻量迁移（兼容更早版本的备份），并把备份里可能残留的 running 运行标记为失败
         self.migrate()?;
+        self.recover_stale_runs()?;
         Ok(())
     }
 }
@@ -1670,6 +1797,117 @@ mod tests {
         let stored = db.get_chapter(&novel.id, 1).unwrap().unwrap().review_json.unwrap();
         let parsed: Review = serde_json::from_str(&stored).unwrap();
         assert!(parsed.issues[0].stale, "引用对不上后应标记 stale");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn negative_index_recovery_survives_conflict_and_heals_fts() {
+        use crate::models::ChapterPlan;
+        let dir = tmp_dir("negidx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ainovel.db");
+        let novel_id;
+        {
+            let db = Db::open(&path).unwrap();
+            let novel = db.create_novel("重排中断测试", "auto", "").unwrap();
+            novel_id = novel.id.clone();
+            db.upsert_chapter_plan(
+                &novel.id,
+                &ChapterPlan { idx: 1, title: "第一章".into(), goal: String::new(), beats: vec![] },
+            )
+            .unwrap();
+            db.save_chapter_content(&novel.id, 1, "灯塔的光扫过海面。", "done").unwrap();
+            db.upsert_chapter_plan(
+                &novel.id,
+                &ChapterPlan { idx: 2, title: "第二章".into(), goal: String::new(), beats: vec![] },
+            )
+            .unwrap();
+            db.save_chapter_content(&novel.id, 2, "船舱里只剩下风声。", "done").unwrap();
+        }
+        // 模拟旧版本「重排写到一半崩溃」：A 变 -2（应还原为 1），B 已写成 1（占位冲突）
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "UPDATE chapters SET idx=-2 WHERE idx=1;
+                 UPDATE chapters SET idx=1 WHERE idx=2;",
+            )
+            .unwrap();
+        }
+        // 旧实现会在这里 UNIQUE 冲突 → 引擎起不来；现在必须能启动并自愈
+        let db2 = Db::open(&path).unwrap();
+        let metas = db2.list_chapter_metas(&novel_id).unwrap();
+        assert_eq!(metas.len(), 2);
+        assert!(
+            metas.iter().all(|m| m.idx > 0),
+            "还原后章号必须全为正：{:?}",
+            metas.iter().map(|m| m.idx).collect::<Vec<_>>()
+        );
+        // FTS 与章号一致：按标题检索出的章号要能打开同名章节
+        let hits = db2.search_chapters(&novel_id, "第一章", 10).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        let (hit_idx, hit_title, _) = &hits[0];
+        assert_eq!(hit_title, "第一章");
+        let ch = db2.get_chapter(&novel_id, *hit_idx).unwrap().unwrap();
+        assert_eq!(ch.title, "第一章", "检索章号与 chapters 表必须对应");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_run_rejects_second_running_run() {
+        let dir = tmp_dir("runlock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("并发运行测试", "auto", "").unwrap();
+        db.create_run(&novel.id, 3).unwrap();
+        let err = db.create_run(&novel.id, 3).unwrap_err();
+        assert!(format!("{err}").contains("已有创作运行"), "{err}");
+        // 前一个运行结束后可以再开
+        let run = db.latest_run(&novel.id).unwrap().unwrap();
+        db.update_run(&run.id, "done", "done", 3, None).unwrap();
+        assert!(db.create_run(&novel.id, 3).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn absorb_characters_preserves_manual_status() {
+        let dir = tmp_dir("charstat");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("角色状态测试", "auto", "").unwrap();
+        db.upsert_character(&novel.id, "林深", "主角", "dead", &[]).unwrap();
+        // 写后抽取没给 status：不能把人工标记的 dead 重置为 active
+        let j = serde_json::json!({
+            "characters": [{"name": "林深", "role": "主角", "facts": ["找到录音笔"]}]
+        });
+        db.absorb_characters(&novel.id, &j).unwrap();
+        let cs = db.list_characters(&novel.id).unwrap();
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].status, "dead", "缺 status 时应保留台账原值");
+        // 抽取明确给出 status 时以新值为准
+        let j2 = serde_json::json!({
+            "characters": [{"name": "林深", "role": "主角", "status": "active", "facts": []}]
+        });
+        db.absorb_characters(&novel.id, &j2).unwrap();
+        assert_eq!(db.list_characters(&novel.id).unwrap()[0].status, "active");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn foreshadow_resolution_does_not_treat_percent_as_wildcard() {
+        let dir = tmp_dir("forepat");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("伏笔匹配测试", "auto", "").unwrap();
+        db.add_foreshadowing(&novel.id, "50%的真相", "").unwrap();
+        db.add_foreshadowing(&novel.id, "他们走了50步", "").unwrap();
+        // 回收标题含 %：只能命中真正包含「50%」的那条
+        let j = serde_json::json!({"foreshadowings_resolved": [{"title": "50%"}]});
+        db.absorb_foreshadowings(&novel.id, 3, &j).unwrap();
+        let items = db.list_foreshadowings(&novel.id).unwrap();
+        let hit = items.iter().find(|f| f.title == "50%的真相").unwrap();
+        assert_eq!(hit.status, "resolved", "应命中 50%的真相");
+        let other = items.iter().find(|f| f.title == "他们走了50步").unwrap();
+        assert_eq!(other.status, "open", "不应把 % 当通配符误回收别的伏笔");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

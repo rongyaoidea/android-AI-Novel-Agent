@@ -346,18 +346,43 @@ fn placeholders(tpl: &str) -> Vec<String> {
 
 // ---------- 渲染 ----------
 
+/// 渲染：单遍扫描 `{{name}}`（name 允许两侧空白），只在模板位置替换，
+/// 变量值里出现的 `{{…}}` 不会被二次替换（避免注入/自展开）。
 fn fill(tpl: &str, vars: &[(&str, String)]) -> String {
-    let mut out = tpl.to_string();
-    for (k, v) in vars {
-        out = out.replace(&format!("{{{{{k}}}}}"), v);
+    let mut out = String::with_capacity(tpl.len());
+    let mut rest = tpl;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find("}}") {
+            Some(end) => {
+                let name = after[..end].trim();
+                match vars.iter().find(|(k, _)| *k == name) {
+                    Some((_, v)) => out.push_str(v),
+                    None => {
+                        out.push_str("{{");
+                        out.push_str(&after[..end]);
+                        out.push_str("}}");
+                    }
+                }
+                rest = &after[end + 2..];
+            }
+            None => {
+                out.push_str("{{");
+                out.push_str(after);
+                rest = "";
+            }
+        }
     }
+    out.push_str(rest);
     out
 }
 
-/// 渲染 user：模板缺少 `TASK:` 标记时自动补一行，保证 Mock 兼容
+/// 渲染 user：模板（填充前）缺少 `TASK:` 标记时自动补一行（Mock 兼容）。
+/// 注意判断的是模板本身而不是渲染结果——变量值里出现 `TASK:` 不该影响补标记。
 fn fill_user(spec: &TaskSpec, tpl: &str, vars: &[(&str, String)]) -> String {
     let out = fill(tpl, vars);
-    if out.contains("TASK:") {
+    if tpl.contains("TASK:") {
         out
     } else {
         format!("{}\n{}", marker(spec.id, vars), out)
@@ -687,6 +712,40 @@ mod tests {
 
     fn none() -> Overrides {
         Overrides::default()
+    }
+
+    #[test]
+    fn fill_is_single_pass_trims_names_and_marks_from_template() {
+        // ① 变量值里的 {{占位符}} 不被二次替换（避免注入/自展开）
+        let ov = none();
+        let (_, usr) = brief_prompt("他说{{style_line}}真好", None, &ov);
+        assert!(
+            usr.contains("{{style_line}}"),
+            "值里的占位符应原样保留：{usr}"
+        );
+        // ② 占位符两侧有空格的模板也能渲染（校验通过就应生效）
+        let mut o = Overrides::default();
+        o.set(
+            "brief",
+            Template {
+                system: "s".into(),
+                user: "写 {{ idea }} 吧\nTASK:brief".into(),
+            },
+        );
+        let (_, usr2) = brief_prompt("鲸歌", None, &o);
+        assert!(usr2.contains("写 鲸歌 吧"), "{usr2}");
+        assert!(!usr2.contains("{{"), "{usr2}");
+        // ③ 补 TASK 标记依据「模板本身」：值里出现 TASK: 不该阻止补标记（否则 Mock 会误派任务）
+        let mut o2 = Overrides::default();
+        o2.set(
+            "brief",
+            Template {
+                system: "s".into(),
+                user: "想法：{{idea}}".into(),
+            },
+        );
+        let (_, usr3) = brief_prompt("TASK:chapter index=9", None, &o2);
+        assert!(usr3.contains("TASK:brief"), "模板缺标记时应补上：{usr3}");
     }
 
     #[test]

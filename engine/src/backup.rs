@@ -130,6 +130,30 @@ mod tests {
     }
 
     #[test]
+    fn restore_marks_stale_running_runs_failed() {
+        // 「运行中」时打的备份：恢复后不能残留 running 的运行（否则再次创作会被 409 锁死）
+        let dir_a = tmp_dir("stale-a");
+        let engine_a = Engine::new(AppConfig::for_data_dir(dir_a.clone())).unwrap();
+        let novel = engine_a.db.create_novel("运行中备份", "auto", "").unwrap();
+        engine_a.db.create_run(&novel.id, 5).unwrap(); // 保持 running
+        let zip_path = dir_a.join("backup.zip");
+        build_backup_zip(&engine_a.db, &zip_path).unwrap();
+
+        let dir_b = tmp_dir("stale-b");
+        let engine_b = Engine::new(AppConfig::for_data_dir(dir_b.clone())).unwrap();
+        let db_path = extract_backup_zip(&zip_path, &dir_b).unwrap();
+        engine_b.db.restore_from_file(&db_path).unwrap();
+
+        let run = engine_b.db.latest_run(&novel.id).unwrap().unwrap();
+        assert_ne!(run.status, "running", "恢复后不应残留进行中的运行");
+        assert_eq!(run.status, "failed");
+        assert!(engine_b.db.any_running_run().unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
     fn rejects_invalid_backup() {
         let dir = tmp_dir("bad");
         std::fs::create_dir_all(&dir).unwrap();

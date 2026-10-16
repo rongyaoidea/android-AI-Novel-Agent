@@ -22,11 +22,18 @@ pub enum EngineEvent {
     RunFailed { run_id: String, error: String },
 }
 
+/// 带作品归属的广播事件（SSE 按作品过滤，避免串台）
+#[derive(Clone)]
+pub struct StampedEvent {
+    pub novel_id: String,
+    pub event: EngineEvent,
+}
+
 /// 事件中心：广播给 SSE 订阅者 + 每书保留最近 N 条关键事件的环形缓冲
 /// （刷新页面后重连可回放到日志面板；Token 流不进入缓冲）
 #[derive(Clone)]
 pub struct EventHub {
-    tx: broadcast::Sender<EngineEvent>,
+    tx: broadcast::Sender<StampedEvent>,
     history: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, std::collections::VecDeque<EngineEvent>>>,
     >,
@@ -60,7 +67,10 @@ impl EventHub {
                 q.push_back(ev.clone());
             }
         }
-        let _ = self.tx.send(ev);
+        let _ = self.tx.send(StampedEvent {
+            novel_id: novel_id.to_string(),
+            event: ev,
+        });
     }
 
     /// 某本书的关键事件历史（用于 SSE 重连回放）
@@ -72,7 +82,7 @@ impl EventHub {
             .unwrap_or_default()
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<StampedEvent> {
         self.tx.subscribe()
     }
 }
@@ -110,6 +120,14 @@ fn maybe_chain_auto(engine: &Arc<Engine>, novel_id: &str) -> anyhow::Result<()> 
         engine.db.set_novel_auto_continue(novel_id, false)?;
         return Ok(());
     }
+    // 审校处理进行中：本轮不接下一批（避免与审校任务并发互写正文）
+    if engine.is_reviewing(novel_id) {
+        engine.hub.publish(novel_id, EngineEvent::Stage {
+            stage: "auto".into(),
+            message: "审校处理进行中，本批暂不自动续写；处理完成后可再点「自动连载」".into(),
+        });
+        return Ok(());
+    }
     if !novel.auto_continue {
         return Ok(());
     }
@@ -138,7 +156,7 @@ fn maybe_chain_auto(engine: &Arc<Engine>, novel_id: &str) -> anyhow::Result<()> 
     if settings.monthly_budget_tokens > 0 {
         let used = engine
             .db
-            .usage_total_since(&crate::api::month_start_utc())
+            .usage_total_since(&crate::api::month_start_local())
             .unwrap_or(0);
         if used >= settings.monthly_budget_tokens {
             engine.db.set_novel_auto_continue(novel_id, false)?;
@@ -404,7 +422,7 @@ async fn run_inner(
             if pipeline_settings.monthly_budget_tokens > 0 {
                 let used = engine
                     .db
-                    .usage_total_since(&crate::api::month_start_utc())
+                    .usage_total_since(&crate::api::month_start_local())
                     .unwrap_or(0);
                 if used >= pipeline_settings.monthly_budget_tokens {
                     engine.hub.publish(novel_id, EngineEvent::Stage {
@@ -497,7 +515,7 @@ async fn run_inner(
         for attempt in 1..=2u8 {
             let mut buf = String::new();
             let hub = engine.hub.clone();
-            let streamed = tokio::select! {
+            let streamed_result = tokio::select! {
                 r = llm.stream(&sys, &usr, |delta: &str| {
                     buf.push_str(delta);
                     if buf.chars().count() >= 80 {
@@ -510,7 +528,7 @@ async fn run_inner(
                             },
                         );
                     }
-                }) => r?,
+                }) => r,
                 _ = wait_for_stop(&engine, novel_id) => {
                     pause_for_stop(
                         &engine,
@@ -523,6 +541,21 @@ async fn run_inner(
                     )?;
                     return Ok(());
                 }
+            };
+            // 空响应（内容过滤/兼容实现返回非 SSE 等）走「自动重试一次」，而不是让整批运行失败
+            let streamed = match streamed_result {
+                Ok(s) => s,
+                Err(e) if e.downcast_ref::<crate::llm::EmptyStreamError>().is_some() => {
+                    if attempt < 2 {
+                        engine.hub.publish(novel_id, EngineEvent::Stage {
+                            stage: "draft".into(),
+                            message: format!("第 {idx} 章返回空内容，自动重试一次…"),
+                        });
+                        continue;
+                    }
+                    anyhow::bail!("第 {idx} 章生成内容为空（已自动重试）");
+                }
+                Err(e) => return Err(e),
             };
             record_usage(
                 &engine.db,
@@ -574,7 +607,7 @@ async fn run_inner(
                 );
                 let mut buf2 = String::new();
                 let hub2 = engine.hub.clone();
-                let streamed2 = tokio::select! {
+                let streamed2_result = tokio::select! {
                     r = llm.stream(&sys, &usr_retry, |delta: &str| {
                         buf2.push_str(delta);
                         if buf2.chars().count() >= 80 {
@@ -584,7 +617,7 @@ async fn run_inner(
                                 delta: chunk,
                             });
                         }
-                    }) => r?,
+                    }) => r,
                     _ = wait_for_stop(&engine, novel_id) => {
                         pause_for_stop(
                             &engine,
@@ -598,27 +631,35 @@ async fn run_inner(
                         return Ok(());
                     }
                 };
-                record_usage(
-                    &engine.db,
-                    Some(novel_id),
-                    Some(idx),
-                    "chapter_retry",
-                    &settings,
-                    &streamed2.usage,
-                );
-                if !buf2.is_empty() {
-                    let chunk = std::mem::take(&mut buf2);
-                    engine.hub.publish(novel_id, EngineEvent::Token {
-                        chapter_idx: idx,
-                        delta: chunk,
-                    });
-                }
-                let c2 = streamed2.text.trim().to_string();
-                if !c2.is_empty() {
-                    let r2 = crate::style_check::check_chapter(p, &c2);
-                    if r2.score() >= r.score() {
-                        content = c2;
-                        report = Some(r2);
+                // 重写失败不致命：保留原稿继续后续流程
+                match streamed2_result {
+                    Ok(streamed2) => {
+                        record_usage(
+                            &engine.db,
+                            Some(novel_id),
+                            Some(idx),
+                            "chapter_retry",
+                            &settings,
+                            &streamed2.usage,
+                        );
+                        if !buf2.is_empty() {
+                            let chunk = std::mem::take(&mut buf2);
+                            engine.hub.publish(novel_id, EngineEvent::Token {
+                                chapter_idx: idx,
+                                delta: chunk,
+                            });
+                        }
+                        let c2 = streamed2.text.trim().to_string();
+                        if !c2.is_empty() {
+                            let r2 = crate::style_check::check_chapter(p, &c2);
+                            if r2.score() >= r.score() {
+                                content = c2;
+                                report = Some(r2);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("chapter {idx} style retry failed: {e:#}（保留原稿）");
                     }
                 }
             }
@@ -684,6 +725,19 @@ async fn run_inner(
         wrote_in_run += 1;
     }
 
+    // 运行收尾：真实进度游标（预算/停止提前收尾时不虚报）+ 补写缺失卷摘要 + 伏笔自动审核
+    let last_done = engine
+        .db
+        .list_chapter_metas(novel_id)
+        .map(|cs| {
+            cs.iter()
+                .filter(|c| c.status == "done")
+                .map(|c| c.idx)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let _ = maybe_fill_volume_summaries(&engine, novel_id, last_done).await;
     // 伏笔自动审核（按设置间隔；1 = 每批都跑，N = 已完成章号逢 N 的倍数，0 = 关闭）
     if wrote_in_run > 0 {
         let every = engine
@@ -691,23 +745,12 @@ async fn run_inner(
             .pipeline_settings()
             .unwrap_or_default()
             .audit_every();
-        let last_idx = engine
-            .db
-            .list_chapter_metas(novel_id)
-            .map(|cs| {
-                cs.iter()
-                    .filter(|c| c.status == "done")
-                    .map(|c| c.idx)
-                    .max()
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
-        if every > 0 && (every == 1 || last_idx % every == 0) {
+        if every > 0 && (every == 1 || last_done % every == 0) {
             let _ = audit_foreshadowings(&engine, novel_id).await;
         }
     }
 
-    engine.db.update_run(run_id, "done", "done", chapters, None)?;
+    engine.db.update_run(run_id, "done", "done", last_done, None)?;
     engine.db.set_novel_status(novel_id, "drafted")?;
     engine.hub.publish(novel_id, EngineEvent::RunFinished {
         run_id: run_id.to_string(),
@@ -778,11 +821,11 @@ fn recent_summaries_context(db: &crate::db::Db, novel_id: &str, current_idx: i64
             ));
         }
     }
-    let chapters = db.list_chapters(novel_id)?;
+    let chapters = db.list_chapter_summaries(novel_id)?;
     let mut lines: Vec<String> = chapters
         .iter()
-        .filter(|c| c.idx < current_idx && !c.summary.trim().is_empty())
-        .map(|c| format!("第{}章 {}：{}", c.idx, c.title, c.summary.trim()))
+        .filter(|(idx, _, summary)| *idx < current_idx && !summary.trim().is_empty())
+        .map(|(idx, title, summary)| format!("第{}章 {}：{}", idx, title, summary.trim()))
         .collect();
     if !lines.is_empty() {
         let keep = lines.len().saturating_sub(5);
@@ -864,11 +907,11 @@ async fn generate_volume_summary(
 ) -> anyhow::Result<()> {
     let from = (volume_idx - 1) * VOLUME_SPAN + 1;
     let to = volume_idx * VOLUME_SPAN;
-    let chapters = engine.db.list_chapters(novel_id)?;
+    let chapters = engine.db.list_chapter_summaries(novel_id)?;
     let items: Vec<(i64, String, String)> = chapters
         .iter()
-        .filter(|c| c.idx >= from && c.idx <= to && !c.summary.trim().is_empty())
-        .map(|c| (c.idx, c.title.clone(), c.summary.trim().to_string()))
+        .filter(|(idx, _, summary)| *idx >= from && *idx <= to && !summary.trim().is_empty())
+        .map(|(idx, title, summary)| (*idx, title.clone(), summary.trim().to_string()))
         .collect();
     if items.is_empty() {
         return Ok(());
@@ -906,6 +949,35 @@ async fn generate_volume_summary(
         message: format!("第 {volume_idx} 卷摘要已生成（第 {from}~{to} 章）"),
     });
     Ok(())
+}
+
+/// 补写缺失的卷级摘要：覆盖「第 20/40… 章由人工或单章接口完成」导致跳过边界触发的情况。
+async fn maybe_fill_volume_summaries(
+    engine: &Arc<Engine>,
+    novel_id: &str,
+    upto: i64,
+) -> anyhow::Result<usize> {
+    let max_vol = upto / VOLUME_SPAN;
+    if max_vol <= 0 {
+        return Ok(0);
+    }
+    let existing: std::collections::HashSet<i64> = engine
+        .db
+        .list_volume_summaries(novel_id)?
+        .iter()
+        .map(|v| v.volume_idx)
+        .collect();
+    let mut made = 0usize;
+    for v in 1..=max_vol {
+        if existing.contains(&v) {
+            continue;
+        }
+        match generate_volume_summary(engine, novel_id, v).await {
+            Ok(()) => made += 1,
+            Err(e) => tracing::warn!("volume summary {v} failed: {e:#}"),
+        }
+    }
+    Ok(made)
 }
 
 /// 组装台账上下文：活跃角色事实（最近 6 人 × 3 条）+ 未回收伏笔（最多 8 条，标注已拖延章数）
@@ -974,7 +1046,8 @@ pub async fn review_and_fix_chapter(
             Ok(out) => {
                 record_usage(&engine.db, Some(novel_id), Some(idx), "review", &settings, &out.usage);
                 let raw = out.text;
-                if let Some(j) = extract_json_object(&raw) {
+                // 必须带 issues 数组：缺字段视为解析失败（否则会被当成「0 条问题」误放行）
+                if let Some(j) = extract_json_object(&raw).filter(|j| j["issues"].is_array()) {
                     let mut review = Review {
                         ok: j["ok"].as_bool().unwrap_or(true),
                         issues: j["issues"]
@@ -999,14 +1072,20 @@ pub async fn review_and_fix_chapter(
                     // ---- 自动修复（减少人工介入）----
                     // 审校出现高/中危问题时：按意见自动修订一次并复核，仅在问题变少时采用新稿。
                     let pipeline_settings = engine.db.pipeline_settings().unwrap_or_default();
-                    let fixable: Vec<String> = review
+                    let mut fixable: Vec<String> = review
                         .issues
                         .iter()
                         .filter(|i| i.severity == "high" || i.severity == "medium")
                         .map(|i| i.note.trim().to_string())
                         .filter(|n| !n.is_empty())
-                        .take(6)
                         .collect();
+                    // 本地文风硬指标一并交给这次修复处理（修完会重算文风报告）
+                    if let Some(r) = &report {
+                        for c in r.checks.iter().filter(|c| c.hard && !c.passed) {
+                            fixable.push(format!("文风检查：{} —— {}", c.name, c.detail));
+                        }
+                    }
+                    let fixable: Vec<String> = fixable.into_iter().take(8).collect();
                     if pipeline_settings.auto_fix_review
                         && !fixable.is_empty()
                         && !engine.stop_requested(novel_id)
@@ -1054,26 +1133,21 @@ pub async fn review_and_fix_chapter(
                                                     &settings,
                                                     &r2out.usage,
                                                 );
-                                                extract_json_object(&r2out.text).map(|j2| {
-                                                    j2["issues"]
-                                                        .as_array()
-                                                        .map(|a| {
-                                                            a.iter()
-                                                                .map(|it| ReviewIssue {
-                                                                    severity: str_field(
-                                                                        it, "severity", "info",
-                                                                    ),
-                                                                    note: str_field(it, "note", ""),
-                                                                    quote: str_field(
-                                                                        it, "quote", "",
-                                                                    ),
-                                                                    status: "open".to_string(),
-                                                                    is_new: false,
-                                                                    stale: false,
-                                                                })
-                                                                .collect()
-                                                        })
-                                                        .unwrap_or_default()
+                                                extract_json_object(&r2out.text).and_then(|j2| {
+                                                    j2["issues"].as_array().map(|a| {
+                                                        a.iter()
+                                                            .map(|it| ReviewIssue {
+                                                                severity: str_field(
+                                                                    it, "severity", "info",
+                                                                ),
+                                                                note: str_field(it, "note", ""),
+                                                                quote: str_field(it, "quote", ""),
+                                                                status: "open".to_string(),
+                                                                is_new: false,
+                                                                stale: false,
+                                                            })
+                                                            .collect()
+                                                    })
                                                 })
                                             }
                                             Err(e) => {
@@ -1156,7 +1230,7 @@ pub async fn review_and_fix_chapter(
             Err(e) => tracing::warn!("chapter {idx} review failed: {e:#}"),
         }
 
-    let review = parsed.ok_or_else(|| anyhow::anyhow!("审校输出无法解析为 JSON"))?;
+    let review = parsed.ok_or_else(|| anyhow::anyhow!("审校输出无法解析（缺 issues 数组）"))?;
     *content_ref = content;
     Ok(review)
 }
@@ -1171,14 +1245,21 @@ fn review_needs_processing(ch: &crate::models::Chapter) -> bool {
     }
 }
 
-/// 仍存在（未标 fixed）的高/中危意见数
-fn medium_high_count(review: &Review) -> usize {
+/// 仍存在（未标 fixed）的高/中危意见数。
+/// 本地文风检查项不算：它由生成期重写与人工处理，「AI 处理全部审校」的队列只针对 LLM 审校意见，
+/// 否则每轮都会把同一章重新入队、永不收敛。
+pub fn medium_high_count(review: &Review) -> usize {
     review
         .issues
         .iter()
+        .filter(|i| !is_style_issue(i))
         .filter(|i| i.status != "fixed")
         .filter(|i| i.severity == "high" || i.severity == "medium")
         .count()
+}
+
+fn is_style_issue(i: &ReviewIssue) -> bool {
+    i.note.starts_with("文风检查：")
 }
 
 /// 汇总审校意见状态（旧 → 新）：
@@ -1293,11 +1374,11 @@ async fn audit_foreshadowings(engine: &Arc<Engine>, novel_id: &str) -> anyhow::R
     if open.is_empty() {
         return Ok(0);
     }
-    let chapters = engine.db.list_chapters(novel_id)?;
+    let chapters = engine.db.list_chapter_summaries(novel_id)?;
     let summaries: Vec<String> = chapters
         .iter()
-        .filter(|c| !c.summary.trim().is_empty())
-        .map(|c| format!("第{}章 {}：{}", c.idx, c.title, c.summary.trim()))
+        .filter(|(_, _, summary)| !summary.trim().is_empty())
+        .map(|(idx, title, summary)| format!("第{}章 {}：{}", idx, title, summary.trim()))
         .collect();
     if summaries.is_empty() {
         return Ok(0);
@@ -1313,7 +1394,8 @@ async fn audit_foreshadowings(engine: &Arc<Engine>, novel_id: &str) -> anyhow::R
         .map(|f| format!("- {}（第{}章埋下）", f.title, f.planted_chapter))
         .collect::<Vec<_>>()
         .join("\n");
-    let sum_text: String = summaries.join("\n").chars().take(6000).collect();
+    // 长书的回收证据通常出现在最近的章节：截断取「最近 6000 字」而不是最早 6000 字
+    let sum_text: String = tail_chars(&summaries.join("\n"), 6000);
     let ov = engine.prompt_overrides();
     let (sys, usr) = crate::prompts::foreshadow_audit_prompt(&list, &sum_text, &ov);
     match llm.complete(&sys, &usr).await {
@@ -1379,7 +1461,7 @@ pub fn apply_foreshadow_audit(
             f.notes.clone()
         };
         if db
-            .update_foreshadowing(&f.id, "resolved", &notes, Some(chapter_idx))
+            .update_foreshadowing(&f.novel_id, &f.id, "resolved", &notes, Some(chapter_idx))
             .unwrap_or(false)
         {
             n += 1;
@@ -1388,9 +1470,28 @@ pub fn apply_foreshadow_audit(
     n
 }
 
-/// 一键「AI 处理全部审校」：对有内容的、存在待处理问题的章节重新审校并自动修复。
+/// 「AI 处理全部审校」：对有内容的、存在待处理问题的章节重新审校并自动修复。
 /// 返回待处理章节数（0 = 都已处理）；后台执行，进度经 SSE 推送。
+/// 同一本书同时只允许一轮（Engine 里有名额）；处理期间可被「停止」中断，且与创作运行互斥。
 pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i64> {
+    if !engine.begin_review(novel_id) {
+        anyhow::bail!("已有一轮审校处理在进行中");
+    }
+    // 名额守卫：无论函数从哪条路径返回、任务如何结束（含 panic），Drop 都会释放
+    struct ReviewSlot {
+        engine: Arc<Engine>,
+        novel_id: String,
+    }
+    impl Drop for ReviewSlot {
+        fn drop(&mut self) {
+            self.engine.end_review(&self.novel_id);
+        }
+    }
+    let slot = ReviewSlot {
+        engine: engine.clone(),
+        novel_id: novel_id.to_string(),
+    };
+
     let novel = engine
         .db
         .get_novel(novel_id)?
@@ -1410,17 +1511,26 @@ pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i
             .iter()
             .any(|f| f.status == "open");
         if !has_open_foreshadow {
-            return Ok(0);
+            return Ok(0); // slot drop → 释放名额
         }
     }
     let total = targets.len() as i64;
     let style_id = novel.style_preset.clone();
     let nid = novel_id.to_string();
     tokio::spawn(async move {
+        let _slot = slot; // 任务结束（含中途 return）才释放
         let style = crate::styles::find(&style_id);
         let ov = engine.prompt_overrides();
         let mut digested = 0usize;
         for (i, (idx, title, goal)) in targets.iter().enumerate() {
+            if engine.stop_requested(&nid) {
+                engine.clear_stop(&nid);
+                engine.hub.publish(&nid, EngineEvent::Stage {
+                    stage: "done".into(),
+                    message: "审校处理已停止（未处理的章节保持原样）".into(),
+                });
+                return;
+            }
             engine.hub.publish(&nid, EngineEvent::Stage {
                 stage: "review".into(),
                 message: format!("AI 处理审校：第 {idx} 章（{}/{total}）…", i + 1),
@@ -1440,11 +1550,28 @@ pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i
             {
                 Ok(r) => {
                     digested += before.saturating_sub(medium_high_count(&r));
+                    // 保持定稿状态：内部采纳修复稿时会以 drafted 落库，这里恢复 done，
+                    // 否则下一轮「继续创作」会按章纲整章重写、覆盖刚修好的稿
+                    if ch.status == "done" {
+                        let _ = engine.db.save_chapter_content(&nid, *idx, &content, "done");
+                    }
                 }
                 Err(e) => tracing::warn!("review-all chapter {idx} failed: {e:#}"),
             }
         }
-        // 阶段二：伏笔自动审核（用章节摘要判定未回收伏笔是否已实质回收）
+        // 阶段二前：补写缺失卷摘要（审校可能补齐了缺失章节的摘要）
+        let last_done = engine
+            .db
+            .list_chapter_metas(&nid)
+            .map(|cs| {
+                cs.iter()
+                    .filter(|c| c.status == "done")
+                    .map(|c| c.idx)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let _ = maybe_fill_volume_summaries(&engine, &nid, last_done).await;
         let resolved = audit_foreshadowings(&engine, &nid).await.unwrap_or(0);
         let message = if total > 0 {
             format!(
@@ -1731,6 +1858,51 @@ mod tests {
             "应记录卷摘要用量：{:?}",
             groups.iter().map(|g| g.key.clone()).collect::<Vec<_>>()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn volume_summary_heals_manually_written_boundary() {
+        // 第 20 章由人工/单章接口完成（绕过流水线边界触发）时，补写入口仍能生成卷摘要
+        let dir = tmp_dir("volume-heal");
+        let engine = std::sync::Arc::new(Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap());
+        engine
+            .db
+            .set_llm_settings(&crate::models::LlmSettings::default())
+            .unwrap();
+        let novel = engine.db.create_novel("卷摘要补写测试", "auto", "").unwrap();
+        for i in 1..=20i64 {
+            engine
+                .db
+                .upsert_chapter_plan(
+                    &novel.id,
+                    &crate::models::ChapterPlan {
+                        idx: i,
+                        title: format!("第{i}章"),
+                        goal: String::new(),
+                        beats: vec![],
+                    },
+                )
+                .unwrap();
+            // 注意：不走 generate_volume_summary 的边界触发，模拟手工写完全部章节
+            engine
+                .db
+                .save_chapter_content(&novel.id, i, "正文内容", "done")
+                .unwrap();
+            engine
+                .db
+                .set_chapter_summary(&novel.id, i, &format!("第{i}章摘要：某事发生"))
+                .unwrap();
+        }
+        assert!(engine.db.list_volume_summaries(&novel.id).unwrap().is_empty());
+        let made = maybe_fill_volume_summaries(&engine, &novel.id, 20).await.unwrap();
+        assert!(made >= 1, "应补写出第 1 卷摘要");
+        let vols = engine.db.list_volume_summaries(&novel.id).unwrap();
+        assert_eq!(vols.len(), 1);
+        assert_eq!(vols[0].volume_idx, 1);
+        // 幂等：再跑一次不重复生成
+        let again = maybe_fill_volume_summaries(&engine, &novel.id, 20).await.unwrap();
+        assert_eq!(again, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

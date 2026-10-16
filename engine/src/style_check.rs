@@ -157,7 +157,12 @@ fn count_dialog_chars(text: &str) -> usize {
         let mut in_dialog = false;
         for ch in text.chars() {
             if ch == open {
-                in_dialog = true;
+                if open == close {
+                    // 直引号同一字符成对：开/关交替翻转（否则从第一个引号起全部误算为对话）
+                    in_dialog = !in_dialog;
+                } else {
+                    in_dialog = true;
+                }
             } else if ch == close {
                 in_dialog = false;
             } else if in_dialog {
@@ -373,6 +378,17 @@ mod tests {
         let r2 = check_chapter(preset("shadiao"), text2);
         let d2 = r2.checks.iter().find(|c| c.name == "对话占比").unwrap();
         assert!(d2.passed, "{d2:?}");
+    }
+
+    #[test]
+    fn straight_quotes_toggle_dialog_count() {
+        // 直引号同一字符成对：应开/关交替，只统计引号内内容（此前会从第一个引号起全部误算）
+        let text = "他说\"别动。\"风停了，灯塔的光扫过海面，所有人沉默着看向远处。";
+        assert_eq!(count_dialog_chars(text), "别动。".chars().count());
+
+        // 中文引号仍按左右配对统计
+        let text2 = "他问：「走不走？」外面安静极了，没有人回答他的问题。";
+        assert_eq!(count_dialog_chars(text2), "走不走？".chars().count());
     }
 
     #[test]
