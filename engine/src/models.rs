@@ -68,6 +68,12 @@ pub struct Chapter {
     pub title: String,
     pub goal: String,
     pub beats: Vec<String>,
+    /// 章末钩型（LLM 规划写入：悬念/危机/反转/升级/信息；空 = 未标注）
+    #[serde(default)]
+    pub hook_type: String,
+    /// 推进强度 1–5（1=过渡、3=小高潮、5=卷级爆点；0 = 未标注）
+    #[serde(default)]
+    pub intensity: i64,
     pub content: String,
     /// 章节摘要（写后自动生成，供后续章节回顾）
     pub summary: String,
@@ -305,6 +311,10 @@ pub struct ChapterMeta {
     pub title: String,
     pub goal: String,
     pub beats: Vec<String>,
+    /// 章末钩型（节奏字段：悬念/危机/反转/升级/信息；空 = 未标注）
+    pub hook_type: String,
+    /// 推进强度 1–5（0 = 未标注）
+    pub intensity: i64,
     pub status: String,
     pub words: i64,
     pub preview: String,
@@ -390,6 +400,10 @@ pub struct PipelineSettings {
     /// 自动连载每批章节数（1–50，默认 10）
     #[serde(default = "default_auto_batch")]
     pub auto_batch: i64,
+    /// 单次规划章数（3–50，默认 10）：章节规划按窗口滚动生成，
+    /// 写到窗口尾部前自动续规划下一段（避免一次规划几十章导致漂移与截断）
+    #[serde(default = "default_plan_window")]
+    pub plan_window: i64,
     /// 伏笔自动审核间隔（章）：1 = 每批收尾都跑；N = 章节号逢 N 的倍数才跑；0 = 关闭（默认 1）
     #[serde(default = "default_audit_every")]
     pub foreshadow_audit_every: i64,
@@ -402,6 +416,10 @@ pub struct PipelineSettings {
 }
 
 fn default_auto_batch() -> i64 {
+    10
+}
+
+fn default_plan_window() -> i64 {
     10
 }
 
@@ -422,6 +440,11 @@ impl PipelineSettings {
         self.auto_batch.clamp(1, 50)
     }
 
+    /// 单次规划窗口（3–50；默认 10）
+    pub fn plan_window(&self) -> i64 {
+        self.plan_window.clamp(3, 50)
+    }
+
     pub fn audit_every(&self) -> i64 {
         self.foreshadow_audit_every.clamp(0, 100)
     }
@@ -437,6 +460,7 @@ impl Default for PipelineSettings {
             auto_fix_review: true,
             monthly_budget_tokens: 0,
             auto_batch: default_auto_batch(),
+            plan_window: default_plan_window(),
             foreshadow_audit_every: default_audit_every(),
             global_review_every: default_global_every(),
             auto_fix_global: true,

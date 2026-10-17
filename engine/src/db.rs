@@ -50,7 +50,7 @@ fn excerpt_for(content: &str, query: &str) -> String {
     let head: String = content.chars().take(80).collect();
     format!("{head}…")
 }
-const CHAPTER_COLS: &str = "id,novel_id,idx,title,goal,beats_json,content,summary,status,review_json,created_at,updated_at,style_report";
+const CHAPTER_COLS: &str = "id,novel_id,idx,title,goal,beats_json,content,summary,status,review_json,created_at,updated_at,style_report,hook_type,intensity";
 const RUN_COLS: &str = "id,novel_id,status,stage,chapter_cursor,chapters_target,error,created_at,updated_at";
 
 impl Db {
@@ -210,6 +210,9 @@ impl Db {
         Self::ensure_column(&conn, "novels", "worldview", "worldview TEXT NOT NULL DEFAULT ''")?;
         // 旧库升级：补 novels.clarify_json 列（立项澄清问答）
         Self::ensure_column(&conn, "novels", "clarify_json", "clarify_json TEXT NOT NULL DEFAULT ''")?;
+        // 旧库升级：补 chapters.hook_type / intensity 列（章纲节奏字段：章末钩型 + 推进强度）
+        Self::ensure_column(&conn, "chapters", "hook_type", "hook_type TEXT NOT NULL DEFAULT ''")?;
+        Self::ensure_column(&conn, "chapters", "intensity", "intensity INTEGER NOT NULL DEFAULT 0")?;
         // 卷级摘要（每 20 章归并一条，供长书回顾注入）
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS volume_summaries (
@@ -629,7 +632,8 @@ impl Db {
 
     fn map_chapter(row: &Row<'_>) -> rusqlite::Result<Chapter> {
         // 列顺序: id(0) novel_id(1) idx(2) title(3) goal(4) beats_json(5)
-        //          content(6) summary(7) status(8) review_json(9) created_at(10) updated_at(11) style_report(12)
+        //          content(6) summary(7) status(8) review_json(9) created_at(10) updated_at(11)
+        //          style_report(12) hook_type(13) intensity(14)
         let beats_json: String = row.get(5)?;
         Ok(Chapter {
             id: row.get(0)?,
@@ -638,6 +642,8 @@ impl Db {
             title: row.get(3)?,
             goal: row.get(4)?,
             beats: serde_json::from_str(&beats_json).unwrap_or_default(),
+            hook_type: row.get(13)?,
+            intensity: row.get(14)?,
             content: row.get(6)?,
             summary: row.get(7)?,
             status: row.get(8)?,
@@ -988,7 +994,7 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT idx, title, goal, beats_json, status, LENGTH(content),
-                    SUBSTR(content, 1, 60), review_json
+                    SUBSTR(content, 1, 60), review_json, hook_type, intensity
              FROM chapters WHERE novel_id=?1 ORDER BY idx ASC",
         )?;
         let rows = stmt.query_map([novel_id], |r| {
@@ -998,6 +1004,8 @@ impl Db {
                 title: r.get(1)?,
                 goal: r.get(2)?,
                 beats: serde_json::from_str(&beats_json).unwrap_or_default(),
+                hook_type: r.get(8)?,
+                intensity: r.get(9)?,
                 status: r.get(4)?,
                 words: r.get(5)?,
                 preview: r.get(6)?,
@@ -1280,6 +1288,23 @@ impl Db {
     }
 
     /// 编辑规划（仅限尚未开写的章节）
+    /// 保存章纲的节奏字段（章末钩型 / 推进强度；仅作用于尚未开写的章节）
+    pub fn set_chapter_pacing(
+        &self,
+        novel_id: &str,
+        idx: i64,
+        hook_type: &str,
+        intensity: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chapters SET hook_type=?3, intensity=?4, updated_at=?5
+             WHERE novel_id=?1 AND idx=?2 AND status='planned'",
+            params![novel_id, idx, hook_type.trim(), intensity.clamp(0, 5), now()],
+        )?;
+        Ok(())
+    }
+
     pub fn update_chapter_plan(
         &self,
         novel_id: &str,

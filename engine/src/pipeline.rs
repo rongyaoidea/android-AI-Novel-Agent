@@ -96,16 +96,153 @@ impl Default for EventHub {
 /// 自动连载：每批章节数（批间有运行检查点，便于崩溃恢复与进度可见）
 pub const AUTO_BATCH: i64 = 10;
 
-/// 自动连载的下一批目标截止章号 = min(已规划最大章号 + 每批章数, 全书目标)
+/// 已写完的最后一章章号（状态 done 且正文非空）
+fn done_through(db: &crate::db::Db, novel_id: &str) -> anyhow::Result<i64> {
+    Ok(db
+        .list_chapters(novel_id)?
+        .iter()
+        .filter(|c| c.status == "done" && !c.content.trim().is_empty())
+        .map(|c| c.idx)
+        .max()
+        .unwrap_or(0))
+}
+
+/// 自动连载的下一批目标截止章号 = min(已写完章号 + 每批章数, 全书目标)。
+/// 以「已写完」为基准（而非已规划），避免滚动规划产生的超前计划让一次写过多章。
 pub fn auto_batch_target(
     db: &crate::db::Db,
     novel_id: &str,
     target: i64,
     batch: i64,
 ) -> anyhow::Result<i64> {
-    let chapters = db.list_chapters(novel_id)?;
-    let max_idx = chapters.iter().map(|c| c.idx).max().unwrap_or(0);
-    Ok((max_idx + batch.clamp(1, 50)).min(target.max(0)))
+    let done = done_through(db, novel_id)?;
+    Ok((done + batch.clamp(1, 50)).min(target.max(0)))
+}
+
+/// 「继续创作」的默认终点：从已写完处再写一批（受全书目标约束；未设目标时按批大小前进）
+pub fn run_batch_end(db: &crate::db::Db, novel_id: &str, batch: i64) -> anyhow::Result<i64> {
+    let novel = db
+        .get_novel(novel_id)?
+        .ok_or_else(|| anyhow::anyhow!("novel not found: {novel_id}"))?;
+    let done = done_through(db, novel_id)?;
+    let batch = batch.clamp(1, 50);
+    let target = if novel.target_chapters > 0 {
+        novel.target_chapters
+    } else {
+        done + batch
+    };
+    Ok((done + batch).min(target))
+}
+
+/// 规划并落库 [from, to] 区间的章纲（一次 LLM 调用；已开写/已定稿章节不会被覆盖）。
+/// 滚动规划的公共入口：run 开头规划首个窗口，写到窗口尾部前再续规划下一段。
+#[allow(clippy::too_many_arguments)]
+async fn plan_range(
+    engine: &Arc<Engine>,
+    novel: &Novel,
+    novel_id: &str,
+    from: i64,
+    to: i64,
+    llm: &Llm,
+    ov: &crate::prompts::Overrides,
+    settings: &LlmSettings,
+) -> anyhow::Result<()> {
+    if to < from {
+        return Ok(());
+    }
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "outline".into(),
+        message: if from == 1 {
+            "生成章节规划…".into()
+        } else {
+            format!("续规划第 {from}~{to} 章…")
+        },
+    });
+    let brief = Brief {
+        title: novel.title.clone(),
+        genre: novel.genre.clone(),
+        logline: novel.logline.clone(),
+        protagonist: novel.protagonist.clone(),
+        style: novel.style.clone(),
+        worldview: novel.worldview.clone(),
+    };
+    let existing = engine.db.list_chapters(novel_id)?;
+    let prev_all: Vec<(i64, String)> = existing
+        .iter()
+        .filter(|c| c.idx < from)
+        .map(|c| (c.idx, c.title.clone()))
+        .collect();
+    let prev_tail = &prev_all[prev_all.len().saturating_sub(5)..];
+    let (sys, usr) = crate::prompts::outline_prompt(
+        &brief,
+        from,
+        to,
+        prev_tail,
+        crate::styles::find(&novel.style_preset),
+        ov,
+    );
+    // JSON 解析失败自动重试一次（自愈）
+    let mut raw = String::new();
+    let mut parsed: Option<serde_json::Value> = None;
+    for attempt in 1..=2u8 {
+        let out = llm.complete(&sys, &usr).await?;
+        record_usage(&engine.db, Some(novel_id), None, "outline", settings, &out.usage);
+        raw = out.text;
+        match extract_json_object(&raw) {
+            Some(v) => {
+                parsed = Some(v);
+                break;
+            }
+            None if attempt < 2 => {
+                engine.hub.publish(novel_id, EngineEvent::Stage {
+                    stage: "outline".into(),
+                    message: format!("第 {from}~{to} 章规划输出不是 JSON，自动重试一次…"),
+                });
+            }
+            None => {}
+        }
+    }
+    let v = parsed.ok_or_else(|| {
+        anyhow::anyhow!(
+            "outline 输出不是 JSON：{}",
+            raw.chars().take(200).collect::<String>()
+        )
+    })?;
+    if novel.book_outline.trim().is_empty() {
+        let book_outline = str_field(&v, "book_outline", "");
+        engine.db.update_novel_outline(novel_id, &book_outline, "outlined")?;
+    }
+    if let Some(arr) = v["chapters"].as_array() {
+        for item in arr {
+            let idx = item["idx"].as_i64().unwrap_or(0);
+            if idx < from || idx > to {
+                continue;
+            }
+            let plan = ChapterPlan {
+                idx,
+                title: str_field(item, "title", &format!("第{idx}章")),
+                goal: str_field(item, "goal", ""),
+                beats: item["beats"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
+            engine.db.upsert_chapter_plan(novel_id, &plan)?;
+            // 节奏字段（章末钩型 / 推进强度）：模型未输出时保持旧值
+            if item.get("hook_type").is_some() || item.get("intensity").is_some() {
+                let hook_type = item["hook_type"].as_str().unwrap_or("").trim().to_string();
+                let intensity = item["intensity"].as_i64().unwrap_or(0).clamp(0, 5);
+                engine
+                    .db
+                    .set_chapter_pacing(novel_id, idx, &hook_type, intensity)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 运行成功收尾：若开启自动连载且未达目标且未超预算 → 自动启动下一批。
@@ -135,14 +272,7 @@ fn maybe_chain_auto(engine: &Arc<Engine>, novel_id: &str) -> anyhow::Result<()> 
     if target <= 0 {
         return Ok(());
     }
-    let done_through = engine
-        .db
-        .list_chapters(novel_id)?
-        .iter()
-        .filter(|c| c.status == "done" && !c.content.trim().is_empty())
-        .map(|c| c.idx)
-        .max()
-        .unwrap_or(0);
+    let done_through = done_through(&engine.db, novel_id)?;
     if done_through >= target {
         engine.db.set_novel_auto_continue(novel_id, false)?;
         engine.hub.publish(novel_id, EngineEvent::Stage {
@@ -324,92 +454,20 @@ async fn run_inner(
         engine.db.update_run(run_id, "running", "outline", 0, None)?;
     }
 
-    // ---- 2) 章节规划（只补缺失章节，不覆盖已有规划）----
+    // ---- 2) 章节规划（滚动窗口：单次只规划前方 ≤plan_window 章，写到窗口尾部前自动续规划）----
+    let plan_window = engine.db.pipeline_settings().unwrap_or_default().plan_window();
     let existing = engine.db.list_chapters(novel_id)?;
     let have: std::collections::BTreeSet<i64> = existing.iter().map(|c| c.idx).collect();
     let missing: Vec<i64> = (1..=chapters).filter(|i| !have.contains(i)).collect();
-    if !missing.is_empty() {
-        let from = missing[0];
-        let to = chapters;
-        engine.hub.publish(novel_id, EngineEvent::Stage {
-            stage: "outline".into(),
-            message: if from == 1 {
-                "生成章节规划…".into()
-            } else {
-                format!("续规划第 {from}~{to} 章…")
-            },
-        });
-        let brief = Brief {
-            title: novel.title.clone(),
-            genre: novel.genre.clone(),
-            logline: novel.logline.clone(),
-            protagonist: novel.protagonist.clone(),
-            style: novel.style.clone(),
-            worldview: novel.worldview.clone(),
-        };
-        let prev_all: Vec<(i64, String)> = existing
-            .iter()
-            .filter(|c| c.idx < from)
-            .map(|c| (c.idx, c.title.clone()))
-            .collect();
-        let prev_tail = &prev_all[prev_all.len().saturating_sub(5)..];
-        let (sys, usr) = crate::prompts::outline_prompt(
-            &brief,
-            from,
-            to,
-            prev_tail,
-            crate::styles::find(&novel.style_preset),
-            &ov,
-        );
-        // JSON 解析失败自动重试一次（自愈）
-        let mut raw = String::new();
-        let mut parsed: Option<serde_json::Value> = None;
-        for attempt in 1..=2u8 {
-            let out = llm.complete(&sys, &usr).await?;
-            record_usage(&engine.db, Some(novel_id), None, "outline", &settings, &out.usage);
-            raw = out.text;
-            match extract_json_object(&raw) {
-                Some(v) => {
-                    parsed = Some(v);
-                    break;
-                }
-                None if attempt < 2 => {
-                    engine.hub.publish(novel_id, EngineEvent::Stage {
-                        stage: "outline".into(),
-                        message: "章节规划输出不是 JSON，自动重试一次…".into(),
-                    });
-                }
-                None => {}
-            }
-        }
-        let v = parsed.ok_or_else(|| {
-            anyhow::anyhow!("outline 输出不是 JSON：{}", raw.chars().take(200).collect::<String>())
-        })?;
-        if novel.book_outline.trim().is_empty() {
-            let book_outline = str_field(&v, "book_outline", "");
-            engine.db.update_novel_outline(novel_id, &book_outline, "outlined")?;
-        }
-        if let Some(arr) = v["chapters"].as_array() {
-            for item in arr {
-                let idx = item["idx"].as_i64().unwrap_or(0);
-                if idx < from || idx > to {
-                    continue;
-                }
-                let plan = ChapterPlan {
-                    idx,
-                    title: str_field(item, "title", &format!("第{idx}章")),
-                    goal: str_field(item, "goal", ""),
-                    beats: item["beats"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|x| x.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                };
-                engine.db.upsert_chapter_plan(novel_id, &plan)?;
-            }
+    let keep_ahead = (plan_window / 3).max(2);
+    let mut planned_upto = chapters; // 无缺失时视为已规划完毕
+    let mut next_plan_from: Option<i64> = None;
+    if let Some(&first) = missing.first() {
+        let to = (first + plan_window - 1).min(chapters);
+        plan_range(&engine, &novel, novel_id, first, to, &llm, &ov, &settings).await?;
+        planned_upto = to;
+        if to < chapters {
+            next_plan_from = Some(to + 1);
         }
         engine.db.update_run(run_id, "running", "draft", 0, None)?;
 
@@ -481,6 +539,17 @@ async fn run_inner(
             continue;
         }
 
+        // 滚动规划：接近当前规划窗口尾部时续规划下一段（吸收已写章节的实际走向，避免远期漂移）
+        if next_plan_from.is_some() && idx > planned_upto - keep_ahead {
+            let from = next_plan_from.take().unwrap_or(idx);
+            let to = (from + plan_window - 1).min(chapters);
+            plan_range(&engine, &novel, novel_id, from, to, &llm, &ov, &settings).await?;
+            planned_upto = to;
+            if to < chapters {
+                next_plan_from = Some(to + 1);
+            }
+        }
+
         let prev_tail = if idx > 1 {
             engine
                 .db
@@ -512,7 +581,7 @@ async fn run_inner(
         let ledger = ledger_context(&engine.db, novel_id, idx).unwrap_or_default();
         let recent = recent_summaries_context(&engine.db, novel_id, idx).unwrap_or_default();
         // 写前事实预检（本地规则，零 token）：矛盾点在生成前提醒模型
-        let warnings = preflight_warnings(&engine.db, novel_id, idx, &plan);
+        let warnings = preflight_warnings(&engine.db, novel_id, idx, &plan, &ch.hook_type, ch.intensity);
         let preflight = if warnings.is_empty() {
             String::new()
         } else {
@@ -523,12 +592,28 @@ async fn run_inner(
             format!("【写前预检提醒（务必避免以下问题）】\n- {}\n", warnings.join("\n- "))
         };
         let context = format!("{preflight}{recent}{ledger}");
+        // 节奏要求（章纲钩型 / 推进强度 → 提示词；未标注时为空）
+        let mut hook_line = String::new();
+        if !ch.hook_type.trim().is_empty() || ch.intensity > 0 {
+            hook_line.push_str("【本章节奏要求】");
+            if !ch.hook_type.trim().is_empty() {
+                hook_line.push_str(&format!("章末钩型：{}；", ch.hook_type.trim()));
+            }
+            if ch.intensity > 0 {
+                hook_line.push_str(&format!(
+                    "推进强度 {}/5（1=过渡、3=小高潮、5=卷末爆点；强度低也要有实质推进，不能水字数）；",
+                    ch.intensity
+                ));
+            }
+            hook_line.push('\n');
+        }
         let (sys, usr) = crate::prompts::chapter_prompt(
             &brief,
             &novel.book_outline,
             &plan,
             &prev_tail,
             &context,
+            &hook_line,
             crate::styles::find(&novel.style_preset),
             &ov,
         );
@@ -860,14 +945,17 @@ fn recent_summaries_context(db: &crate::db::Db, novel_id: &str, current_idx: i64
     Ok(s)
 }
 
-/// 写前事实预检（本地规则，零 token）：把与台账/近章矛盾的章纲点出来，随提示词注入。
+/// 写前事实预检（本地规则，零 token）：把与台账/近章/节奏矛盾的章纲点出来，随提示词注入。
 /// 规则：① 章纲提到已死亡/退场角色（可能是回忆，但值得核对）；
-///       ② 与最近 5 章目标高度重复（字符二元组 Jaccard ≥ 0.6，提示可能重复桥段）。
+///       ② 与最近 5 章目标高度重复（字符二元组 Jaccard ≥ 0.6，提示可能重复桥段）；
+///       ③ 节奏预检（基于章纲钩型/强度字段）：连续过渡章、连续高强度、强钩同型连发。
 fn preflight_warnings(
     db: &crate::db::Db,
     novel_id: &str,
     idx: i64,
     plan: &ChapterPlan,
+    hook_type: &str,
+    intensity: i64,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
     let text = format!("{} {}", plan.goal, plan.beats.join(" "));
@@ -883,17 +971,52 @@ fn preflight_warnings(
             }
         }
     }
-    if let Ok(recent) = db.list_chapter_metas(novel_id) {
-        for p in recent
-            .iter()
-            .filter(|c| c.idx < idx && c.idx > idx - 6 && !c.goal.trim().is_empty())
-        {
-            let sim = goal_similarity(plan.goal.trim(), p.goal.trim());
-            if sim >= 0.6 {
+    let metas = db.list_chapter_metas(novel_id).unwrap_or_default();
+    for p in metas
+        .iter()
+        .filter(|c| c.idx < idx && c.idx > idx - 6 && !c.goal.trim().is_empty())
+    {
+        let sim = goal_similarity(plan.goal.trim(), p.goal.trim());
+        if sim >= 0.6 {
+            warnings.push(format!(
+                "本章目标与第{}章目标高度相似（{:.0}%）：注意避免重复桥段",
+                p.idx,
+                sim * 100.0
+            ));
+        }
+    }
+    // ③ 节奏预检（强度 0 = 未标注，跳过）
+    let cur_hook = hook_type.trim();
+    if intensity > 0 {
+        let prev1 = metas.iter().filter(|c| c.idx == idx - 1).max_by_key(|c| c.idx);
+        let prev2 = metas.iter().filter(|c| c.idx == idx - 2).max_by_key(|c| c.idx);
+        if let (Some(p1), Some(p2)) = (prev1, prev2) {
+            if p1.intensity > 0
+                && p2.intensity > 0
+                && p1.intensity <= 2
+                && p2.intensity <= 2
+                && intensity <= 2
+            {
                 warnings.push(format!(
-                    "本章目标与第{}章目标高度相似（{:.0}%）：注意避免重复桥段",
-                    p.idx,
-                    sim * 100.0
+                    "节奏偏平：第{}、{}章与本章强度都 ≤2（连续过渡章）——本章需要明确推进/冲突/爆点，或调高本章强度",
+                    p2.idx, p1.idx
+                ));
+            }
+            if p1.intensity >= 4 && p2.intensity >= 4 && intensity >= 4 {
+                warnings.push(
+                    "连续高能：近三章强度都 ≥4，读者容易麻木——本章建议放缓或改用信息型推进"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(p1) = prev1 {
+            if !cur_hook.is_empty()
+                && intensity >= 4
+                && p1.intensity >= 4
+                && p1.hook_type.trim() == cur_hook
+            {
+                warnings.push(format!(
+                    "钩型重复：与上一章同为高强度「{cur_hook}」钩——建议更换钩型（悬念/危机/反转/升级/信息）"
                 ));
             }
         }
@@ -2541,7 +2664,7 @@ mod tests {
             goal: "主角在码头与老陈对峙".into(),
             beats: vec!["对峙升级".into()],
         };
-        let warnings = preflight_warnings(&engine.db, &novel.id, 3, &plan);
+        let warnings = preflight_warnings(&engine.db, &novel.id, 3, &plan, "", 0);
         assert!(
             warnings.iter().any(|w| w.contains("老陈")),
             "应提示已死亡角色：{warnings:?}"
@@ -2557,8 +2680,90 @@ mod tests {
             goal: "主角独自登船前往雾港".into(),
             beats: vec!["启程".into()],
         };
-        let none = preflight_warnings(&engine.db, &novel.id, 3, &clean);
+        let none = preflight_warnings(&engine.db, &novel.id, 3, &clean, "", 0);
         assert!(none.is_empty(), "{none:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preflight_flags_flat_pace_and_repeated_hook() {
+        let dir = tmp_dir("preflight-pacing");
+        let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+        let novel = engine.db.create_novel("节奏预检", "auto", "").unwrap();
+        for i in 1..=4i64 {
+            engine
+                .db
+                .upsert_chapter_plan(
+                    &novel.id,
+                    &crate::models::ChapterPlan {
+                        idx: i,
+                        title: format!("第{i}章"),
+                        goal: String::new(),
+                        beats: vec![],
+                    },
+                )
+                .unwrap();
+        }
+        // 第 1、2 章为过渡强度（1、2）→ 第 3 章也低强度时应提示节奏偏平
+        engine.db.set_chapter_pacing(&novel.id, 1, "悬念", 1).unwrap();
+        engine.db.set_chapter_pacing(&novel.id, 2, "危机", 2).unwrap();
+        let plan3 = crate::models::ChapterPlan {
+            idx: 3,
+            title: "第3章".into(),
+            goal: String::new(),
+            beats: vec![],
+        };
+        let warnings = preflight_warnings(&engine.db, &novel.id, 3, &plan3, "信息", 1);
+        assert!(
+            warnings.iter().any(|w| w.contains("节奏偏平")),
+            "应提示连续过渡章：{warnings:?}"
+        );
+
+        // 第 3、4 章同为「反转」强钩（≥4）→ 第 4 章应提示钩型重复
+        engine.db.set_chapter_pacing(&novel.id, 3, "反转", 4).unwrap();
+        let plan4 = crate::models::ChapterPlan {
+            idx: 4,
+            title: "第4章".into(),
+            goal: String::new(),
+            beats: vec![],
+        };
+        let w2 = preflight_warnings(&engine.db, &novel.id, 4, &plan4, "反转", 4);
+        assert!(
+            w2.iter().any(|w| w.contains("钩型重复")),
+            "应提示同型强钩连发：{w2:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_batch_end_advances_by_batch_from_done_progress() {
+        let dir = tmp_dir("batch-end");
+        let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+        let novel = engine.db.create_novel("批量终点", "auto", "").unwrap();
+        engine.db.set_novel_target(&novel.id, 100).unwrap();
+        for i in 1..=50i64 {
+            engine
+                .db
+                .upsert_chapter_plan(
+                    &novel.id,
+                    &crate::models::ChapterPlan {
+                        idx: i,
+                        title: format!("第{i}章"),
+                        goal: String::new(),
+                        beats: vec![],
+                    },
+                )
+                .unwrap();
+            engine.db.save_chapter_content(&novel.id, i, "正文", "done").unwrap();
+        }
+        // 已写完 50 章、每批 10 → 「继续创作」写到第 60 章（不再被 50 封顶）
+        assert_eq!(run_batch_end(&engine.db, &novel.id, 10).unwrap(), 60);
+        // 目标更近时按目标封顶
+        engine.db.set_novel_target(&novel.id, 55).unwrap();
+        assert_eq!(run_batch_end(&engine.db, &novel.id, 10).unwrap(), 55);
+        // 未设目标：按批大小前进
+        engine.db.set_novel_target(&novel.id, 0).unwrap();
+        assert_eq!(run_batch_end(&engine.db, &novel.id, 10).unwrap(), 60);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

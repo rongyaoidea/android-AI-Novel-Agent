@@ -55,6 +55,8 @@ mod tests {
             title: "起点".into(),
             goal: "".into(),
             beats: vec![],
+            hook_type: String::new(),
+            intensity: 0,
             content: "正文内容。".into(),
             summary: String::new(),
             status: "done".into(),

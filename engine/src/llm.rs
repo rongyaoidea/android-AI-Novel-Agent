@@ -642,13 +642,16 @@ fn mock_complete(user: &str) -> anyhow::Result<String> {
     if user.contains("TASK:outline") {
         let from = extract_number_after(user, "from=").unwrap_or(1).clamp(1, 50);
         let to = extract_number_after(user, "to=").unwrap_or(from + 2).clamp(from, 50);
+        let hooks = ["悬念", "危机", "反转", "升级", "信息"];
         let mut chapters = Vec::new();
         for i in from..=to {
             chapters.push(serde_json::json!({
                 "idx": i,
                 "title": format!("风起之{}", i),
                 "goal": format!("推进第 {} 阶段目标", i),
-                "beats": ["开场钩子", "冲突升级", "章末悬念"]
+                "beats": ["开场钩子", "冲突升级", "章末悬念"],
+                "hook_type": hooks[(i.rem_euclid(5)) as usize],
+                "intensity": 1 + i.rem_euclid(4)
             }));
         }
         return Ok(serde_json::json!({

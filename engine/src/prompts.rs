@@ -96,8 +96,9 @@ static OUTLINE: TaskSpec = TaskSpec {
 已有章节：{{prev_text}}\n\n\
 请给出全书走向与第 {{from}}~{{to}} 章的章节计划（共 {{count}} 章），输出 JSON，字段：\n\
 - book_outline: 全书走向（120 字以内；若已有走向且无需调整，返回空字符串）\n\
-- chapters: 数组，每项 {\"idx\": {{from}}, \"title\": \"章节名\", \"goal\": \"本章目标（30 字以内）\", \"beats\": [\"关键情节1\", \"关键情节2\", \"关键情节3\"]}\n\
-数量必须正好 {{count}} 章，idx 从 {{from}} 连续编号到 {{to}}。{{style_block}}",
+- chapters: 数组，每项 {\"idx\": {{from}}, \"title\": \"章节名\", \"goal\": \"本章目标（30 字以内）\", \"beats\": [\"关键情节1\", \"关键情节2\", \"关键情节3\"], \"hook_type\": \"章末钩型（悬念/危机/反转/升级/信息，五选一）\", \"intensity\": 推进强度整数（1-5，1=过渡、3=小高潮、5=阶段/卷末爆点）}\n\
+数量必须正好 {{count}} 章，idx 从 {{from}} 连续编号到 {{to}}。\n\
+节奏要求：intensity 要有起伏——连续 ≤2 的过渡章不超过 2 章；每 2~3 章至少一个 ≥4；同一 hook_type 不连续出现；章末必须有钩（动作截断 / 疑问绑定 / 信息投放）。{{style_block}}",
 };
 
 static CHAPTER: TaskSpec = TaskSpec {
@@ -115,6 +116,7 @@ static CHAPTER: TaskSpec = TaskSpec {
         VarSpec { name: "outline", desc: "全书走向", sample: "从港口小城出发，逐步深入深海文明的秘密。" },
         VarSpec { name: "goal", desc: "本章目标", sample: "开场钩子：姐姐留下的录音笔失效" },
         VarSpec { name: "beats", desc: "本章节拍（分号连接）", sample: "开场钩子；冲突升级；章末悬念" },
+        VarSpec { name: "hook_line", desc: "本章节奏要求行（章纲钩型/强度；未标注时为空）", sample: "【本章节奏要求】章末钩型：悬念；推进强度 3/5（1=过渡、3=小高潮、5=卷末爆点）；\n" },
         VarSpec { name: "ledger", desc: "角色事实与未回收伏笔块（可能为空）", sample: "\n【必须保持一致的角色事实与未回收伏笔】\n林深：正在寻找姐姐；录音笔：第1章埋下\n" },
         VarSpec { name: "prev", desc: "上一章结尾块", sample: "上一章结尾：\n他把录音笔塞回口袋，海风把后半句话吹散了。" },
         VarSpec { name: "words", desc: "单章字数窗口", sample: "2000~2400 字" },
@@ -123,7 +125,7 @@ static CHAPTER: TaskSpec = TaskSpec {
     default_system: "你是中文网文写手。直接输出章节正文：第一行写章节标题，之后不再出现任何说明性文字、不要客套、不要使用 Markdown 标题符号。",
     default_user: "TASK:chapter index={{idx}} title={{title}}\n\
 书名：{{book_title}}\n题材：{{genre}}\n卖点：{{logline}}\n主角：{{protagonist}}\n基调：{{style}}\n全书走向：{{outline}}\n\n\
-本章目标：{{goal}}\n本章节拍：{{beats}}\n{{ledger}}\n{{prev}}\n\n\
+本章目标：{{goal}}\n本章节拍：{{beats}}\n{{hook_line}}{{ledger}}\n{{prev}}\n\n\
 要求：写完整的第 {{idx}} 章正文，{{words}}；第一行是「第{{idx}}章 {{title}}」；\
 延续上一章结尾的情绪与场景；章末留悬念。{{style_block}}",
 };
@@ -568,6 +570,7 @@ pub fn chapter_prompt(
     plan: &ChapterPlan,
     prev_tail: &str,
     ledger: &str,
+    hook_line: &str,
     style: Option<&StylePreset>,
     ov: &Overrides,
 ) -> (String, String) {
@@ -593,6 +596,7 @@ pub fn chapter_prompt(
         ("outline", book_outline.to_string()),
         ("goal", plan.goal.clone()),
         ("beats", plan.beats.join("；")),
+        ("hook_line", hook_line.to_string()),
         ("ledger", ledger_block),
         ("prev", prev),
         ("words", words.to_string()),
@@ -882,6 +886,26 @@ mod tests {
     }
 
     #[test]
+    fn chapter_prompt_injects_pacing_line() {
+        let ov = none();
+        let (_, user) = chapter_prompt(
+            &sample_brief(),
+            "走向",
+            &sample_plan(),
+            "",
+            "",
+            "【本章节奏要求】章末钩型：悬念；推进强度 4/5；\n",
+            None,
+            &ov,
+        );
+        assert!(user.contains("本章节奏要求"), "{user}");
+        assert!(user.contains("章末钩型：悬念"), "{user}");
+        // 无节奏标注时行内容为空（模板占位符替换为空串）
+        let (_, user2) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", None, &ov);
+        assert!(!user2.contains("本章节奏要求"), "{user2}");
+    }
+
+    #[test]
     fn task_catalog_is_consistent() {
         assert_eq!(TASKS.len(), 12, "任务数量应为 12");
         for spec in TASKS {
@@ -951,7 +975,7 @@ mod tests {
         let mut ov = Overrides::default();
         // 自定义模板：故意不带 TASK 标记
         ov.set("chapter", Template { system: "自定义系统".into(), user: "请写第 {{idx}} 章「{{title}}」，字数 {{words}}。".into() });
-        let (sys, user) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", None, &ov);
+        let (sys, user) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", None, &ov);
         assert_eq!(sys, "自定义系统");
         assert!(user.contains("请写第 1 章「第一章」"), "{user}");
         assert!(user.starts_with("TASK:chapter index=1 title=第一章"), "缺标记时应自动补：{user}");
@@ -960,7 +984,7 @@ mod tests {
     #[test]
     fn without_style_prompts_stay_unchanged() {
         let ov = none();
-        let (_, user) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", None, &ov);
+        let (_, user) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", None, &ov);
         assert!(user.contains("1500~2500 字"), "未选预设时应保持默认字数窗口");
         assert!(!user.contains("平台节奏基线"), "未选预设时不应出现风格块");
         assert!(!user.contains("【文风预设："), "未选预设时不应出现风格块头");
@@ -974,7 +998,7 @@ mod tests {
     fn style_block_is_injected_into_all_writing_tasks() {
         let ov = none();
         let p = crate::styles::find("gufeng").unwrap();
-        let (_, ch) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "前文", "台账", Some(p), &ov);
+        let (_, ch) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "前文", "台账", "", Some(p), &ov);
         assert!(ch.contains("【文风预设：古风雅致·家宅权谋"), "章节提示词应含风格块");
         assert!(ch.contains(p.word_target), "字数窗口应使用预设值");
         assert!(!ch.contains("1500~2500 字"), "选预设后不应再出现默认字数窗口");
@@ -1006,7 +1030,7 @@ mod tests {
         // 逐个预设跑一遍，确保追加风格块后 Mock 仍能解析出关键参数
         let ov = none();
         for p in crate::styles::PRESETS {
-            let (_, ch) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", Some(p), &ov);
+            let (_, ch) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", Some(p), &ov);
             assert!(ch.contains("index=1"), "{}: index 标记丢失", p.id);
             assert!(ch.contains("title=第一章"), "{}: title 标记丢失", p.id);
             let (_, cu) = continue_prompt("第一章", "前文", 300, "", Some(p), &ov);

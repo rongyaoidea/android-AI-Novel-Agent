@@ -728,7 +728,12 @@ function bindCreate() {
     try {
       const r = await apiSend("/api/novels", "POST", { idea, chapters, mode, style_preset, clarify });
       const extra = clarify.length ? `（已带入 ${clarify.length} 条确认设定）` : "";
-      toast((mode === "staged" ? "已开始：规划完成后会暂停等你确认" : "已开始创作，进入工作台查看进度") + extra);
+      const first = r.first_batch && r.first_batch < chapters ? `首批先写 ${r.first_batch} 章（目标 ${chapters} 章）` : "";
+      toast(
+        (mode === "staged"
+          ? "已开始：规划完成后会暂停等你确认"
+          : `已开始创作${first ? "，" + first : ""}，进入工作台查看进度`) + extra,
+      );
       location.hash = `#/novel/${r.novel_id}`;
     } catch (err) {
       toast(err.message, true);
@@ -1154,7 +1159,7 @@ function renderChapters() {
     ? chs.map((c) => `
       <tr>
         <td class="num">${c.idx}</td>
-        <td>${esc(c.title || `第${c.idx}章`)}</td>
+        <td>${esc(c.title || `第${c.idx}章`)}${c.hook_type || c.intensity > 0 ? `<span class="chip chip-info" style="margin-left:6px;font-size:11px;" title="章末钩型与推进强度（AI 章纲规划；可在「改规划」里调整）">${esc(c.hook_type || "钩")}${c.intensity > 0 ? `·${c.intensity}` : ""}</span>` : ""}</td>
         <td>${c.status === "done" ? `<span class="chip chip-success">已完成</span>` : c.status === "drafted" ? `<span class="chip chip-info">待审校</span>` : `<span class="chip">已规划</span>`}</td>
         <td class="num">${c.words || 0}</td>
         <td>${reviewChip(c.review, c.idx)}</td>
@@ -1433,10 +1438,9 @@ function bindNovel() {
     }
   };
   $("#novel-run").onclick = async () => {
-    const chapters = Math.min(50, Math.max(1, parseInt($("#novel-target").value || "3", 10) || 3));
     try {
-      await apiSend(`/api/novels/${state.novelId}/run`, "POST", { chapters });
-      toast(`已开始，目标 ${chapters} 章（已完成章节会自动跳过）`);
+      const r = await apiSend(`/api/novels/${state.novelId}/run`, "POST", {});
+      toast(`已开始：再写一批（至第 ${r.batch_until} 章；已完成章节自动跳过）`);
       $("#novel-run").disabled = true;
       $("#novel-run").textContent = "创作中…";
       $("#novel-run").classList.remove("attention");
@@ -1496,6 +1500,34 @@ async function editPlan(idx) {
       { name: "title", label: "章节标题", value: c.title || "" },
       { name: "goal", label: "本章目标", value: c.goal || "", placeholder: "30 字以内" },
       { name: "beats", label: "关键节拍（每行一条）", type: "textarea", rows: 4, value: (c.beats || []).join("\n") },
+      {
+        name: "hook_type",
+        label: "章末钩型（节奏控制：每 2~3 章一个高能钩，别连着用同一型）",
+        type: "select",
+        value: c.hook_type || "",
+        options: [
+          { value: "", label: "（未标注）" },
+          { value: "悬念", label: "悬念（疑问绑定 / 信息截断）" },
+          { value: "危机", label: "危机（动作截断 / 命悬一线）" },
+          { value: "反转", label: "反转（推翻本章结论）" },
+          { value: "升级", label: "升级（规则 / 能力变化）" },
+          { value: "信息", label: "信息（关键信息投放）" },
+        ],
+      },
+      {
+        name: "intensity",
+        label: "推进强度（节奏曲线：连续低强度不超过 2 章）",
+        type: "select",
+        value: String(c.intensity || 0),
+        options: [
+          { value: "0", label: "未标注" },
+          { value: "1", label: "1 过渡" },
+          { value: "2", label: "2 平缓推进" },
+          { value: "3", label: "3 小高潮" },
+          { value: "4", label: "4 强推进" },
+          { value: "5", label: "5 卷级爆点" },
+        ],
+      },
     ],
     onSubmit: async (v) => {
       if (!v.title.trim()) throw new Error("标题不能为空");
@@ -1504,6 +1536,8 @@ async function editPlan(idx) {
         title: v.title,
         goal: v.goal,
         beats,
+        hook_type: v.hook_type || "",
+        intensity: parseInt(v.intensity || "0", 10) || 0,
       });
       toast("规划已更新");
       await refreshNovel();
@@ -2840,6 +2874,7 @@ async function loadSettingsForm() {
     $("#set-auto-fix").checked = !!p.auto_fix_review;
     $("#set-budget").value = p.monthly_budget_tokens > 0 ? p.monthly_budget_tokens : "";
     $("#set-auto-batch").value = p.auto_batch && p.auto_batch !== 10 ? p.auto_batch : "";
+    $("#set-plan-window").value = p.plan_window && p.plan_window !== 10 ? p.plan_window : "";
     const auditEvery = typeof p.foreshadow_audit_every === "number" ? p.foreshadow_audit_every : 1;
     const sel = $("#set-audit-every");
     if (sel) {
@@ -2974,6 +3009,8 @@ function bindSettings() {
     const budget = Math.max(0, parseInt($("#set-budget").value || "0", 10) || 0);
     const batchRaw = parseInt($("#set-auto-batch").value || "10", 10) || 10;
     const batch = Math.min(50, Math.max(1, batchRaw));
+    const planWindowRaw = parseInt($("#set-plan-window").value || "10", 10) || 10;
+    const planWindow = Math.min(50, Math.max(3, planWindowRaw));
     const auditEvery = Math.min(100, Math.max(0, parseInt($("#set-audit-every").value || "1", 10) || 0));
     const globalEvery = Math.min(100, Math.max(0, parseInt($("#set-global-every").value || "10", 10) || 0));
     const autoFixGlobalEl = $("#set-auto-fix-global");
@@ -2982,6 +3019,7 @@ function bindSettings() {
         auto_fix_review: $("#set-auto-fix").checked,
         monthly_budget_tokens: budget,
         auto_batch: batch,
+        plan_window: planWindow,
         foreshadow_audit_every: auditEvery,
         auto_fix_global: autoFixGlobalEl ? autoFixGlobalEl.checked : true,
         global_review_every: globalEvery,
@@ -3003,6 +3041,9 @@ function bindSettings() {
   );
   $("#set-auto-batch").addEventListener("change", () =>
     savePipeline(`每批章节数已设为 ${Math.min(50, Math.max(1, parseInt($("#set-auto-batch").value || "10", 10) || 10))}`),
+  );
+  $("#set-plan-window").addEventListener("change", () =>
+    savePipeline(`单次规划章数已设为 ${Math.min(50, Math.max(3, parseInt($("#set-plan-window").value || "10", 10) || 10))}`),
   );
   $("#set-audit-every").addEventListener("change", () => {
     const v = parseInt($("#set-audit-every").value, 10) || 0;

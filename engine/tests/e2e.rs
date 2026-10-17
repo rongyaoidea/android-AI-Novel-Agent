@@ -4,7 +4,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use ainovel_engine::config::AppConfig;
-use ainovel_engine::models::{ChapterPlan, GlobalIssue, GlobalReview, LlmSettings};
+use ainovel_engine::models::{ChapterPlan, GlobalIssue, GlobalReview, LlmSettings, PipelineSettings};
 use ainovel_engine::pipeline::EngineEvent;
 use ainovel_engine::{api, Engine};
 
@@ -3129,6 +3129,205 @@ async fn clarify_then_create_with_answers() {
     let raw = v["novel"]["clarify_json"].as_str().unwrap_or("");
     assert!(raw.contains("女性·港口调音师"), "{raw}");
     assert!(!raw.contains("未回答的问题"), "空答案不应入库：{raw}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 滚动规划窗口：单次只规划一小段，写到窗口尾部前自动续规划（不再一次规划整批）
+#[tokio::test]
+async fn rolling_plan_window_plans_in_segments() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-rolling-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    // 每批 12 章、单次规划 4 章 → 一次运行内应规划 3 段（1 段起始 + 2 段续规划）
+    engine
+        .db
+        .set_pipeline_settings(&PipelineSettings {
+            plan_window: 4,
+            auto_batch: 12,
+            ..PipelineSettings::default()
+        })
+        .unwrap();
+    let app = api::build_router(engine.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "滚动规划测试", "chapters": 12}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    let chapters = v["chapters"].as_array().unwrap();
+    let done = chapters.iter().filter(|c| c["status"] == "done").count();
+    assert_eq!(done, 12, "应写完首批 12 章：{v}");
+
+    // 节奏字段（钩型/强度）应随章纲落库并出现在章节列表
+    let first = &chapters[0];
+    assert!(
+        !first["hook_type"].as_str().unwrap_or("").is_empty(),
+        "章纲应带钩型：{first}"
+    );
+    let intensity = first["intensity"].as_i64().unwrap_or(0);
+    assert!((1..=5).contains(&intensity), "强度应在 1-5：{first}");
+
+    // 规划段数：1 次「生成章节规划」+ 2 次「续规划」（4 章一段）
+    let msgs: Vec<String> = engine
+        .hub
+        .history(&novel_id)
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::Stage { stage, message } if stage == "outline" => Some(message.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(msgs.iter().any(|m| m == "生成章节规划…"), "{msgs:?}");
+    let continued: Vec<&String> = msgs.iter().filter(|m| m.starts_with("续规划")).collect();
+    assert_eq!(continued.len(), 2, "应续规划两次（每段 4 章）：{msgs:?}");
+    assert!(msgs.iter().any(|m| m.contains("5~8")), "{msgs:?}");
+    assert!(msgs.iter().any(|m| m.contains("9~12")), "{msgs:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 「继续创作」按批推进：首批 = min(目标, 批)；再点从已写处 +批（修复 50 章封顶）
+#[tokio::test]
+async fn manual_continue_advances_one_batch_from_progress() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-batch-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    engine
+        .db
+        .set_pipeline_settings(&PipelineSettings {
+            auto_batch: 5,
+            ..PipelineSettings::default()
+        })
+        .unwrap();
+    let app = api::build_router(engine.clone());
+
+    // 目标 12 章 → 首批只写 5 章
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "批量语义测试", "chapters": 12}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["first_batch"], 5, "首批应受每批章节数约束：{v}");
+    let novel_id = v["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    let done_count = |app: axum::Router, novel_id: String| async move {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        v["chapters"]
+            .as_array()
+            .map(|a| a.iter().filter(|c| c["status"] == "done").count())
+            .unwrap_or(0)
+    };
+    assert_eq!(done_count(app.clone(), novel_id.clone()).await, 5, "首批应只写 5 章");
+
+    // 继续创作（不带 chapters）→ 写到第 10 章
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/run"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["batch_until"], 10, "第二批应写到第 10 章：{v}");
+    wait_run_done(app.clone(), &novel_id).await;
+    assert_eq!(done_count(app.clone(), novel_id.clone()).await, 10);
+
+    // 再点一次 → 封顶到目标 12
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/run"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["batch_until"], 12, "第三批应封顶到目标：{v}");
+    wait_run_done(app.clone(), &novel_id).await;
+    assert_eq!(done_count(app.clone(), novel_id.clone()).await, 12);
+
+    // 已达标再点 → 不写新章（批次终点仍为 12）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/run"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["batch_until"], 12, "达标后终点不再增长：{v}");
+    wait_run_done(app.clone(), &novel_id).await;
+    assert_eq!(done_count(app.clone(), novel_id.clone()).await, 12);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -165,6 +165,9 @@
               </select>
             </div>
           </div>
+          <div class="muted" style="font-size:12px;margin:-4px 0 10px;">
+            首批只写一小批（默认 10 章，可在「设置 → 写作偏好」调整）：先看几章再决定是否继续；点工作台「自动连载」会自动一批批写到达标。
+          </div>
           <div class="field">
             <label>文风预设 <span class="muted">（可选：决定写法、节奏与爽点密度；创建后仍可更换）</span></label>
             <div class="chips" id="create-style-groups"></div>
@@ -211,7 +214,7 @@
           </div>
           <div class="novel-head-actions">
             <input id="novel-target" class="input-sm" type="number" min="1" max="999" title="全书目标章节数（自动连载体以其为准）" />
-            <button class="btn btn-primary" id="novel-run">继续创作</button>
+            <button class="btn btn-primary" id="novel-run" title="再写一批（默认 10 章，可在设置调整）；写完自动停下，点「自动连载」可自动写到达标">继续创作</button>
             <button class="btn btn-outline" id="novel-stop" disabled title="停止当前创作：流式生成立即中断，已写章节全部保留"><svg class="ic"><use href="#i-stop"/></svg>停止</button>
             <button class="btn btn-outline" id="novel-auto"><svg class="ic"><use href="#i-refresh"/></svg>自动连载</button>
             <button class="btn btn-outline" id="novel-review-all"><svg class="ic"><use href="#i-check"/></svg>AI 处理全部审校</button>
@@ -416,6 +419,10 @@
             <input id="set-auto-batch" type="number" min="1" max="50" placeholder="10" />
           </div>
           <div class="field" style="max-width:340px;">
+            <label for="set-plan-window">单次规划章数（3–50，默认 10）</label>
+            <input id="set-plan-window" type="number" min="3" max="50" placeholder="10" />
+          </div>
+          <div class="field" style="max-width:340px;">
             <label for="set-audit-every">伏笔自动审核频率</label>
             <select id="set-audit-every">
               <option value="1">每批收尾都审核（默认）</option>
@@ -429,6 +436,7 @@
             伏笔回收与资料整理均为自动：每章写后自动抽取台账；生成每章时会注入「未回收伏笔（含已拖延章数）」，回收后自动标记。
             伏笔自动审核会用章节摘要批量判定未回收伏笔是否已被后文实质回收（一次 LLM 调用）。
             全局审校从全书视角检查跨章一致性/节奏/支线（每 N 章一次 + 手动随时可跑）；章节历史会自动留档最近 10 版，可回滚或让 AI 选最优版本复原。
+            章节规划按「单次规划章数」滚动生成：一次只规划前方一小段，写到窗口尾部前自动续规划下一段（避免一次规划几十章导致漂移与截断）。
             达到月度预算后自动连载会自动暂停（工作量以各厂商 token 计，不含价格折算）。
           </p>
         </div>

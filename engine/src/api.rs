@@ -351,6 +351,7 @@ async fn put_pipeline(
 ) -> Result<Json<serde_json::Value>, ApiErr> {
     // 宽容归一化，防止越界值入库
     s.auto_batch = s.batch();
+    s.plan_window = s.plan_window();
     s.foreshadow_audit_every = s.audit_every();
     s.global_review_every = s.global_every();
     e.db.set_pipeline_settings(&s).map_err(err)?;
@@ -447,8 +448,16 @@ async fn create_novel(
         e.db.set_novel_clarify(&novel.id, &serde_json::to_string(&clarify).map_err(err)?)
             .map_err(err)?;
     }
-    let run_id = pipeline::spawn(e.clone(), &novel.id, b.chapters.clamp(1, 50)).map_err(err)?;
-    Ok(Json(json!({"novel_id": novel.id, "run_id": run_id, "target_chapters": target})))
+    // 首批只写一小批（默认 10 章；目标更小时按目标）——避免一次冲几十章，节奏与质量更可控
+    let batch = e.db.pipeline_settings().map_err(err)?.batch();
+    let first_batch = target.min(batch);
+    let run_id = pipeline::spawn(e.clone(), &novel.id, first_batch).map_err(err)?;
+    Ok(Json(json!({
+        "novel_id": novel.id,
+        "run_id": run_id,
+        "target_chapters": target,
+        "first_batch": first_batch
+    })))
 }
 
 async fn list_novels(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, ApiErr> {
@@ -476,6 +485,8 @@ async fn get_novel(
                 "title": c.title,
                 "goal": c.goal,
                 "beats": c.beats,
+                "hook_type": c.hook_type,
+                "intensity": c.intensity,
                 "status": c.status,
                 "words": c.words,
                 "preview": c.preview,
@@ -945,6 +956,8 @@ async fn get_chapter(
         "title": ch.title,
         "goal": ch.goal,
         "beats": ch.beats,
+        "hook_type": ch.hook_type,
+        "intensity": ch.intensity,
         "content": ch.content,
         "summary": ch.summary,
         "words": ch.content.chars().count(),
@@ -1000,6 +1013,12 @@ struct PlanBody {
     goal: String,
     #[serde(default)]
     beats: Vec<String>,
+    /// 章末钩型（悬念/危机/反转/升级/信息；空 = 未标注）
+    #[serde(default)]
+    hook_type: String,
+    /// 推进强度 1–5（0 = 未标注）
+    #[serde(default)]
+    intensity: i64,
 }
 
 /// 编辑章节规划（仅限尚未开写的章节）——供"按阶段确认"时人工调整章纲。
@@ -1024,6 +1043,8 @@ async fn edit_plan(
         ));
     }
     e.db.update_chapter_plan(&id, idx, title, b.goal.trim(), &b.beats)
+        .map_err(err)?;
+    e.db.set_chapter_pacing(&id, idx, b.hook_type.trim(), b.intensity)
         .map_err(err)?;
     Ok(Json(json!({"ok": true})))
 }
@@ -1492,8 +1513,9 @@ async fn novel_health(
 
 #[derive(Deserialize)]
 struct RunBody {
-    #[serde(default = "default_chapters")]
-    chapters: i64,
+    /// 显式指定「写到第几章」；省略时按当前进度再写一批（受全书目标约束）
+    #[serde(default)]
+    chapters: Option<i64>,
 }
 
 async fn run_novel(
@@ -1518,8 +1540,24 @@ async fn run_novel(
             "审校处理进行中，完成后再继续创作。".to_string(),
         ));
     }
-    let run_id = pipeline::spawn(e.clone(), &id, b.chapters.clamp(1, 50)).map_err(err)?;
-    Ok(Json(json!({"run_id": run_id})))
+    let end = match b.chapters {
+        Some(c) => c.clamp(1, 999),
+        None => {
+            let settings = e.db.pipeline_settings().map_err(err)?;
+            let paused_confirm = e
+                .db
+                .latest_run(&id)
+                .map_err(err)?
+                .filter(|r| r.status == "paused" && r.stage == "await_confirm");
+            match paused_confirm {
+                // 「按阶段确认」后点确认：把该次已规划的区间写完（不额外规划）
+                Some(r) => r.chapters_target.clamp(1, 999),
+                None => pipeline::run_batch_end(&e.db, &id, settings.batch()).map_err(err)?,
+            }
+        }
+    };
+    let run_id = pipeline::spawn(e.clone(), &id, end).map_err(err)?;
+    Ok(Json(json!({"run_id": run_id, "batch_until": end})))
 }
 
 // ---------- 自动连载 / 月度用量 ----------
