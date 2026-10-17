@@ -354,6 +354,26 @@
             <label for="set-temp">temperature</label>
             <input id="set-temp" type="number" step="0.1" min="0" max="2" />
           </div>
+          <div class="field-row" style="max-width:700px;">
+            <div class="field">
+              <label for="set-thinking">思考模式</label>
+              <select id="set-thinking">
+                <option value="auto">自动（推荐：识别到支持思考的服务商/模型时自动开启）</option>
+                <option value="on">开启（尽量开启；服务商不支持时自动兼容）</option>
+                <option value="off">关闭</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="set-thinking-style">思考参数风格（默认自动识别）</label>
+              <select id="set-thinking-style">
+                <option value="">自动识别</option>
+                <option value="reasoning_effort">reasoning_effort（OpenAI o 系 / GPT-5 / OpenRouter）</option>
+                <option value="enable_thinking">enable_thinking（Qwen3 / 硅基流动，仅流式）</option>
+                <option value="thinking">thinking 对象（智谱 GLM / 火山豆包）</option>
+                <option value="none">不注入参数（模型自带思考，如 DeepSeek Reasoner）</option>
+              </select>
+            </div>
+          </div>
           <div class="row">
             <button class="btn btn-primary" type="submit"><svg class="ic"><use href="#i-check"/></svg>保存</button>
             <button class="btn btn-outline" type="button" id="set-test"><svg class="ic"><use href="#i-refresh"/></svg>测试连接</button>

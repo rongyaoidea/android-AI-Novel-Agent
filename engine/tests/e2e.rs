@@ -1613,6 +1613,8 @@ async fn llm_model_list_endpoint() {
             api_key: String::new(),
             model: String::new(),
             temperature: 0.8,
+            thinking: "auto".into(),
+            thinking_style: String::new(),
         })
         .unwrap();
     let resp = app

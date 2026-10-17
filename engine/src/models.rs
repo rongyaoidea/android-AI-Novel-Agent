@@ -109,6 +109,16 @@ pub struct LlmSettings {
     pub api_key: String,
     pub model: String,
     pub temperature: f64,
+    /// 思考模式："auto"（默认：识别到支持思考的服务商/模型时自动开启）| "on"（尽量开启）| "off"
+    #[serde(default = "default_thinking_mode")]
+    pub thinking: String,
+    /// 思考参数风格（空 = 自动识别）：reasoning_effort / enable_thinking / thinking / reasoning / none
+    #[serde(default)]
+    pub thinking_style: String,
+}
+
+fn default_thinking_mode() -> String {
+    "auto".into()
 }
 
 impl Default for LlmSettings {
@@ -119,6 +129,8 @@ impl Default for LlmSettings {
             api_key: String::new(),
             model: "gpt-4o-mini".into(),
             temperature: 0.8,
+            thinking: "auto".into(),
+            thinking_style: String::new(),
         }
     }
 }

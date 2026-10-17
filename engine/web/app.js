@@ -3094,6 +3094,8 @@ async function loadSettingsForm() {
   $("#set-key").value = s.api_key || "";
   $("#set-model").value = s.model || "";
   $("#set-temp").value = typeof s.temperature === "number" ? Math.round(s.temperature * 100) / 100 : 0.8;
+  $("#set-thinking").value = s.thinking === "on" || s.thinking === "off" ? s.thinking : "auto";
+  $("#set-thinking-style").value = s.thinking_style || "";
   syncProviderFields();
   $("#set-status").textContent = "";
   const backup = $("#set-backup");
@@ -3139,6 +3141,8 @@ function bindSettings() {
       api_key: $("#set-key").value.trim(),
       model: $("#set-model").value.trim(),
       temperature: parseFloat($("#set-temp").value || "0.8"),
+      thinking: $("#set-thinking").value || "auto",
+      thinking_style: $("#set-thinking-style").value || "",
     };
     try {
       await apiSend("/api/settings/llm", "PUT", body);

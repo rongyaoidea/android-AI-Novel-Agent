@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context};
 use futures_util::StreamExt;
+use std::sync::{Mutex, OnceLock};
 
 use crate::models::{LlmSettings, TokenUsage, UsageRecord};
 
@@ -30,6 +31,149 @@ pub fn backoff_delay(attempt: usize) -> std::time::Duration {
         .unwrap_or(0)
         % span;
     std::time::Duration::from_millis(base_ms - base_ms / 10 + jitter)
+}
+
+// ---------------- 思考模式（默认 auto：识别到支持思考的服务商/模型时自动开启） ----------------
+
+/// 思考模式归一化："auto"（默认）| "on" | "off"
+fn thinking_mode(s: &LlmSettings) -> &str {
+    match s.thinking.trim() {
+        "on" => "on",
+        "off" => "off",
+        _ => "auto",
+    }
+}
+
+/// 模型名是否属于「自带思考、无需注入参数」的家族（DeepSeek Reasoner / Kimi 思考版 / -R1 等）
+fn model_thinks_by_default(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("reasoner") || m.contains("thinking") || m.contains("-r1")
+}
+
+/// OpenAI o 系 / GPT-5 系：思考用 reasoning_effort，且不接受 temperature
+fn is_reasoning_family(model: &str) -> bool {
+    let m = model.to_lowercase();
+    let m = m.trim_start_matches("openai/");
+    m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.starts_with("gpt-5")
+}
+
+/// 思考参数风格解析：显式配置优先；否则按 Base URL / 模型名自动识别。
+/// 返回 None = 不注入参数（模型自带思考，或未识别且非强制开启）。
+fn resolve_thinking_style(s: &LlmSettings, streaming: bool) -> Option<&'static str> {
+    if thinking_mode(s) == "off" {
+        return None;
+    }
+    // 显式风格优先（用户明确指定）
+    let explicit = s.thinking_style.trim();
+    if !explicit.is_empty() && explicit != "auto" {
+        return match explicit {
+            "reasoning_effort" => Some("reasoning_effort"),
+            "enable_thinking" if streaming => Some("enable_thinking"),
+            "enable_thinking" => None, // DashScope 等仅流式支持该参数
+            "thinking" => Some("thinking"),
+            "reasoning" => Some("reasoning"),
+            _ => None, // "none" 及未知值：不注入
+        };
+    }
+    let base = s.base_url.to_lowercase();
+    let model = s.model.to_lowercase();
+    // 自带思考的模型无需参数（注入反而可能报错）
+    if model_thinks_by_default(&model) {
+        return None;
+    }
+    let mode = thinking_mode(s);
+    let detected: Option<&'static str> = if base.contains("openrouter.ai") {
+        Some("reasoning")
+    } else if base.contains("bigmodel.cn") || base.contains("zhipu") {
+        if mode == "on"
+            || model.contains("glm-4.5")
+            || model.contains("glm-4.6")
+            || model.contains("glm-z")
+        {
+            Some("thinking")
+        } else {
+            None
+        }
+    } else if base.contains("dashscope") || base.contains("siliconflow") {
+        if streaming && (mode == "on" || model.contains("qwen3")) {
+            Some("enable_thinking")
+        } else {
+            None
+        }
+    } else if base.contains("volces.com") || base.contains("ark.cn") || base.contains("volcengine") {
+        if mode == "on" || model.contains("thinking") || model.contains("seed-1.6") {
+            Some("thinking")
+        } else {
+            None
+        }
+    } else if is_reasoning_family(&model) {
+        Some("reasoning_effort")
+    } else {
+        None
+    };
+    match detected {
+        Some(style) => Some(style),
+        // 强制开启但未识别：用最通用的 reasoning_effort 试探（被拒会自动去掉重试并记忆）
+        None if mode == "on" => Some("reasoning_effort"),
+        None => None,
+    }
+}
+
+/// 风格 → 请求体字段
+fn thinking_fields(style: &str) -> Option<(&'static str, serde_json::Value)> {
+    match style {
+        "reasoning_effort" => Some(("reasoning_effort", serde_json::json!("medium"))),
+        "enable_thinking" => Some(("enable_thinking", serde_json::json!(true))),
+        "thinking" => Some(("thinking", serde_json::json!({"type": "enabled"}))),
+        "reasoning" => Some(("reasoning", serde_json::json!({"enabled": true}))),
+        _ => None,
+    }
+}
+
+/// 兼容性抑制：某 (base, model) 因某参数返回过 400 → 本进程内不再发送（重启后重新探测）
+fn suppressed() -> &'static Mutex<std::collections::HashSet<String>> {
+    static S: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn suppress_key(s: &LlmSettings, what: &str) -> String {
+    format!("{}|{}|{}", s.base_url, s.model, what)
+}
+
+fn is_suppressed(s: &LlmSettings, what: &str) -> bool {
+    suppressed()
+        .lock()
+        .map(|g| g.contains(&suppress_key(s, what)))
+        .unwrap_or(false)
+}
+
+fn mark_suppressed(s: &LlmSettings, what: &str) {
+    if let Ok(mut g) = suppressed().lock() {
+        g.insert(suppress_key(s, what));
+    }
+}
+
+/// 从 400 错误文本判断可去掉哪些字段重试（思考参数 / temperature）
+fn compat_fields_to_strip(body: &serde_json::Value, err_text: &str) -> Vec<&'static str> {
+    let lowered = err_text.to_lowercase();
+    let mut out = Vec::new();
+    const THINKING_KEYS: [&str; 4] = [
+        "reasoning_effort",
+        "enable_thinking",
+        "thinking",
+        "reasoning",
+    ];
+    if lowered.contains("reasoning") || lowered.contains("thinking") {
+        for k in THINKING_KEYS {
+            if body.get(k).is_some() {
+                out.push(k);
+            }
+        }
+    }
+    if lowered.contains("temperature") && body.get("temperature").is_some() {
+        out.push("temperature");
+    }
+    out
 }
 
 /// 极简 LLM 客户端：
@@ -207,18 +351,40 @@ impl Llm {
     fn base_body(&self, system: &str, user: &str, stream: bool) -> serde_json::Value {
         let mut body = serde_json::json!({
             "model": self.settings.model,
-            "temperature": self.settings.temperature,
             "stream": stream,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user}
             ]
         });
+        // temperature：o 系 / GPT-5 系不接受该参数（发送会 400）；被服务商拒过也跳过
+        if !is_reasoning_family(&self.settings.model) && !is_suppressed(&self.settings, "temperature") {
+            body["temperature"] = serde_json::json!(self.settings.temperature);
+        }
+        // 思考模式（默认 auto：识别到支持思考的服务商/模型时自动开启）
+        if !is_suppressed(&self.settings, "thinking") {
+            if let Some(style) = resolve_thinking_style(&self.settings, stream) {
+                if let Some((k, v)) = thinking_fields(style) {
+                    body[k] = v;
+                }
+            }
+        }
         if stream {
             // 让兼容实现（OpenAI / DeepSeek 等）在最后一个 chunk 里带回 usage
             body["stream_options"] = serde_json::json!({"include_usage": true});
         }
         body
+    }
+
+    /// 解析非流式补全响应
+    fn parse_complete_response(text: &str) -> anyhow::Result<LlmOutput> {
+        let v: serde_json::Value = serde_json::from_str(text).context("LLM 响应不是 JSON")?;
+        let usage = parse_usage(&v);
+        let out = v["choices"][0]["message"]["content"]
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .ok_or_else(|| anyhow!("LLM 响应缺少 content 字段: {}", truncate(text, 300)))?;
+        Ok(LlmOutput { text: out, usage })
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -238,7 +404,8 @@ impl Llm {
         }
     }
 
-    /// 非流式补全（含网络/限流/5xx 自动重试与退避；Base URL 缺 /v1 时自动回退尝试）
+    /// 非流式补全（含网络/限流/5xx 自动重试与退避；Base URL 缺 /v1 时自动回退尝试；
+    /// 服务商不认「思考参数 / temperature」时按 400 提示自动去掉重试并本进程内记忆）
     pub async fn complete(&self, system: &str, user: &str) -> anyhow::Result<LlmOutput> {
         if self.settings.provider == "mock" {
             let text = mock_complete(user)?;
@@ -255,16 +422,46 @@ impl Llm {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             if status.is_success() {
-                let v: serde_json::Value =
-                    serde_json::from_str(&text).context("LLM 响应不是 JSON")?;
-                let usage = parse_usage(&v);
-                let out = v["choices"][0]["message"]["content"]
-                    .as_str()
-                    .map(|s| s.trim().to_string())
-                    .ok_or_else(|| {
-                        anyhow!("LLM 响应缺少 content 字段: {}", truncate(&text, 300))
-                    })?;
-                return Ok(LlmOutput { text: out, usage });
+                return Self::parse_complete_response(&text);
+            }
+            // 400：按错误提示去掉不被支持的字段重试一次（思考参数 / temperature），并本进程内记忆
+            if status == reqwest::StatusCode::BAD_REQUEST {
+                let strip = compat_fields_to_strip(&body, &text);
+                if !strip.is_empty() {
+                    let mut body2 = body.clone();
+                    if let Some(m) = body2.as_object_mut() {
+                        for k in &strip {
+                            m.remove(*k);
+                        }
+                    }
+                    if strip.iter().any(|k| *k != "temperature") {
+                        mark_suppressed(&self.settings, "thinking");
+                    }
+                    if strip.contains(&"temperature") {
+                        mark_suppressed(&self.settings, "temperature");
+                    }
+                    let r2 = self
+                        .send_with_retry(|| self.decorate(self.http.post(url).json(&body2)))
+                        .await
+                        .context("LLM 兼容重试失败（网络）")?;
+                    let st2 = r2.status();
+                    let text2 = r2.text().await.unwrap_or_default();
+                    if st2.is_success() {
+                        return Self::parse_complete_response(&text2);
+                    }
+                    return Err(anyhow!(
+                        "LLM HTTP {} @ {}: {}",
+                        st2,
+                        url,
+                        truncate(&text2, 300)
+                    ));
+                }
+                return Err(anyhow!(
+                    "LLM HTTP {} @ {}: {}",
+                    status,
+                    url,
+                    truncate(&text, 300)
+                ));
             }
             // 404 且还有候选端点 → 换下一个（常见于 Base URL 少写 /v1）
             if status == reqwest::StatusCode::NOT_FOUND {
@@ -365,22 +562,53 @@ impl Llm {
                 .await
                 .context("LLM 流式请求失败（网络）")?;
             if r.status() == reqwest::StatusCode::BAD_REQUEST {
-                body.as_object_mut().map(|m| m.remove("stream_options"));
-                let r2 = self
-                    .send_with_retry(|| self.decorate(self.http.post(url).json(&body)))
-                    .await
-                    .context("LLM 流式重试失败（网络）")?;
-                if r2.status().is_success() {
-                    resp = Some(r2);
-                    break;
+                let text = r.text().await.unwrap_or_default();
+                // 兼容：去掉不被支持的字段（stream_options / 思考参数 / temperature）重试一次，并本进程内记忆
+                let mut changed = false;
+                if body.get("stream_options").is_some() {
+                    if let Some(m) = body.as_object_mut() {
+                        m.remove("stream_options");
+                    }
+                    changed = true;
                 }
-                let st = r2.status();
-                let text = r2.text().await.unwrap_or_default();
-                if st == reqwest::StatusCode::NOT_FOUND && i + 1 < self.endpoints.len() {
-                    last = Some((st, text));
-                    continue;
+                let strip = compat_fields_to_strip(&body, &text);
+                if !strip.is_empty() {
+                    if let Some(m) = body.as_object_mut() {
+                        for k in &strip {
+                            m.remove(*k);
+                        }
+                    }
+                    if strip.iter().any(|k| *k != "temperature") {
+                        mark_suppressed(&self.settings, "thinking");
+                    }
+                    if strip.contains(&"temperature") {
+                        mark_suppressed(&self.settings, "temperature");
+                    }
+                    changed = true;
                 }
-                return Err(anyhow!("LLM HTTP {} @ {}: {}", st, url, truncate(&text, 300)));
+                if changed {
+                    let r2 = self
+                        .send_with_retry(|| self.decorate(self.http.post(url).json(&body)))
+                        .await
+                        .context("LLM 流式重试失败（网络）")?;
+                    if r2.status().is_success() {
+                        resp = Some(r2);
+                        break;
+                    }
+                    let st = r2.status();
+                    let text2 = r2.text().await.unwrap_or_default();
+                    if st == reqwest::StatusCode::NOT_FOUND && i + 1 < self.endpoints.len() {
+                        last = Some((st, text2));
+                        continue;
+                    }
+                    return Err(anyhow!("LLM HTTP {} @ {}: {}", st, url, truncate(&text2, 300)));
+                }
+                return Err(anyhow!(
+                    "LLM HTTP {} @ {}: {}",
+                    reqwest::StatusCode::BAD_REQUEST,
+                    url,
+                    truncate(&text, 300)
+                ));
             }
             if r.status().is_success() {
                 resp = Some(r);
@@ -1047,6 +1275,8 @@ mod tests {
             api_key: String::new(),
             model: "test-model".into(),
             temperature: 0.5,
+            thinking: "auto".into(),
+            thinking_style: String::new(),
         })
     }
 
@@ -1085,6 +1315,197 @@ mod tests {
         let err = llm.complete("system", "user").await.unwrap_err();
         assert!(format!("{err}").contains("500"), "错误应带状态码: {err}");
         assert_eq!(hits.load(Ordering::SeqCst), 3, "最多尝试 3 次");
+    }
+
+    /// 思考模式：风格解析矩阵（自动识别 / 显式覆盖 / 关闭 / 强制开启兜底）
+    #[test]
+    fn thinking_style_resolution_matrix() {
+        let s = |base: &str, model: &str, mode: &str, style: &str| LlmSettings {
+            provider: "openai".into(),
+            base_url: base.into(),
+            api_key: String::new(),
+            model: model.into(),
+            temperature: 0.8,
+            thinking: mode.into(),
+            thinking_style: style.into(),
+        };
+        // 自动：OpenAI GPT-5 → reasoning_effort
+        assert_eq!(
+            resolve_thinking_style(&s("https://api.openai.com/v1", "gpt-5.1", "auto", ""), false),
+            Some("reasoning_effort")
+        );
+        // 自动：DeepSeek Reasoner 自带思考 → 不注入
+        assert_eq!(
+            resolve_thinking_style(
+                &s("https://api.deepseek.com/v1", "deepseek-reasoner", "auto", ""),
+                false
+            ),
+            None
+        );
+        // 自动：Qwen3 @ DashScope → 仅流式注入 enable_thinking
+        assert_eq!(
+            resolve_thinking_style(
+                &s(
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    "qwen3-max",
+                    "auto",
+                    ""
+                ),
+                true
+            ),
+            Some("enable_thinking")
+        );
+        assert_eq!(
+            resolve_thinking_style(
+                &s(
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                    "qwen3-max",
+                    "auto",
+                    ""
+                ),
+                false
+            ),
+            None
+        );
+        // 自动：智谱 GLM-4.5 → thinking 对象
+        assert_eq!(
+            resolve_thinking_style(
+                &s("https://open.bigmodel.cn/api/paas/v4", "glm-4.5", "auto", ""),
+                false
+            ),
+            Some("thinking")
+        );
+        // 自动：OpenRouter → reasoning 对象
+        assert_eq!(
+            resolve_thinking_style(
+                &s(
+                    "https://openrouter.ai/api/v1",
+                    "anthropic/claude-sonnet-4.5",
+                    "auto",
+                    ""
+                ),
+                false
+            ),
+            Some("reasoning")
+        );
+        // 关闭：永不注入
+        assert_eq!(
+            resolve_thinking_style(&s("https://api.openai.com/v1", "gpt-5.1", "off", ""), false),
+            None
+        );
+        // 强制开启 + 未识别端点 → 兜底 reasoning_effort
+        assert_eq!(
+            resolve_thinking_style(&s("https://example.com/v1", "some-model", "on", ""), false),
+            Some("reasoning_effort")
+        );
+        // 显式风格优先（且 enable_thinking 仅流式）
+        assert_eq!(
+            resolve_thinking_style(
+                &s("https://example.com/v1", "some-model", "auto", "thinking"),
+                false
+            ),
+            Some("thinking")
+        );
+        assert_eq!(
+            resolve_thinking_style(
+                &s("https://example.com/v1", "some-model", "on", "enable_thinking"),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_thinking_style(&s("https://example.com/v1", "some-model", "on", "none"), false),
+            None
+        );
+    }
+
+    /// 请求体：思考参数注入 + o 系/GPT-5 不发送 temperature
+    #[test]
+    fn base_body_injects_thinking_and_skips_temperature_for_reasoning_models() {
+        let mk = |model: &str, mode: &str| LlmSettings {
+            provider: "openai".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: String::new(),
+            model: model.into(),
+            temperature: 0.8,
+            thinking: mode.into(),
+            thinking_style: String::new(),
+        };
+        let llm = Llm::new(mk("gpt-5.1", "auto"));
+        let body = llm.base_body("s", "u", false);
+        assert_eq!(body["reasoning_effort"], "medium", "{body}");
+        assert!(
+            body.get("temperature").is_none(),
+            "o/GPT-5 系不应发送 temperature：{body}"
+        );
+        let llm2 = Llm::new(mk("gpt-4o-mini", "off"));
+        let body2 = llm2.base_body("s", "u", true);
+        assert!(body2.get("reasoning_effort").is_none(), "{body2}");
+        assert_eq!(body2["temperature"], 0.8, "{body2}");
+    }
+
+    /// 集成：服务商拒绝思考参数（400）→ 自动去掉重试成功，且本进程内不再发送
+    #[tokio::test]
+    async fn bad_request_thinking_param_self_heals() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let with_param = Arc::new(AtomicUsize::new(0));
+        let without_param = Arc::new(AtomicUsize::new(0));
+        let app = {
+            let with_param = with_param.clone();
+            let without_param = without_param.clone();
+            axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(move |axum::Json(v): axum::Json<serde_json::Value>| {
+                    let with_param = with_param.clone();
+                    let without_param = without_param.clone();
+                    async move {
+                        if v.get("reasoning_effort").is_some() {
+                            with_param.fetch_add(1, Ordering::SeqCst);
+                            (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                axum::Json(serde_json::json!({
+                                    "error": {"message": "Unsupported parameter: reasoning_effort"}
+                                })),
+                            )
+                        } else {
+                            without_param.fetch_add(1, Ordering::SeqCst);
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::Json(serde_json::json!({
+                                    "choices": [{"message": {"content": "ok-text"}}],
+                                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let settings = LlmSettings {
+            provider: "openai".into(),
+            base_url: format!("http://{addr}/v1"),
+            api_key: String::new(),
+            model: "gpt-5.1".into(),
+            temperature: 0.8,
+            thinking: "auto".into(),
+            thinking_style: String::new(),
+        };
+        let llm = Llm::new(settings.clone());
+        let out = llm.complete("s", "u").await.unwrap();
+        assert_eq!(out.text, "ok-text");
+        assert_eq!(with_param.load(Ordering::SeqCst), 1, "首次带参数被拒一次");
+        assert_eq!(without_param.load(Ordering::SeqCst), 1, "去掉参数后成功一次");
+        // 本进程内已记忆：同一 (base, model) 再次请求不再带思考参数
+        let out2 = llm.complete("s", "u").await.unwrap();
+        assert_eq!(out2.text, "ok-text");
+        assert_eq!(with_param.load(Ordering::SeqCst), 1, "不应再次尝试带参数");
+        assert_eq!(without_param.load(Ordering::SeqCst), 2);
     }
 
     /// 集成：流式解析的字节边界与收尾帧
@@ -1237,6 +1658,8 @@ mod tests {
             api_key: String::new(),
             model: "m".into(),
             temperature: 0.5,
+            thinking: "auto".into(),
+            thinking_style: String::new(),
         });
         let out = llm.complete("s", "u").await.unwrap();
         assert_eq!(out.text, "ok");
@@ -1258,6 +1681,8 @@ mod tests {
             api_key: String::new(),
             model: "m".into(),
             temperature: 0.5,
+            thinking: "auto".into(),
+            thinking_style: String::new(),
         });
         let err = format!("{}", llm.complete("s", "u").await.unwrap_err());
         assert!(err.contains("404"), "{err}");
@@ -1327,6 +1752,8 @@ mod tests {
             api_key: String::new(),
             model: String::new(),
             temperature: 0.0,
+            thinking: "auto".into(),
+            thinking_style: String::new(),
         });
         let models = llm.list_models().await.unwrap();
         assert_eq!(models, vec!["model-a".to_string(), "model-b".to_string()]);
@@ -1348,6 +1775,8 @@ mod tests {
             api_key: String::new(),
             model: String::new(),
             temperature: 0.0,
+            thinking: "auto".into(),
+            thinking_style: String::new(),
         });
         let err = format!("{}", llm.list_models().await.unwrap_err());
         assert!(err.contains("不存在"), "{err}");
@@ -1368,6 +1797,8 @@ mod tests {
             api_key: String::new(),
             model: String::new(),
             temperature: 0.0,
+            thinking: "auto".into(),
+            thinking_style: String::new(),
         });
         let err2 = format!("{}", llm2.list_models().await.unwrap_err());
         assert!(err2.contains("未解析到模型"), "{err2}");
@@ -1454,6 +1885,8 @@ mod tests {
             api_key: "sk-test".into(),
             model: "m".into(),
             temperature: 0.5,
+            thinking: "auto".into(),
+            thinking_style: String::new(),
         });
         llm.complete("s", "u").await.unwrap();
         {
@@ -1470,6 +1903,8 @@ mod tests {
             api_key: String::new(),
             model: "m".into(),
             temperature: 0.5,
+            thinking: "auto".into(),
+            thinking_style: String::new(),
         });
         llm2.complete("s", "u").await.unwrap();
         {

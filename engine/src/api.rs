@@ -337,6 +337,8 @@ async fn list_llm_models(
         api_key,
         model: String::new(),
         temperature: 0.0,
+        thinking: "auto".into(),
+        thinking_style: String::new(),
     });
     match llm.list_models().await {
         Ok(models) => Ok(Json(json!({"ok": true, "models": models}))),

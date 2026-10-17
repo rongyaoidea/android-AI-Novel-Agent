@@ -71,6 +71,7 @@ android-AI-Novel-Agent/
 | LLM 调用容错：网络错误 / 408 / 429 / 5xx 自动退避重试（最多 3 次） | ✅ |
 | 文风预设（10 套，蒸馏自番茄生态调研：悬疑限知 / 热血群像 / 系统神豪 / 玄幻打脸 / 苟道种田 / 纪实江湖 / 发疯毒舌 / 无 CP 大女主 / 拉扯甜虐 / 古风权谋），建书时选择、工作台可随时更换 | ✅ |
 | 提示词可编辑：14 个生成任务的 system / user 模板全部可改，`{{变量}}` 占位符校验 + 变量一键插入 + 恢复默认，改动即时生效 | ✅ |
+| **思考模式默认开启**：自动识别服务商/模型注入思考参数（o 系 / GPT-5 → reasoning_effort 且不发 temperature；OpenRouter → reasoning；智谱 GLM-4.5+ → thinking 对象；Qwen3 → enable_thinking；火山方舟 → thinking；DeepSeek Reasoner 等自带思考的模型不注入）；被服务商拒绝时自动去掉参数重试并记忆；设置里可切「自动 / 开启 / 关闭」与参数风格 | ✅ |
 | 数据安全：全量备份导出 & 恢复（zip 快照）、本地服务访问令牌、API Key 落库加密（Android Keystore 包裹密钥 + AES-256-GCM） | ✅ |
 | AI 用量统计：按任务/章节记账，输入 / 输出 / 缓存命中 / 未命中（多厂商字段已归一化，未知不按 0 计） | ✅ |
 | Android 壳（前台服务 + WebView + JNI，下载/选文件已接系统） | ✅ 脚手架（见 `android/README.md` 构建步骤） |
