@@ -1422,7 +1422,7 @@ function bindBatch() {
     btn.disabled = true;
     try {
       const r = await apiSend(`/api/novels/${state.novelId}/chapters/batch-delete`, "POST", { from, to });
-      toast(`已删除 ${r.deleted} 章，后续章节已重排`);
+      toast(`已删除 ${r.deleted} 章，后续章节已重排（台账 / 全局审校引用已同步）`);
       $("#batch-del-status").textContent = `已删除第 ${from} ~ ${to} 章`;
       await refreshNovel();
       openBatch();

@@ -1621,6 +1621,34 @@ impl Db {
                 "DELETE FROM chapter_versions WHERE novel_id=?1 AND idx < 0",
                 params![novel_id],
             )?;
+            // 其它派生数据跟随章号：伏笔台账引用、全局审校涉及章节、失效卷摘要
+            let old_to_new: std::collections::HashMap<i64, i64> = moves
+                .iter()
+                .filter(|(o, _)| *o > 0)
+                .map(|(o, n)| (*o, *n))
+                .collect();
+            let max_old = moves
+                .iter()
+                .map(|(o, _)| *o)
+                .filter(|o| *o > 0)
+                .max()
+                .unwrap_or(0);
+            Self::remap_foreshadow_chapters_locked(conn, novel_id, &old_to_new)?;
+            Self::remap_global_review_locked(conn, novel_id, &old_to_new)?;
+            // 卷摘要失效判定：
+            // ① 中间有被删章号（幸存章号出现缺口）→ 缺口起点及之后覆盖的卷全部失效（内容已错位）
+            // ② 卷覆盖范围超出新的章节总数 → 尾部被删的卷失效
+            let new_total = order.len() as i64;
+            if let Some(gap) = (1..=max_old).find(|i| !old_to_new.contains_key(i)) {
+                conn.execute(
+                    "DELETE FROM volume_summaries WHERE novel_id=?1 AND upto_chapter >= ?2",
+                    params![novel_id, gap],
+                )?;
+            }
+            conn.execute(
+                "DELETE FROM volume_summaries WHERE novel_id=?1 AND upto_chapter > ?2",
+                params![novel_id, new_total],
+            )?;
             // 章号已整体重排：重建本书检索索引（索引里存的是旧章号）
             Self::reindex_novel_locked(conn, novel_id)?;
             Ok(())
@@ -1647,6 +1675,84 @@ impl Db {
         Ok(v)
     }
 
+    /// 章号映射：存活章号直接映射；被删章号就地落到「其前最近的存活章」，找不到则 None。
+    fn remap_idx(old: i64, map: &std::collections::HashMap<i64, i64>) -> Option<i64> {
+        if old <= 0 {
+            return Some(old.max(0));
+        }
+        if let Some(n) = map.get(&old) {
+            return Some(*n);
+        }
+        map.iter()
+            .filter(|(o, _)| **o > 0 && **o < old)
+            .max_by_key(|(o, _)| **o)
+            .map(|(_, n)| *n)
+    }
+
+    /// 章号重排后：伏笔台账的埋设/回收章号跟随映射（被删章号落到其前最近存活章，找不到归 0/None）
+    fn remap_foreshadow_chapters_locked(
+        conn: &Connection,
+        novel_id: &str,
+        map: &std::collections::HashMap<i64, i64>,
+    ) -> anyhow::Result<()> {
+        let mut stmt = conn.prepare(
+            "SELECT id, planted_chapter, resolved_chapter FROM foreshadowings WHERE novel_id=?1",
+        )?;
+        let rows: Vec<(String, i64, Option<i64>)> = stmt
+            .query_map([novel_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        for (id, planted, resolved) in rows {
+            let np = Self::remap_idx(planted, map).unwrap_or(0);
+            let nr = resolved.and_then(|r| Self::remap_idx(r, map));
+            conn.execute(
+                "UPDATE foreshadowings SET planted_chapter=?2, resolved_chapter=?3, updated_at=?4 WHERE id=?1",
+                params![id, np, nr, now()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 章号重排后：全局审校「涉及章节」跟随映射并去重（全部落空时保留空数组，等下一轮全局审校归并）
+    fn remap_global_review_locked(
+        conn: &Connection,
+        novel_id: &str,
+        map: &std::collections::HashMap<i64, i64>,
+    ) -> anyhow::Result<()> {
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT review_json FROM global_reviews WHERE novel_id=?1",
+                [novel_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else { return Ok(()) };
+        let Ok(mut review) = serde_json::from_str::<crate::models::GlobalReview>(&raw) else {
+            return Ok(());
+        };
+        let mut changed = false;
+        for issue in review.issues.iter_mut() {
+            let mut mapped: Vec<i64> = issue
+                .affected_chapters
+                .iter()
+                .filter_map(|c| Self::remap_idx(*c, map))
+                .collect();
+            mapped.sort_unstable();
+            mapped.dedup();
+            if mapped != issue.affected_chapters {
+                issue.affected_chapters = mapped;
+                changed = true;
+            }
+        }
+        if changed {
+            conn.execute(
+                "UPDATE global_reviews SET review_json=?2 WHERE novel_id=?1",
+                params![novel_id, serde_json::to_string(&review)?],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 按给定顺序把章节写回为 1..n（重排/插入/删除的统一入口）
     fn write_order(conn: &Connection, novel_id: &str, ids: &[String]) -> anyhow::Result<()> {
         let order: Vec<(String, i64)> = ids
             .iter()
@@ -1739,6 +1845,11 @@ impl Db {
             )?;
             n += 1;
         }
+        // 覆盖到的卷摘要失效（内容将被重写），等待下一批自动重建
+        conn.execute(
+            "DELETE FROM volume_summaries WHERE novel_id=?1 AND upto_chapter > ?2",
+            params![novel_id, after],
+        )?;
         Self::reindex_novel_locked(&conn, novel_id)?;
         Ok(n)
     }
@@ -1762,6 +1873,11 @@ impl Db {
         )?;
         conn.execute(
             "DELETE FROM chapter_fts WHERE novel_id=?1 AND chapter_idx > ?2",
+            params![novel_id, after],
+        )?;
+        // 覆盖到的卷摘要失效（内容将被重新规划与重写）
+        conn.execute(
+            "DELETE FROM volume_summaries WHERE novel_id=?1 AND upto_chapter > ?2",
             params![novel_id, after],
         )?;
         Ok(n)
@@ -2383,6 +2499,138 @@ mod tests {
         assert!(db.get_chapter(&novel.id, 2).unwrap().is_none());
         let metas = db.list_chapter_metas(&novel.id).unwrap();
         assert_eq!(metas.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_renumbers_remap_derived_chapter_refs() {
+        use crate::models::{ChapterPlan, GlobalIssue, GlobalReview};
+        let dir = tmp_dir("remap-del");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("删除引用同步测试", "auto", "").unwrap();
+        for i in 1..=4i64 {
+            db.upsert_chapter_plan(
+                &novel.id,
+                &ChapterPlan { idx: i, title: format!("第{i}章"), goal: String::new(), beats: vec![] },
+            )
+            .unwrap();
+            db.save_chapter_content(&novel.id, i, &format!("第{i}章正文"), "done").unwrap();
+        }
+        // 伏笔：A 埋于第2章（将被删）；B 埋于第4章（存活 → 重排为2）；C 埋于1、回收于3（回收章将被删）
+        db.absorb_foreshadowings(
+            &novel.id,
+            2,
+            &serde_json::json!({"foreshadowings_planted": [{"title": "伏笔A"}]}),
+        )
+        .unwrap();
+        db.absorb_foreshadowings(
+            &novel.id,
+            4,
+            &serde_json::json!({"foreshadowings_planted": [{"title": "伏笔B"}]}),
+        )
+        .unwrap();
+        db.absorb_foreshadowings(
+            &novel.id,
+            1,
+            &serde_json::json!({"foreshadowings_planted": [{"title": "伏笔C"}]}),
+        )
+        .unwrap();
+        db.absorb_foreshadowings(
+            &novel.id,
+            3,
+            &serde_json::json!({"foreshadowings_resolved": [{"title": "伏笔C"}]}),
+        )
+        .unwrap();
+        // 全局审校：涉及 2、3、4
+        db.save_global_review(
+            &novel.id,
+            &GlobalReview {
+                ok: true,
+                issues: vec![GlobalIssue {
+                    severity: "medium".into(),
+                    note: "连续三章平淡".into(),
+                    affected_chapters: vec![2, 3, 4],
+                    suggestion: String::new(),
+                    status: "open".into(),
+                    is_new: false,
+                }],
+                updated_at: "t".into(),
+            },
+        )
+        .unwrap();
+        // 卷摘要覆盖到第 4 章
+        db.upsert_volume_summary(&novel.id, 1, 4, "第1卷摘要").unwrap();
+
+        // 删除 2..3 → 重排
+        db.batch_delete_chapters(&novel.id, 2, 3).unwrap();
+
+        let fs = db.list_foreshadowings(&novel.id).unwrap();
+        let find = |t: &str| fs.iter().find(|f| f.title == t).unwrap();
+        assert_eq!(find("伏笔A").planted_chapter, 1, "被删埋设章应就近落到前一个存活章");
+        assert_eq!(find("伏笔B").planted_chapter, 2, "存活章号重排 4→2");
+        assert_eq!(find("伏笔C").planted_chapter, 1);
+        assert_eq!(
+            find("伏笔C").resolved_chapter,
+            Some(1),
+            "被删回收章应就近落到前一个存活章"
+        );
+        let gr = db.get_global_review(&novel.id).unwrap().unwrap();
+        assert_eq!(
+            gr.issues[0].affected_chapters,
+            vec![1, 2],
+            "[2,3,4] 应映射为 [1,1,2] 并去重排序"
+        );
+        assert!(
+            db.list_volume_summaries(&novel.id).unwrap().is_empty(),
+            "被删章号覆盖的卷摘要应失效清理"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_remaps_derived_chapter_refs() {
+        use crate::models::{ChapterPlan, GlobalIssue, GlobalReview};
+        let dir = tmp_dir("remap-mv");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("移动引用同步测试", "auto", "").unwrap();
+        for i in 1..=2i64 {
+            db.upsert_chapter_plan(
+                &novel.id,
+                &ChapterPlan { idx: i, title: format!("第{i}章"), goal: String::new(), beats: vec![] },
+            )
+            .unwrap();
+            db.save_chapter_content(&novel.id, i, &format!("第{i}章正文"), "done").unwrap();
+        }
+        db.absorb_foreshadowings(
+            &novel.id,
+            1,
+            &serde_json::json!({"foreshadowings_planted": [{"title": "甲伏笔"}]}),
+        )
+        .unwrap();
+        db.save_global_review(
+            &novel.id,
+            &GlobalReview {
+                ok: true,
+                issues: vec![GlobalIssue {
+                    severity: "low".into(),
+                    note: "第1章节奏".into(),
+                    affected_chapters: vec![1],
+                    suggestion: String::new(),
+                    status: "open".into(),
+                    is_new: false,
+                }],
+                updated_at: "t".into(),
+            },
+        )
+        .unwrap();
+        // 交换 1/2：引用应跟随章节互换
+        db.move_chapter(&novel.id, 1, 1).unwrap();
+        let fs = db.list_foreshadowings(&novel.id).unwrap();
+        assert_eq!(fs[0].planted_chapter, 2, "埋设章应跟随章节移动到 2");
+        let gr = db.get_global_review(&novel.id).unwrap().unwrap();
+        assert_eq!(gr.issues[0].affected_chapters, vec![2], "涉及章节应跟随章节移动");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

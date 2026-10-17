@@ -686,7 +686,7 @@ async fn batch_delete_chapters(
     e.hub.publish(&id, pipeline::EngineEvent::Stage {
         stage: "draft".into(),
         message: format!(
-            "已批量删除第 {}~{} 章（共 {deleted} 章），后续章节已重排",
+            "已批量删除第 {}~{} 章（共 {deleted} 章），后续章节已重排；台账与全局审校的章号引用已同步",
             b.from, b.to
         ),
     });

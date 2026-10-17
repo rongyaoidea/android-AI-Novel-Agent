@@ -4,7 +4,7 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use ainovel_engine::config::AppConfig;
-use ainovel_engine::models::{ChapterPlan, LlmSettings};
+use ainovel_engine::models::{ChapterPlan, GlobalIssue, GlobalReview, LlmSettings};
 use ainovel_engine::pipeline::EngineEvent;
 use ainovel_engine::{api, Engine};
 
@@ -2959,7 +2959,39 @@ async fn batch_delete_and_rewrite_after_endpoints() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    // ③ 批量删除 2~3 → 只剩 1 章
+    // ③ 批量删除前：造派生数据（卷摘要 / 伏笔埋设第3章 / 全局审校涉及第3章），验证删除后引用同步
+    engine
+        .db
+        .upsert_volume_summary(&novel_id, 1, 3, "第1卷摘要")
+        .unwrap();
+    engine
+        .db
+        .absorb_foreshadowings(
+            &novel_id,
+            3,
+            &serde_json::json!({"foreshadowings_planted": [{"title": "跨章伏笔"}]}),
+        )
+        .unwrap();
+    engine
+        .db
+        .save_global_review(
+            &novel_id,
+            &GlobalReview {
+                ok: true,
+                issues: vec![GlobalIssue {
+                    severity: "medium".into(),
+                    note: "第3章节奏拖沓".into(),
+                    affected_chapters: vec![3],
+                    suggestion: "收紧".into(),
+                    status: "open".into(),
+                    is_new: false,
+                }],
+                updated_at: "t".into(),
+            },
+        )
+        .unwrap();
+
+    // ④ 批量删除 2~3 → 只剩 1 章
     let resp = app
         .clone()
         .oneshot(
@@ -2977,7 +3009,19 @@ async fn batch_delete_and_rewrite_after_endpoints() {
     let metas = engine.db.list_chapter_metas(&novel_id).unwrap();
     assert_eq!(metas.len(), 1, "应只剩第 1 章");
 
-    // ④ 保底：不能全删 → 400
+    // 派生数据已同步：伏笔埋设章号 3（被删）→ 落到其前最近存活章 1；
+    // 全局审校涉及章节 → [1]；失效卷摘要被清理
+    let fs = engine.db.list_foreshadowings(&novel_id).unwrap();
+    let f = fs.iter().find(|f| f.title == "跨章伏笔").unwrap();
+    assert_eq!(f.planted_chapter, 1, "被删章号的引用应就近落到存活章：{f:?}");
+    let gr = engine.db.get_global_review(&novel_id).unwrap().unwrap();
+    assert_eq!(gr.issues[0].affected_chapters, vec![1], "{gr:?}");
+    assert!(
+        engine.db.list_volume_summaries(&novel_id).unwrap().is_empty(),
+        "失效卷摘要应被清理"
+    );
+
+    // ⑤ 保底：不能全删 → 400
     let resp = app
         .clone()
         .oneshot(
