@@ -19,7 +19,7 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-const NOVEL_COLS: &str = "id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at,style_preset,target_chapters,auto_continue,worldview";
+const NOVEL_COLS: &str = "id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at,style_preset,target_chapters,auto_continue,worldview,clarify_json";
 
 /// 每章保留的历史版本数
 const MAX_CHAPTER_VERSIONS: i64 = 10;
@@ -208,6 +208,8 @@ impl Db {
         Self::ensure_column(&conn, "chapters", "summary", "summary TEXT NOT NULL DEFAULT ''")?;
         // 旧库升级：补 novels.worldview 列（立项世界观）
         Self::ensure_column(&conn, "novels", "worldview", "worldview TEXT NOT NULL DEFAULT ''")?;
+        // 旧库升级：补 novels.clarify_json 列（立项澄清问答）
+        Self::ensure_column(&conn, "novels", "clarify_json", "clarify_json TEXT NOT NULL DEFAULT ''")?;
         // 卷级摘要（每 20 章归并一条，供长书回顾注入）
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS volume_summaries (
@@ -497,6 +499,7 @@ impl Db {
             style: String::new(),
             book_outline: String::new(),
             worldview: String::new(),
+            clarify_json: String::new(),
             status: "created".into(),
             mode: if mode == "staged" { "staged".into() } else { "auto".into() },
             created_at: now(),
@@ -532,6 +535,7 @@ impl Db {
             target_chapters: row.get(13)?,
             auto_continue: row.get(14)?,
             worldview: row.get(15)?,
+            clarify_json: row.get(16)?,
         })
     }
 
@@ -558,12 +562,12 @@ impl Db {
         let rows = stmt.query_map([], |row| {
             Ok(NovelListItem {
                 novel: Self::map_novel(row)?,
-                chapters_done: row.get(16)?,
-                words: row.get(17)?,
-                run_status: row.get(18)?,
-                run_stage: row.get(19)?,
-                chapters_target: row.get(20)?,
-                last_error: row.get(21)?,
+                chapters_done: row.get(17)?,
+                words: row.get(18)?,
+                run_status: row.get(19)?,
+                run_stage: row.get(20)?,
+                chapters_target: row.get(21)?,
+                last_error: row.get(22)?,
             })
         })?;
         let mut out = Vec::new();
@@ -598,6 +602,16 @@ impl Db {
         conn.execute(
             "UPDATE novels SET book_outline=?2, status=?3, updated_at=?4 WHERE id=?1",
             params![id, outline, status, now()],
+        )?;
+        Ok(())
+    }
+
+    /// 保存立项澄清问答（JSON 数组字符串）
+    pub fn set_novel_clarify(&self, id: &str, clarify_json: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE novels SET clarify_json=?2, updated_at=?3 WHERE id=?1",
+            params![id, clarify_json, now()],
         )?;
         Ok(())
     }

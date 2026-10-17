@@ -1247,7 +1247,7 @@ async fn prompt_overrides_endpoints() {
     engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
     let app = api::build_router(engine.clone());
 
-    // 1) 目录：11 个任务，默认模板齐全，初始无覆盖
+    // 1) 目录：12 个任务，默认模板齐全，初始无覆盖
     let resp = app
         .clone()
         .oneshot(
@@ -1261,7 +1261,7 @@ async fn prompt_overrides_endpoints() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
     let items = v["items"].as_array().unwrap();
-    assert_eq!(items.len(), 11, "任务数量应为 11");
+    assert_eq!(items.len(), 12, "任务数量应为 12");
     for t in items {
         assert!(!t["default_system"].as_str().unwrap().is_empty(), "{}", t["id"]);
         assert!(!t["default_user"].as_str().unwrap().is_empty(), "{}", t["id"]);
@@ -3035,6 +3035,100 @@ async fn batch_delete_and_rewrite_after_endpoints() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 立项澄清：AI 提问 → 带答案建书 → 问答入库（作为「作者已确认的设定」）
+#[tokio::test]
+async fn clarify_then_create_with_answers() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-clarify-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    // ① 空 idea → 400
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/clarify")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"idea": "   "}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // ② 提问：mock 返回 3 个问题（含建议选项）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/clarify")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "一个能听见鲸歌的少年"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let questions = v["questions"].as_array().unwrap();
+    assert!(questions.len() >= 2, "{v}");
+    assert!(!questions[0]["question"].as_str().unwrap().is_empty(), "{v}");
+    assert!(questions[0]["suggestions"].as_array().unwrap().len() >= 2, "{v}");
+
+    // ③ 带答案建书（一条作答、一条空答案应被忽略）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "idea": "一个能听见鲸歌的少年",
+                        "chapters": 1,
+                        "clarify": [
+                            {"question": "主角的性别与身份是什么？", "answer": "女性·港口调音师"},
+                            {"question": "（未回答的问题）", "answer": ""}
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    // ④ 问答入库：只保留已作答的
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    let raw = v["novel"]["clarify_json"].as_str().unwrap_or("");
+    assert!(raw.contains("女性·港口调音师"), "{raw}");
+    assert!(!raw.contains("未回答的问题"), "空答案不应入库：{raw}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

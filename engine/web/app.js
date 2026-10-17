@@ -401,12 +401,24 @@ function openOutline(item) {
   chips.push(statusChip(n.status));
   $("#outline-chips").innerHTML = chips.join("");
   const cell = (v) => esc(String(v)).replace(/\n/g, "<br>");
+  // 立项澄清（作者已确认的设定）
+  let clarify = [];
+  try {
+    clarify = JSON.parse(n.clarify_json || "[]");
+  } catch {
+    clarify = [];
+  }
+  const clarifyText = (Array.isArray(clarify) ? clarify : [])
+    .filter((x) => x && String(x.answer || "").trim())
+    .map((x) => `${x.question}：${x.answer}`)
+    .join("\n");
   const rows = [
     ["世界观", n.worldview],
     ["全书走向", n.book_outline],
     ["一句话卖点", n.logline],
     ["主角", n.protagonist],
     ["写法基调", n.style],
+    ["立项澄清", clarifyText],
     ["原始想法", n.idea],
   ].filter(([, v]) => v && String(v).trim());
   $("#outline-body").innerHTML = rows.length
@@ -434,6 +446,68 @@ function bindOutline() {
 
 /* ---------------- 新建作品 ---------------- */
 
+/** 立项澄清：AI 提问 → 作者回答（答案随建书提交，作为「已确认的设定」约束立项） */
+async function runClarify() {
+  const idea = $("#create-idea").value.trim();
+  if (!idea) {
+    toast("请先写一句灵感，再让 AI 提问", true);
+    return;
+  }
+  const btn = $("#create-clarify");
+  btn.disabled = true;
+  $("#create-clarify-status").textContent = "AI 正在分析灵感、提炼关键问题…";
+  try {
+    const r = await apiSend("/api/clarify", "POST", { idea, style_preset: getStylePick() });
+    renderClarifyQuestions(r.questions || []);
+    $("#create-clarify-clear").hidden = false;
+  } catch (err) {
+    toast(err.message, true);
+    $("#create-clarify-status").textContent = "提问失败：" + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderClarifyQuestions(questions) {
+  const box = $("#create-clarify-list");
+  if (!questions.length) {
+    box.innerHTML = "";
+    $("#create-clarify-status").textContent = "没有生成问题，可直接开始";
+    return;
+  }
+  $("#create-clarify-status").textContent = `共 ${questions.length} 个问题：点建议选项可直接填入，也可以自由回答；不回答的会被忽略`;
+  box.innerHTML = questions
+    .map(
+      (q, i) => `
+      <div class="panel" style="padding:10px 12px;margin:0 0 8px;">
+        <div style="font-size:13px;font-weight:600;">${i + 1}. ${esc(q.question || "")}</div>
+        ${q.hint ? `<div class="muted" style="font-size:12px;margin-top:2px;">${esc(q.hint)}</div>` : ""}
+        ${(q.suggestions || []).length
+          ? `<div class="chips" style="margin-top:6px;">${q.suggestions
+              .map((s) => `<span class="chip chip-filter" data-clarify-suggest="${i}" data-value="${esc(s)}">${esc(s)}</span>`)
+              .join("")}</div>`
+          : ""}
+        <input class="input-sm" style="margin-top:8px;width:100%;" data-clarify-answer="${i}" placeholder="你的回答…" />
+      </div>`,
+    )
+    .join("");
+}
+
+/** 从表单读取已作答的澄清问答（未作答的忽略） */
+function collectClarify() {
+  const out = [];
+  const items = $$("#create-clarify-list [data-clarify-answer]");
+  items.forEach((el) => {
+    const i = parseInt(el.dataset.clarifyAnswer, 10);
+    const answer = (el.value || "").trim();
+    if (!answer) return;
+    const card = el.closest(".panel");
+    const question = card ? card.querySelector("div")?.textContent?.replace(/^\d+\.\s*/, "") || "" : "";
+    out.push({ question, answer });
+  });
+  return out;
+}
+
 async function renderCreate() {
   const provider = state.settings?.provider;
   const model = provider === "mock" ? "离线演示（mock）" : state.settings?.model || "未配置";
@@ -452,6 +526,22 @@ async function renderCreate() {
 }
 
 function bindCreate() {
+  $("#create-clarify").onclick = () => runClarify();
+  $("#create-clarify-clear").onclick = () => {
+    $("#create-clarify-list").innerHTML = "";
+    $("#create-clarify-clear").hidden = true;
+    $("#create-clarify-status").textContent = "动笔前先把核心设定问清楚（可选；也可以直接开始）";
+  };
+  // 建议选项：点一下填入回答框
+  $("#create-clarify-list").addEventListener("click", (e) => {
+    const chip = e.target.closest("[data-clarify-suggest]");
+    if (!chip) return;
+    const input = $(`#create-clarify-list [data-clarify-answer="${chip.dataset.clarifySuggest}"]`);
+    if (input) {
+      input.value = chip.dataset.value || "";
+      input.focus();
+    }
+  });
   $("#create-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const idea = $("#create-idea").value.trim();
@@ -459,12 +549,14 @@ function bindCreate() {
     const chapters = Math.min(999, Math.max(1, parseInt($("#create-chapters").value || "3", 10) || 3));
     const mode = $("#create-mode").value;
     const style_preset = getStylePick();
+    const clarify = collectClarify();
     const btn = $("#create-submit");
     btn.disabled = true;
     btn.textContent = "正在创建…";
     try {
-      const r = await apiSend("/api/novels", "POST", { idea, chapters, mode, style_preset });
-      toast(mode === "staged" ? "已开始：规划完成后会暂停等你确认" : "已开始创作，进入工作台查看进度");
+      const r = await apiSend("/api/novels", "POST", { idea, chapters, mode, style_preset, clarify });
+      const extra = clarify.length ? `（已带入 ${clarify.length} 条确认设定）` : "";
+      toast((mode === "staged" ? "已开始：规划完成后会暂停等你确认" : "已开始创作，进入工作台查看进度") + extra);
       location.hash = `#/novel/${r.novel_id}`;
     } catch (err) {
       toast(err.message, true);
@@ -816,6 +908,7 @@ async function fillMissing() {
 /* ---------------- AI 用量 ---------------- */
 
 const USAGE_TASK_LABEL = {
+  clarify: "立项澄清",
   brief: "立项方案",
   outline: "章节规划",
   chapter: "正文生成",

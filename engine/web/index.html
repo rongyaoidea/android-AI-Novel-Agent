@@ -144,6 +144,14 @@
             <label for="create-idea">一句灵感</label>
             <textarea id="create-idea" rows="4" placeholder="例如：一个能听见鲸歌的少年，在深海城市里寻找失踪的姐姐。"></textarea>
           </div>
+          <div class="field">
+            <div class="row" style="margin-bottom:6px;">
+              <button class="btn btn-outline btn-sm" type="button" id="create-clarify"><svg class="ic"><use href="#i-eye"/></svg>AI 提问澄清设定</button>
+              <button class="btn btn-ghost btn-sm" type="button" id="create-clarify-clear" hidden>清空问答</button>
+              <span class="muted" id="create-clarify-status">动笔前先把核心设定问清楚（可选；也可以直接开始）</span>
+            </div>
+            <div id="create-clarify-list"></div>
+          </div>
           <div class="field-row">
             <div class="field">
               <label for="create-chapters">目标章节数（可续写，1–999）</label>

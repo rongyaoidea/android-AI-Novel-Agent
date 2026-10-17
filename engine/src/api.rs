@@ -108,6 +108,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/settings/llm/models", post(list_llm_models))
         .route("/api/settings/pipeline", get(get_pipeline).put(put_pipeline))
         .route("/api/novels", get(list_novels).post(create_novel))
+        .route("/api/clarify", post(clarify_idea))
         .route("/api/novels/:id", get(get_novel).patch(patch_novel).delete(delete_novel))
         .route("/api/novels/:id/search", get(search_novel))
         .route("/api/novels/:id/stop", post(stop_novel))
@@ -368,10 +369,52 @@ struct CreateNovelBody {
     /// 文风预设 id（可选；非法值自动忽略）
     #[serde(default)]
     style_preset: Option<String>,
+    /// 立项澄清问答（可选）：作为「作者已确认的设定」约束立项与后续生成
+    #[serde(default)]
+    clarify: Option<Vec<crate::models::ClarifyQA>>,
 }
 
 fn default_chapters() -> i64 {
     3
+}
+
+#[derive(Deserialize)]
+struct ClarifyBody {
+    idea: String,
+    #[serde(default)]
+    style_preset: Option<String>,
+}
+
+/// 立项澄清：根据灵感生成关键澄清问题（不建书、不落库；建议选项供参考，也可自由回答）
+async fn clarify_idea(
+    State(e): State<Arc<Engine>>,
+    Json(b): Json<ClarifyBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let idea = b.idea.trim();
+    if idea.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "idea 不能为空".to_string()));
+    }
+    let style = b.style_preset.as_deref().and_then(crate::styles::find);
+    let settings = e.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings.clone());
+    let ov = e.prompt_overrides();
+    let (sys, usr) = crate::prompts::clarify_prompt(idea, style, &ov);
+    let out = llm.complete(&sys, &usr).await.map_err(err)?;
+    record_usage(&e.db, None, None, "clarify", &settings, &out.usage);
+    let raw = out.text;
+    let mut questions: Vec<crate::models::ClarifyQuestion> = crate::llm::extract_json_object(&raw)
+        .filter(|j| j["questions"].is_array())
+        .and_then(|j| serde_json::from_value(j["questions"].clone()).ok())
+        .unwrap_or_default();
+    questions.retain(|q| !q.question.trim().is_empty());
+    questions.truncate(8);
+    if questions.is_empty() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "澄清输出无法解析（缺 questions 数组），可重试一次".to_string(),
+        ));
+    }
+    Ok(Json(json!({"ok": true, "questions": questions})))
 }
 
 async fn create_novel(
@@ -393,6 +436,17 @@ async fn create_novel(
     // 目标章节数 = 创建时填写的数量（后续可改；自动连载体以其为准）
     let target = b.chapters.clamp(1, 999);
     e.db.set_novel_target(&novel.id, target).map_err(err)?;
+    // 立项澄清问答：只保留已作答的，作为「作者已确认的设定」注入立项（与后续写作约束）
+    let clarify: Vec<crate::models::ClarifyQA> = b
+        .clarify
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|q| !q.question.trim().is_empty() && !q.answer.trim().is_empty())
+        .collect();
+    if !clarify.is_empty() {
+        e.db.set_novel_clarify(&novel.id, &serde_json::to_string(&clarify).map_err(err)?)
+            .map_err(err)?;
+    }
     let run_id = pipeline::spawn(e.clone(), &novel.id, b.chapters.clamp(1, 50)).map_err(err)?;
     Ok(Json(json!({"novel_id": novel.id, "run_id": run_id, "target_chapters": target})))
 }

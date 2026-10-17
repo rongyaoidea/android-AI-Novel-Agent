@@ -284,6 +284,7 @@ async fn run_inner(
         let (sys, usr) = crate::prompts::brief_prompt(
             &novel.idea,
             crate::styles::find(&novel.style_preset),
+            &parse_clarify(&novel.clarify_json),
             &ov,
         );
         // JSON 解析失败自动重试一次（自愈）
@@ -1163,6 +1164,11 @@ pub fn stale_review_candidates(
         }
     }
     out
+}
+
+/// 解析立项澄清问答（宽容：畸形 JSON 视为无澄清）
+pub fn parse_clarify(raw: &str) -> Vec<crate::models::ClarifyQA> {
+    serde_json::from_str::<Vec<crate::models::ClarifyQA>>(raw).unwrap_or_default()
 }
 
 /// 开工巡检结果（全部为「本次实际做了多少」）

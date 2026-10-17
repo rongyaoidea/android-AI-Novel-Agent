@@ -14,6 +14,9 @@ pub struct Novel {
     /// 世界观设定（立项时生成；旧库为空）
     #[serde(default)]
     pub worldview: String,
+    /// 立项澄清的问答（JSON 数组：[{question, answer}]；作者已确认的设定，作为立项与写作的硬约束）
+    #[serde(default)]
+    pub clarify_json: String,
     pub status: String,
     /// "auto"（全自动）| "staged"（按阶段确认）
     pub mode: String,
@@ -112,6 +115,25 @@ impl Default for LlmSettings {
             temperature: 0.8,
         }
     }
+}
+
+/// 立项澄清问答（AI 提问 → 作者回答）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClarifyQA {
+    #[serde(default)]
+    pub question: String,
+    #[serde(default)]
+    pub answer: String,
+}
+
+/// 一条澄清提问（AI 生成，含可选建议）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClarifyQuestion {
+    pub question: String,
+    #[serde(default)]
+    pub hint: String,
+    #[serde(default)]
+    pub suggestions: Vec<String>,
 }
 
 /// 立项方案（LLM 结构化输出）

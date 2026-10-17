@@ -37,9 +37,10 @@ static BRIEF: TaskSpec = TaskSpec {
     vars: &[
         VarSpec { name: "idea", desc: "小说灵感（用户输入）", sample: "一个能听见鲸歌的少年，在深海城市里寻找失踪的姐姐" },
         VarSpec { name: "style_line", desc: "文风预设提示行（未选预设时为空）", sample: "文风预设：悬疑限知·反转烧脑（镜头扛在主角肩上）——书名与卖点要贴合该风格。\n" },
+        VarSpec { name: "clarify_block", desc: "作者已确认的设定块（未做澄清时为空）", sample: "\n【作者已确认的设定（必须遵守）】\nQ: 主角性别与身份？\nA: 女性，港口调音师\n" },
     ],
     default_system: "你是资深中文网文策划。只输出一个 JSON 对象，不要输出任何其他文字，不要使用 Markdown 代码块。",
-    default_user: "TASK:brief\n想法：{{idea}}\n{{style_line}}\n\
+    default_user: "TASK:brief\n想法：{{idea}}\n{{style_line}}{{clarify_block}}\n\
 请基于上述想法给出一本书的立项方案，输出 JSON，字段：\n\
 - title: 书名（12 字以内，有网感）\n\
 - genre: 题材（如 玄幻/都市/悬疑/科幻/历史）\n\
@@ -47,6 +48,29 @@ static BRIEF: TaskSpec = TaskSpec {
 - protagonist: 主角名与一句话设定\n\
 - worldview: 世界观设定（60 字以内：时代背景、力量体系/核心规则、关键地点或阵营）\n\
 - style: 写法基调（节奏 / 视角 / 语言风格；若给了文风预设，需与该预设一致）\n",
+};
+
+static CLARIFY: TaskSpec = TaskSpec {
+    id: "clarify",
+    label: "立项澄清",
+    desc: "根据灵感提出关键澄清问题，把核心设定问清楚再动笔（JSON）",
+    vars: &[
+        VarSpec { name: "idea", desc: "小说灵感（用户输入）", sample: "一个能听见鲸歌的少年，在深海城市里寻找失踪的姐姐" },
+        VarSpec { name: "style_line", desc: "文风预设提示行（未选预设时为空）", sample: "文风预设：悬疑限知·反转烧脑——问题可围绕该风格强调的要素展开。\n" },
+    ],
+    default_system: "你是资深中文网文策划。只输出一个 JSON 对象，不要输出任何其他文字，不要使用 Markdown 代码块。",
+    default_user: "TASK:clarify\n想法：{{idea}}\n{{style_line}}\n\
+动笔之前，请针对上述想法列出 5~8 个最关键的澄清问题，覆盖这些维度（按想法的缺口取舍，不要面面俱到）：\n\
+- 题材与频道（男频/女频、主分类与核心卖点）\n\
+- 主角（性别/身份/性格/核心欲望/能力或金手指）\n\
+- 世界观关键规则（时代、力量体系或现实规矩、核心地点）\n\
+- 主线目标与核心冲突（主角要什么、谁/什么挡着）\n\
+- 基调与爽点（燃 / 虐 / 沙雕 / 悬疑…）、节奏偏好\n\
+- 感情线（有无 CP、关系走向）\n\
+- 篇幅规划（预计章节规模与结局倾向）\n\
+针对该想法里**已经明确的信息不要重复问**。\n\
+输出 JSON：{\"questions\": [{\"question\": \"问题（一句话）\", \"hint\": \"为什么问 / 期望的回答形式\", \"suggestions\": [\"常见选项1\", \"常见选项2\"]}]}\n\
+questions 最多 8 个；suggestions 给 2~4 个常见选项供参考（作者也可自由回答）。\n",
 };
 
 static OUTLINE: TaskSpec = TaskSpec {
@@ -245,7 +269,7 @@ static GLOBAL_REVIEW: TaskSpec = TaskSpec {
 };
 
 pub static TASKS: &[&TaskSpec] = &[
-    &BRIEF, &OUTLINE, &CHAPTER, &REVIEW, &POLISH, &CONTINUE, &REWRITE, &EXTRACT,
+    &BRIEF, &CLARIFY, &OUTLINE, &CHAPTER, &REVIEW, &POLISH, &CONTINUE, &REWRITE, &EXTRACT,
     &VOLUME_SUMMARY, &FORESHADOW_AUDIT, &GLOBAL_REVIEW,
 ];
 
@@ -450,16 +474,52 @@ fn style_block_var(style: Option<&StylePreset>) -> String {
 
 // ---------- 各任务构建 ----------
 
-pub fn brief_prompt(idea: &str, style: Option<&StylePreset>, ov: &Overrides) -> (String, String) {
+pub fn brief_prompt(
+    idea: &str,
+    style: Option<&StylePreset>,
+    clarify: &[crate::models::ClarifyQA],
+    ov: &Overrides,
+) -> (String, String) {
     let style_line = match style {
         Some(p) => format!("文风预设：{}（{}）——书名与卖点要贴合该风格。\n", p.name, p.tagline),
+        None => String::new(),
+    };
+    let clarify_block = build_clarify_block(clarify);
+    let vars = vec![
+        ("idea", idea.to_string()),
+        ("style_line", style_line),
+        ("clarify_block", clarify_block),
+    ];
+    build(&BRIEF, ov, &vars)
+}
+
+/// 作者已确认的设定块（立项与后续生成共用的硬约束文本；无问答时为空）
+pub fn build_clarify_block(clarify: &[crate::models::ClarifyQA]) -> String {
+    let items: Vec<&crate::models::ClarifyQA> = clarify
+        .iter()
+        .filter(|q| !q.answer.trim().is_empty())
+        .collect();
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\n【作者已确认的设定（必须遵守，与其它设定冲突时以此为准）】\n");
+    for q in items {
+        s.push_str(&format!("Q: {}\nA: {}\n", q.question.trim(), q.answer.trim()));
+    }
+    s
+}
+
+/// 立项澄清提问
+pub fn clarify_prompt(idea: &str, style: Option<&StylePreset>, ov: &Overrides) -> (String, String) {
+    let style_line = match style {
+        Some(p) => format!("文风预设：{}——问题可围绕该风格强调的要素展开。\n", p.name),
         None => String::new(),
     };
     let vars = vec![
         ("idea", idea.to_string()),
         ("style_line", style_line),
     ];
-    build(&BRIEF, ov, &vars)
+    build(&CLARIFY, ov, &vars)
 }
 
 pub fn outline_prompt(
@@ -769,7 +829,7 @@ mod tests {
     fn fill_is_single_pass_trims_names_and_marks_from_template() {
         // ① 变量值里的 {{占位符}} 不被二次替换（避免注入/自展开）
         let ov = none();
-        let (_, usr) = brief_prompt("他说{{style_line}}真好", None, &ov);
+        let (_, usr) = brief_prompt("他说{{style_line}}真好", None, &[], &ov);
         assert!(
             usr.contains("{{style_line}}"),
             "值里的占位符应原样保留：{usr}"
@@ -783,7 +843,7 @@ mod tests {
                 user: "写 {{ idea }} 吧\nTASK:brief".into(),
             },
         );
-        let (_, usr2) = brief_prompt("鲸歌", None, &o);
+        let (_, usr2) = brief_prompt("鲸歌", None, &[], &o);
         assert!(usr2.contains("写 鲸歌 吧"), "{usr2}");
         assert!(!usr2.contains("{{"), "{usr2}");
         // ③ 补 TASK 标记依据「模板本身」：值里出现 TASK: 不该阻止补标记（否则 Mock 会误派任务）
@@ -795,13 +855,35 @@ mod tests {
                 user: "想法：{{idea}}".into(),
             },
         );
-        let (_, usr3) = brief_prompt("TASK:chapter index=9", None, &o2);
+        let (_, usr3) = brief_prompt("TASK:chapter index=9", None, &[], &o2);
         assert!(usr3.contains("TASK:brief"), "模板缺标记时应补上：{usr3}");
     }
 
     #[test]
+    fn brief_includes_author_confirmed_clarify() {
+        let ov = none();
+        let clarify = vec![
+            crate::models::ClarifyQA {
+                question: "主角性别与身份？".into(),
+                answer: "女性，港口调音师".into(),
+            },
+            crate::models::ClarifyQA {
+                question: "（未回答的问题）".into(),
+                answer: "".into(),
+            },
+        ];
+        let (_, usr) = brief_prompt("鲸歌", None, &clarify, &ov);
+        assert!(usr.contains("作者已确认的设定"), "{usr}");
+        assert!(usr.contains("女性，港口调音师"), "{usr}");
+        assert!(!usr.contains("未回答的问题"), "未回答的问题不应注入：{usr}");
+        // 无澄清时块为空
+        let (_, usr2) = brief_prompt("鲸歌", None, &[], &ov);
+        assert!(!usr2.contains("作者已确认的设定"), "{usr2}");
+    }
+
+    #[test]
     fn task_catalog_is_consistent() {
-        assert_eq!(TASKS.len(), 11, "任务数量应为 11");
+        assert_eq!(TASKS.len(), 12, "任务数量应为 12");
         for spec in TASKS {
             assert!(task(spec.id).is_some());
             assert!(!spec.label.is_empty() && !spec.desc.is_empty());
@@ -884,7 +966,7 @@ mod tests {
         assert!(!user.contains("【文风预设："), "未选预设时不应出现风格块头");
         let (_, ou) = outline_prompt(&sample_brief(), 1, 2, &[], None, &ov);
         assert!(!ou.contains("平台节奏基线"), "未选预设时章纲不应出现风格块");
-        let (_, bu) = brief_prompt("灵感", None, &ov);
+        let (_, bu) = brief_prompt("灵感", None, &[], &ov);
         assert!(!bu.contains("平台节奏基线"), "未选预设时立项不应出现风格块");
     }
 

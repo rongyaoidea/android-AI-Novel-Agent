@@ -39,6 +39,7 @@ mod tests {
             style: "基调".into(),
             book_outline: "走向".into(),
             worldview: "世界观".into(),
+            clarify_json: String::new(),
             status: "drafted".into(),
             mode: "auto".into(),
             style_preset: String::new(),

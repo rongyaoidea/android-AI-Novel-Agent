@@ -616,6 +616,16 @@ fn mock_usage(system: &str, user: &str, text: &str) -> TokenUsage {
 }
 
 fn mock_complete(user: &str) -> anyhow::Result<String> {
+    if user.contains("TASK:clarify") {
+        return Ok(serde_json::json!({
+            "questions": [
+                {"question": "主角的性别与身份是什么？", "hint": "决定视角与代入感", "suggestions": ["少年·学生", "少女·手艺人", "中年·退役者"]},
+                {"question": "核心能力或金手指是什么？", "hint": "决定爽点与冲突方式", "suggestions": ["听见鲸歌", "预知三秒", "无金手指·写实"]},
+                {"question": "感情线与结局倾向？", "hint": "单女主/多女主/无 CP；团圆或留白", "suggestions": ["单女主·团圆", "无 CP", "开放结局"]}
+            ]
+        })
+        .to_string());
+    }
     if user.contains("TASK:brief") {
         let idea = extract_after(user, "想法：").unwrap_or_else(|| "未命名灵感".into());
         let short: String = idea.chars().take(12).collect();
