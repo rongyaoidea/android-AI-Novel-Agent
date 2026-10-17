@@ -12,7 +12,7 @@
 //! 硬伤会触发流水线的自动重写（最多一次），软伤只进审校提醒。
 
 use crate::models::ReviewIssue;
-use crate::styles::StylePreset;
+use crate::styles::StyleSpec;
 
 /// 全局 AI 味黑名单（番茄平台专项治理的典型陈词）
 pub const AI_FLAVOR_PHRASES: &[&str] = &[
@@ -50,6 +50,15 @@ pub struct StyleReport {
     pub ok: bool,
     pub hard_fail: bool,
     pub checks: Vec<CheckItem>,
+    /// 文风指纹（S1：本地统计画像；旧报告为空）
+    #[serde(default)]
+    pub fingerprint: Option<serde_json::Value>,
+    /// 指纹带偏离提示（S1；偏离只告警不硬判）
+    #[serde(default)]
+    pub deviations: Vec<String>,
+    /// 与风格样本的防复述重叠命中（S4；命中即触发过重写）
+    #[serde(default)]
+    pub overlap: Option<String>,
 }
 
 impl StyleReport {
@@ -224,8 +233,8 @@ fn has_ending_hook(text: &str) -> bool {
     HOOK_WORDS.iter().any(|w| tail.contains(w))
 }
 
-/// 对一章正文执行全部检查
-pub fn check_chapter(preset: &StylePreset, text: &str) -> StyleReport {
+/// 对一章正文执行全部检查（风格规格：静态预设或用户自定义风格统一传入）
+pub fn check_chapter(spec: &StyleSpec, text: &str) -> StyleReport {
     let stats = text_stats(text);
     let mut checks: Vec<CheckItem> = Vec::new();
 
@@ -241,8 +250,8 @@ pub fn check_chapter(preset: &StylePreset, text: &str) -> StyleReport {
         });
     }
 
-    // 2) 对话占比（仅当预设要求）
-    if let Some(min) = preset.checks.min_dialogue_ratio {
+    // 2) 对话占比（仅当风格要求）
+    if let Some(min) = spec.checks.min_dialogue_ratio {
         let ratio = stats.dialogue_ratio;
         let passed = ratio >= min;
         checks.push(CheckItem {
@@ -253,8 +262,8 @@ pub fn check_chapter(preset: &StylePreset, text: &str) -> StyleReport {
         });
     }
 
-    // 3) 单句最长（仅当预设要求）
-    if let Some(limit) = preset.checks.max_sentence_len {
+    // 3) 单句最长（仅当风格要求）
+    if let Some(limit) = spec.checks.max_sentence_len {
         let m = stats.max_sentence;
         let passed = m <= limit;
         checks.push(CheckItem {
@@ -273,7 +282,7 @@ pub fn check_chapter(preset: &StylePreset, text: &str) -> StyleReport {
                 hits.push((*p).to_string());
             }
         }
-        if preset.checks.forbid_modern_words {
+        if spec.checks.forbid_modern_words {
             for w in MODERN_WORDS {
                 if text.contains(w) {
                     hits.push((*w).to_string());
@@ -308,8 +317,8 @@ pub fn check_chapter(preset: &StylePreset, text: &str) -> StyleReport {
         });
     }
 
-    // 6) 字数窗口（解析预设；偏差过大才软失败）
-    if let Some((min, max)) = parse_word_target(preset.word_target) {
+    // 6) 字数窗口（解析风格字数；偏差过大才软失败）
+    if let Some((min, max)) = parse_word_target(&spec.word_target) {
         let n = stats.chars;
         let passed = n >= (min as f32 * 0.7) as usize && n <= (max as f32 * 1.3) as usize;
         checks.push(CheckItem {
@@ -323,10 +332,13 @@ pub fn check_chapter(preset: &StylePreset, text: &str) -> StyleReport {
     let hard_fail = checks.iter().any(|c| !c.passed && c.hard);
     let ok = checks.iter().all(|c| c.passed);
     StyleReport {
-        style: preset.id.to_string(),
+        style: spec.id.clone(),
         ok,
         hard_fail,
         checks,
+        fingerprint: None,
+        deviations: Vec::new(),
+        overlap: None,
     }
 }
 
@@ -334,8 +346,8 @@ pub fn check_chapter(preset: &StylePreset, text: &str) -> StyleReport {
 mod tests {
     use super::*;
 
-    fn preset(id: &str) -> &'static StylePreset {
-        crate::styles::find(id).unwrap()
+    fn preset(id: &str) -> StyleSpec {
+        StyleSpec::from_preset(crate::styles::find(id).unwrap())
     }
 
     #[test]
@@ -348,7 +360,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        let r = check_chapter(preset("xuanyi"), &text);
+        let r = check_chapter(&preset("xuanyi"), &text);
         let cv_check = r.checks.iter().find(|c| c.name == "段落长短交错").unwrap();
         assert!(!cv_check.passed, "等长段落不应通过");
         assert!(cv_check.hard, "应判为硬伤");
@@ -358,7 +370,7 @@ mod tests {
     #[test]
     fn varied_paragraphs_pass() {
         let text = "第1章 测试\n\n短句。\n这是一段中等长度的叙述，交代场景与人物状态，长度适中。\n他慢慢把杯子放下，又看了一眼窗外那条被雨淋湿的街，心里忽然升起一个念头，却没有说出口。\n短。\n他又说了一句话，这次稍微长一些，带上了情绪。";
-        let r = check_chapter(preset("xuanyi"), text);
+        let r = check_chapter(&preset("xuanyi"), text);
         let cv_check = r.checks.iter().find(|c| c.name == "段落长短交错").unwrap();
         assert!(cv_check.passed, "长短交错应通过: {cv_check:?}");
     }
@@ -367,13 +379,13 @@ mod tests {
     fn dialogue_ratio_required_for_chatty_styles() {
         // 无对话文本在"发疯毒舌"预设下应判不通过（且为硬伤：0 < 0.42*0.8）
         let text = "第1章 测试\n\n他走进房间，环顾四周，没有人。\n他坐了下来，开始等待。";
-        let r = check_chapter(preset("shadiao"), text);
+        let r = check_chapter(&preset("shadiao"), text);
         let d = r.checks.iter().find(|c| c.name == "对话占比").unwrap();
         assert!(!d.passed && d.hard, "{d:?}");
 
         // 对话充足则通过
         let text2 = "第1章 测试\n\n「你到底来不来？」\n「来。」\n「那就别磨蹭。」\n「行。」\n「走。」";
-        let r2 = check_chapter(preset("shadiao"), text2);
+        let r2 = check_chapter(&preset("shadiao"), text2);
         let d2 = r2.checks.iter().find(|c| c.name == "对话占比").unwrap();
         assert!(d2.passed, "{d2:?}");
     }
@@ -393,24 +405,24 @@ mod tests {
     fn long_sentence_flagged_for_shadiao_only() {
         let long = "他说".to_string() + &"这句话真的非常非常长而且完全没有停顿一口气说下去让读者喘不过气".repeat(2);
         let text = format!("第1章 测试\n\n{long}。");
-        let r = check_chapter(preset("shadiao"), &text);
+        let r = check_chapter(&preset("shadiao"), &text);
         assert!(r.checks.iter().any(|c| c.name == "句长上限" && !c.passed));
         // 其他预设没有句长约束，不出现该项
-        let r2 = check_chapter(preset("gufeng"), &text);
+        let r2 = check_chapter(&preset("gufeng"), &text);
         assert!(!r2.checks.iter().any(|c| c.name == "句长上限"));
     }
 
     #[test]
     fn ai_flavor_and_modern_words_are_hard_fail() {
         let text = "第1章 测试\n\n他头皮发麻，空气仿佛凝固。";
-        let r = check_chapter(preset("xuanyi"), text);
+        let r = check_chapter(&preset("xuanyi"), text);
         let p = r.checks.iter().find(|c| c.name == "禁用短语").unwrap();
         assert!(!p.passed && p.hard, "{p:?}");
 
         // 现代词只在古风/纪实预设中检查
         let text2 = "第1章 测试\n\n他觉得很破防，决定不再内耗。";
         assert!(
-            !check_chapter(preset("gufeng"), text2)
+            !check_chapter(&preset("gufeng"), text2)
                 .checks
                 .iter()
                 .find(|c| c.name == "禁用短语")
@@ -418,7 +430,7 @@ mod tests {
                 .passed
         );
         assert!(
-            check_chapter(preset("xuanyi"), text2)
+            check_chapter(&preset("xuanyi"), text2)
                 .checks
                 .iter()
                 .find(|c| c.name == "禁用短语")
@@ -439,7 +451,7 @@ mod tests {
     #[test]
     fn report_shapes_review_issues() {
         let text = format!("第1章 测\n\n{}", "一样长度的段落内容。\n".repeat(5));
-        let r = check_chapter(preset("rexue"), &text);
+        let r = check_chapter(&preset("rexue"), &text);
         let issues = r.as_review_issues();
         assert!(!issues.is_empty());
         assert!(issues.iter().any(|i| i.note.contains("文风检查")));

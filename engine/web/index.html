@@ -172,6 +172,7 @@
             <label>文风预设 <span class="muted">（可选：决定写法、节奏与爽点密度；创建后仍可更换）</span></label>
             <div class="chips" id="create-style-groups"></div>
             <div class="style-grid" id="create-style-grid"></div>
+            <button class="btn btn-outline btn-sm" type="button" id="create-style-custom" style="margin-top:8px;"><svg class="ic"><use href="#i-pen"/></svg>从样本创建风格（自定义）</button>
           </div>
           <div class="row">
             <button class="btn btn-primary" type="submit" id="create-submit">开始创作</button>
@@ -672,6 +673,10 @@
       <div id="health-style-stats" class="muted" style="margin:0;">加载中…</div>
     </div>
     <div class="usage-block">
+      <h4 class="usage-sub">文风指纹（本地零 token：全书 vs 预设指纹带）</h4>
+      <div id="health-fingerprint" class="muted" style="margin:0;">加载中…</div>
+    </div>
+    <div class="usage-block">
       <h4 class="usage-sub">读者视角评审（AI，含黄金三章专项）</h4>
       <div class="row">
         <select id="readerv-range" class="input-sm">
@@ -746,6 +751,10 @@
     </div>
     <div class="chips" id="style-groups"></div>
     <div class="style-grid" id="style-grid"></div>
+    <div class="row" style="margin-top:8px;">
+      <button class="btn btn-outline btn-sm" type="button" id="style-custom"><svg class="ic"><use href="#i-pen"/></svg>从样本创建风格（自定义）</button>
+      <span class="muted" style="font-size:12px;">样本不出机：本地提取指纹，AI 只生成风格卡</span>
+    </div>
     <p class="muted" style="margin:0;">选择后立即生效：后续生成的章节、续写与修文都会按该风格执行；已完成的章节不受影响。</p>
   </div>
 </div>

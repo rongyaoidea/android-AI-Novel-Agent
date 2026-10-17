@@ -942,6 +942,22 @@ fn mock_complete(user: &str) -> anyhow::Result<String> {
         })
         .to_string());
     }
+    if user.contains("TASK:style_card") {
+        return Ok(serde_json::json!({
+            "tagline": "（模拟）冷峻短句的都市悬疑风",
+            "genres": "都市悬疑 / 心理惊悚",
+            "word_target": "2000~2400 字",
+            "rules": [
+                "短句推进，句均长不超过 18 字",
+                "对话占比 20%~40%，对白承担信息投放",
+                "第三人称限知，不写主角不知道的信息",
+                "情绪用动作外化，禁止大段内心独白",
+                "章末用信息截断收束，禁总结抒情"
+            ],
+            "avoid": ["形容词堆砌", "全知视角剧透", "章末总结升华"]
+        })
+        .to_string());
+    }
     if user.contains("TASK:review") {
         return Ok(serde_json::json!({
             "ok": true,

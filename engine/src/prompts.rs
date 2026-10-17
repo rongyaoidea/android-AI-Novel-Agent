@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::models::{Brief, ChapterPlan};
-use crate::styles::StylePreset;
+use crate::styles::StyleSpec;
 
 // ---------- 任务与变量定义 ----------
 
@@ -117,6 +117,7 @@ static CHAPTER: TaskSpec = TaskSpec {
         VarSpec { name: "goal", desc: "本章目标", sample: "开场钩子：姐姐留下的录音笔失效" },
         VarSpec { name: "beats", desc: "本章节拍（分号连接）", sample: "开场钩子；冲突升级；章末悬念" },
         VarSpec { name: "hook_line", desc: "本章节奏要求行（章纲钩型/强度；未标注时为空）", sample: "【本章节奏要求】章末钩型：悬念；推进强度 3/5（1=过渡、3=小高潮、5=卷末爆点）；\n" },
+        VarSpec { name: "style_sample", desc: "风格锚定样本块（按章轮换注入；未选风格时为空）", sample: "\n【风格锚定样本（仅作语感参考，禁止照抄其中内容）】\n他数着自己的心跳走过去……\n" },
         VarSpec { name: "ledger", desc: "角色事实与未回收伏笔块（可能为空）", sample: "\n【必须保持一致的角色事实与未回收伏笔】\n林深：正在寻找姐姐；录音笔：第1章埋下\n" },
         VarSpec { name: "prev", desc: "上一章结尾块", sample: "上一章结尾：\n他把录音笔塞回口袋，海风把后半句话吹散了。" },
         VarSpec { name: "words", desc: "单章字数窗口", sample: "2000~2400 字" },
@@ -125,7 +126,7 @@ static CHAPTER: TaskSpec = TaskSpec {
     default_system: "你是中文网文写手。直接输出章节正文：第一行写章节标题，之后不再出现任何说明性文字、不要客套、不要使用 Markdown 标题符号。",
     default_user: "TASK:chapter index={{idx}} title={{title}}\n\
 书名：{{book_title}}\n题材：{{genre}}\n卖点：{{logline}}\n主角：{{protagonist}}\n基调：{{style}}\n全书走向：{{outline}}\n\n\
-本章目标：{{goal}}\n本章节拍：{{beats}}\n{{hook_line}}{{ledger}}\n{{prev}}\n\n\
+本章目标：{{goal}}\n本章节拍：{{beats}}\n{{hook_line}}{{style_sample}}{{ledger}}\n{{prev}}\n\n\
 要求：写完整的第 {{idx}} 章正文，{{words}}；第一行是「第{{idx}}章 {{title}}」；\
 延续上一章结尾的情绪与场景；章末留悬念。{{style_block}}",
 };
@@ -314,9 +315,29 @@ static READER_REVIEW: TaskSpec = TaskSpec {
 评分维度：代入感（前 300 字能否抓住人）、爽点/信息密度、章末牵引（钩子是否有效）、节奏（拖沓或赶）、语言（AI 腔/重复）。\n",
 };
 
+static STYLE_CARD: TaskSpec = TaskSpec {
+    id: "style_card",
+    label: "风格卡提炼",
+    desc: "从用户样本提炼结构化文风卡（自定义风格；JSON）",
+    vars: &[
+        VarSpec { name: "style_name", desc: "风格名称", sample: "我的都市悬疑风" },
+        VarSpec { name: "sample", desc: "用户样本（截断后）", sample: "他把伞收起来，雨水顺着伞骨往下淌……" },
+    ],
+    default_system: "你是网文文风分析师。只输出一个 JSON 对象，不要输出任何其他文字，不要使用 Markdown 代码块。",
+    default_user: "TASK:style_card\n风格名称：{{style_name}}\n以下是作者提供的风格样本（可能是同一作者的多段节选）：\n---\n{{sample}}\n---\n\n\
+请提炼这份样本的写作风格，输出 JSON，字段：\n\
+- tagline: 一句话定位（20 字以内）\n\
+- genres: 适用题材（20 字以内）\n\
+- word_target: 建议单章字数窗口（如 \"2000~2400 字\"）\n\
+- rules: 5~6 条可执行的写作规则（覆盖句式节奏 / 对话占比 / 视角 / 修辞密度 / 情绪表达 / 章末断法；每条一句话，不写形容词空话）\n\
+- avoid: 3 条反例（该风格最忌惮的写法，出现即视为不合格）\n\
+只描述「怎么写」，不要复述样本内容、不要引用样本原句。\n",
+};
+
 pub static TASKS: &[&TaskSpec] = &[
     &BRIEF, &CLARIFY, &OUTLINE, &CHAPTER, &REVIEW, &POLISH, &CONTINUE, &REWRITE, &EXTRACT,
     &VOLUME_SUMMARY, &FORESHADOW_AUDIT, &GLOBAL_REVIEW, &VOLUME_REVIEW, &READER_REVIEW,
+    &STYLE_CARD,
 ];
 
 pub fn task(id: &str) -> Option<&'static TaskSpec> {
@@ -510,11 +531,11 @@ fn build(spec: &TaskSpec, ov: &Overrides, vars: &[(&str, String)]) -> (String, S
     }
 }
 
-/// 风格块（选中预设时追加；未选则空串）
-fn style_block_var(style: Option<&StylePreset>) -> String {
+/// 风格块（选中风格时追加；未选则空串）
+fn style_block_var(style: Option<&StyleSpec>) -> String {
     match style {
-        Some(p) => format!("\n\n{}", crate::styles::style_block(p)),
-        None => String::new(),
+        Some(s) if !s.block.trim().is_empty() => format!("\n\n{}", s.block),
+        _ => String::new(),
     }
 }
 
@@ -522,7 +543,7 @@ fn style_block_var(style: Option<&StylePreset>) -> String {
 
 pub fn brief_prompt(
     idea: &str,
-    style: Option<&StylePreset>,
+    style: Option<&StyleSpec>,
     clarify: &[crate::models::ClarifyQA],
     ov: &Overrides,
 ) -> (String, String) {
@@ -556,7 +577,7 @@ pub fn build_clarify_block(clarify: &[crate::models::ClarifyQA]) -> String {
 }
 
 /// 立项澄清提问
-pub fn clarify_prompt(idea: &str, style: Option<&StylePreset>, ov: &Overrides) -> (String, String) {
+pub fn clarify_prompt(idea: &str, style: Option<&StyleSpec>, ov: &Overrides) -> (String, String) {
     let style_line = match style {
         Some(p) => format!("文风预设：{}——问题可围绕该风格强调的要素展开。\n", p.name),
         None => String::new(),
@@ -573,7 +594,7 @@ pub fn outline_prompt(
     from: i64,
     to: i64,
     prev: &[(i64, String)],
-    style: Option<&StylePreset>,
+    style: Option<&StyleSpec>,
     ov: &Overrides,
 ) -> (String, String) {
     let count = to - from + 1;
@@ -615,7 +636,8 @@ pub fn chapter_prompt(
     prev_tail: &str,
     ledger: &str,
     hook_line: &str,
-    style: Option<&StylePreset>,
+    style_sample: &str,
+    style: Option<&StyleSpec>,
     ov: &Overrides,
 ) -> (String, String) {
     let prev = if prev_tail.trim().is_empty() {
@@ -628,7 +650,9 @@ pub fn chapter_prompt(
     } else {
         format!("\n【必须保持一致的角色事实与未回收伏笔】\n{}\n", ledger.trim())
     };
-    let words = style.map(|p| p.word_target).unwrap_or("1500~2500 字");
+    let words = style
+        .map(|s| s.word_target.clone())
+        .unwrap_or_else(|| "1500~2500 字".to_string());
     let vars = vec![
         ("idx", plan.idx.to_string()),
         ("title", plan.title.clone()),
@@ -641,6 +665,7 @@ pub fn chapter_prompt(
         ("goal", plan.goal.clone()),
         ("beats", plan.beats.join("；")),
         ("hook_line", hook_line.to_string()),
+        ("style_sample", style_sample.to_string()),
         ("ledger", ledger_block),
         ("prev", prev),
         ("words", words.to_string()),
@@ -649,13 +674,13 @@ pub fn chapter_prompt(
     build(&CHAPTER, ov, &vars)
 }
 
-pub fn review_prompt(chapter_text: &str, style: Option<&StylePreset>, ov: &Overrides) -> (String, String) {
+pub fn review_prompt(chapter_text: &str, style: Option<&StyleSpec>, ov: &Overrides) -> (String, String) {
     let style_note = match style {
         Some(p) => format!(
             "\n另外按文风预设《{}》检查文风违例（如：{}；反例：{}），有则计入 issues（severity 用 low）。\n",
             p.name,
-            p.rules.first().copied().unwrap_or(""),
-            p.avoid.first().copied().unwrap_or(""),
+            p.rules.first().map(String::as_str).unwrap_or(""),
+            p.avoid.first().map(String::as_str).unwrap_or(""),
         ),
         None => String::new(),
     };
@@ -671,7 +696,7 @@ pub fn polish_prompt(
     selection: &str,
     chapter_title: &str,
     instruction: &str,
-    style: Option<&StylePreset>,
+    style: Option<&StyleSpec>,
     ov: &Overrides,
 ) -> (String, String) {
     let goal = match mode {
@@ -705,7 +730,7 @@ pub fn continue_prompt(
     context_before: &str,
     chars: i64,
     instruction: &str,
-    style: Option<&StylePreset>,
+    style: Option<&StyleSpec>,
     ov: &Overrides,
 ) -> (String, String) {
     let extra = if instruction.trim().is_empty() {
@@ -733,7 +758,7 @@ pub fn rewrite_prompt(
     goal: &str,
     current: &str,
     instruction: &str,
-    style: Option<&StylePreset>,
+    style: Option<&StyleSpec>,
     ov: &Overrides,
 ) -> (String, String) {
     let style_line = match style {
@@ -784,6 +809,16 @@ pub fn extract_prompt(chapter_idx: i64, text: &str, ov: &Overrides) -> (String, 
         ("excerpt", excerpt),
     ];
     build(&EXTRACT, ov, &vars)
+}
+
+/// 风格卡提炼（S5 自定义风格）：用户样本 → 结构化文风卡
+pub fn style_card_prompt(style_name: &str, sample: &str, ov: &Overrides) -> (String, String) {
+    let excerpt: String = sample.chars().take(6000).collect();
+    let vars = vec![
+        ("style_name", style_name.to_string()),
+        ("sample", excerpt),
+    ];
+    build(&STYLE_CARD, ov, &vars)
 }
 
 /// 卷级摘要：把一卷内各章摘要压成一条（from~to 含端点）
@@ -859,7 +894,7 @@ pub fn reader_review_prompt(
     to: i64,
     golden: bool,
     chapters_text: &str,
-    style: Option<&StylePreset>,
+    style: Option<&StyleSpec>,
     ov: &Overrides,
 ) -> (String, String) {
     let style_line = match style {
@@ -1016,19 +1051,41 @@ mod tests {
             "",
             "",
             "【本章节奏要求】章末钩型：悬念；推进强度 4/5；\n",
+            "",
             None,
             &ov,
         );
         assert!(user.contains("本章节奏要求"), "{user}");
         assert!(user.contains("章末钩型：悬念"), "{user}");
         // 无节奏标注时行内容为空（模板占位符替换为空串）
-        let (_, user2) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", None, &ov);
+        let (_, user2) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", "", None, &ov);
         assert!(!user2.contains("本章节奏要求"), "{user2}");
     }
 
     #[test]
+    fn chapter_prompt_injects_style_sample_block() {
+        let ov = none();
+        let (_, user) = chapter_prompt(
+            &sample_brief(),
+            "走向",
+            &sample_plan(),
+            "",
+            "",
+            "",
+            "\n【风格锚定样本（仅作语感参考，禁止照抄其中内容）】\n他数着自己的心跳走过去。\n",
+            None,
+            &ov,
+        );
+        assert!(user.contains("风格锚定样本"), "{user}");
+        assert!(user.contains("禁止照抄"), "{user}");
+        // 无样本时占位符替换为空串
+        let (_, user2) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", "", None, &ov);
+        assert!(!user2.contains("风格锚定样本"), "{user2}");
+    }
+
+    #[test]
     fn task_catalog_is_consistent() {
-        assert_eq!(TASKS.len(), 14, "任务数量应为 14");
+        assert_eq!(TASKS.len(), 15, "任务数量应为 15");
         for spec in TASKS {
             assert!(task(spec.id).is_some());
             assert!(!spec.label.is_empty() && !spec.desc.is_empty());
@@ -1096,7 +1153,7 @@ mod tests {
         let mut ov = Overrides::default();
         // 自定义模板：故意不带 TASK 标记
         ov.set("chapter", Template { system: "自定义系统".into(), user: "请写第 {{idx}} 章「{{title}}」，字数 {{words}}。".into() });
-        let (sys, user) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", None, &ov);
+        let (sys, user) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", "", None, &ov);
         assert_eq!(sys, "自定义系统");
         assert!(user.contains("请写第 1 章「第一章」"), "{user}");
         assert!(user.starts_with("TASK:chapter index=1 title=第一章"), "缺标记时应自动补：{user}");
@@ -1105,7 +1162,7 @@ mod tests {
     #[test]
     fn without_style_prompts_stay_unchanged() {
         let ov = none();
-        let (_, user) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", None, &ov);
+        let (_, user) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", "", None, &ov);
         assert!(user.contains("1500~2500 字"), "未选预设时应保持默认字数窗口");
         assert!(!user.contains("平台节奏基线"), "未选预设时不应出现风格块");
         assert!(!user.contains("【文风预设："), "未选预设时不应出现风格块头");
@@ -1118,31 +1175,31 @@ mod tests {
     #[test]
     fn style_block_is_injected_into_all_writing_tasks() {
         let ov = none();
-        let p = crate::styles::find("gufeng").unwrap();
-        let (_, ch) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "前文", "台账", "", Some(p), &ov);
+        let p = StyleSpec::from_preset(crate::styles::find("gufeng").unwrap());
+        let (_, ch) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "前文", "台账", "", "", Some(&p), &ov);
         assert!(ch.contains("【文风预设：古风雅致·家宅权谋"), "章节提示词应含风格块");
-        assert!(ch.contains(p.word_target), "字数窗口应使用预设值");
+        assert!(ch.contains(&p.word_target), "字数窗口应使用预设值");
         assert!(!ch.contains("1500~2500 字"), "选预设后不应再出现默认字数窗口");
         assert!(ch.starts_with("TASK:chapter"), "任务标记必须仍在开头");
 
-        let (_, ou) = outline_prompt(&sample_brief(), 1, 2, &[], Some(p), &ov);
+        let (_, ou) = outline_prompt(&sample_brief(), 1, 2, &[], Some(&p), &ov);
         assert!(ou.contains("文风预设：古风雅致"));
         assert!(ou.contains("平台节奏基线"), "章纲提示词应含完整风格块");
         assert!(ou.starts_with("TASK:outline"));
 
-        let (_, pu) = polish_prompt("rewrite", "选段内容", "第一章", "", Some(p), &ov);
+        let (_, pu) = polish_prompt("rewrite", "选段内容", "第一章", "", Some(&p), &ov);
         assert!(pu.contains("文风预设：古风雅致"));
         assert!(pu.contains("原段落："), "修文标记不能被破坏");
 
-        let (_, cu) = continue_prompt("第一章", "前文", 300, "", Some(p), &ov);
+        let (_, cu) = continue_prompt("第一章", "前文", 300, "", Some(&p), &ov);
         assert!(cu.contains("文风预设：古风雅致"));
 
-        let (_, ru) = rewrite_prompt("regenerate", "第一章", "目标", "", "", Some(p), &ov);
+        let (_, ru) = rewrite_prompt("regenerate", "第一章", "目标", "", "", Some(&p), &ov);
         assert!(ru.contains("文风预设：古风雅致"));
-        let (_, rv) = rewrite_prompt("revise", "第一章", "", "正文", "要求", Some(p), &ov);
+        let (_, rv) = rewrite_prompt("revise", "第一章", "", "正文", "要求", Some(&p), &ov);
         assert!(rv.contains("文风预设：古风雅致"));
 
-        let (_, re) = review_prompt("正文内容", Some(p), &ov);
+        let (_, re) = review_prompt("正文内容", Some(&p), &ov);
         assert!(re.contains("文风违例"), "审校应带风格违例检查");
     }
 
@@ -1150,13 +1207,14 @@ mod tests {
     fn style_blocks_keep_mock_parsable_markers() {
         // 逐个预设跑一遍，确保追加风格块后 Mock 仍能解析出关键参数
         let ov = none();
-        for p in crate::styles::PRESETS {
-            let (_, ch) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", Some(p), &ov);
+        for preset in crate::styles::PRESETS {
+            let p = StyleSpec::from_preset(preset);
+            let (_, ch) = chapter_prompt(&sample_brief(), "走向", &sample_plan(), "", "", "", "", Some(&p), &ov);
             assert!(ch.contains("index=1"), "{}: index 标记丢失", p.id);
             assert!(ch.contains("title=第一章"), "{}: title 标记丢失", p.id);
-            let (_, cu) = continue_prompt("第一章", "前文", 300, "", Some(p), &ov);
+            let (_, cu) = continue_prompt("第一章", "前文", 300, "", Some(&p), &ov);
             assert!(cu.contains("chars=300"), "{}: chars 标记丢失", p.id);
-            let (_, ou) = outline_prompt(&sample_brief(), 1, 3, &[], Some(p), &ov);
+            let (_, ou) = outline_prompt(&sample_brief(), 1, 3, &[], Some(&p), &ov);
             assert!(ou.contains("from=1") && ou.contains("to=3"), "{}: 区间标记丢失", p.id);
         }
     }

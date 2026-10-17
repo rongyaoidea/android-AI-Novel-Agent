@@ -98,6 +98,8 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/app.js", get(app_js))
         .route("/api/health", get(health))
         .route("/api/styles", get(list_styles))
+        .route("/api/styles/custom", get(list_custom_styles).post(create_custom_style))
+        .route("/api/styles/custom/:id", axum::routing::delete(delete_custom_style))
         .route("/api/prompts", get(list_prompts))
         .route(
             "/api/prompts/:task",
@@ -134,6 +136,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/novels/:id/chapters/:idx/rewrite", post(rewrite_chapter))
         .route("/api/novels/:id/chapters/:idx/extract", post(extract_chapter))
         .route("/api/novels/:id/health", get(novel_health))
+        .route("/api/novels/:id/style-fingerprint", get(novel_style_fingerprint))
         .route("/api/novels/:id/style-stats", get(novel_style_stats))
         .route("/api/novels/:id/volume-reports", get(volume_reports))
         .route("/api/novels/:id/reader-review", post(reader_review))
@@ -210,9 +213,137 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({"ok": true, "name": "ainovel-engine", "version": env!("CARGO_PKG_VERSION")}))
 }
 
-/// 文风预设目录（UI 选择器数据源；含规则/反例，便于前端展示与自检）
-async fn list_styles() -> Json<serde_json::Value> {
-    Json(json!({"items": crate::styles::PRESETS}))
+/// 文风预设目录（UI 选择器数据源；含规则/反例，便于前端展示与自检）+ 用户自定义风格
+async fn list_styles(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, ApiErr> {
+    let custom: Vec<serde_json::Value> = e
+        .db
+        .list_custom_styles()
+        .map_err(err)?
+        .into_iter()
+        .map(|c| {
+            let card: serde_json::Value = serde_json::from_str(&c.card_json).unwrap_or_default();
+            json!({
+                "id": format!("custom:{}", c.id),
+                "name": c.name,
+                "group": "自定义",
+                "tagline": card["tagline"],
+                "genres": card["genres"],
+                "custom": true,
+            })
+        })
+        .collect();
+    Ok(Json(json!({"items": crate::styles::PRESETS, "custom": custom})))
+}
+
+/// 自定义风格列表（含风格卡与指纹）
+async fn list_custom_styles(State(e): State<Arc<Engine>>) -> Result<Json<serde_json::Value>, ApiErr> {
+    let items: Vec<serde_json::Value> = e
+        .db
+        .list_custom_styles()
+        .map_err(err)?
+        .into_iter()
+        .map(|c| {
+            json!({
+                "id": c.id,
+                "style_id": format!("custom:{}", c.id),
+                "name": c.name,
+                "card": serde_json::from_str::<serde_json::Value>(&c.card_json).unwrap_or_default(),
+                "fingerprint": serde_json::from_str::<serde_json::Value>(&c.fingerprint_json).unwrap_or_default(),
+                "anchor": c.anchor,
+                "created_at": c.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({"items": items})))
+}
+
+#[derive(Deserialize)]
+struct CustomStyleBody {
+    name: String,
+    sample: String,
+}
+
+/// 从样本创建自定义风格（S5）：本地提取指纹 + LLM 生成风格卡 + 锚定样本（样本不出机）
+async fn create_custom_style(
+    State(e): State<Arc<Engine>>,
+    Json(b): Json<CustomStyleBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let name = b.name.trim();
+    if name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "风格名称不能为空".to_string()));
+    }
+    let sample = b.sample.trim();
+    let sample_len = sample.chars().count();
+    if sample_len < 1500 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("样本太短（{sample_len} 字）：建议至少 1500 字，理想 5000 字以上、多章混合"),
+        ));
+    }
+    let settings = e.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings.clone());
+    let ov = e.prompt_overrides();
+    let (sys, usr) = crate::prompts::style_card_prompt(name, sample, &ov);
+    let out = llm.complete(&sys, &usr).await.map_err(err)?;
+    record_usage(&e.db, None, None, "style_card", &settings, &out.usage);
+    let card = crate::llm::extract_json_object(&out.text).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "风格卡输出不是 JSON（可重试一次）".to_string(),
+    ))?;
+    // 本地指纹 + 指纹带（样本值 ±30%，工程参考带）
+    let fp = crate::style_fingerprint::compute(sample);
+    let metrics = [
+        "avg_para_len",
+        "avg_sentence_len",
+        "short_sentence_ratio",
+        "comma_period_ratio",
+        "quote_ratio",
+        "exclaim_per_k",
+        "ellipsis_per_k",
+        "idiom_per_k",
+    ];
+    let bands: Vec<serde_json::Value> = metrics
+        .iter()
+        .filter_map(|m| {
+            let v = crate::style_fingerprint::value_of(&fp, m)?;
+            if v <= 0.0 {
+                return None;
+            }
+            let round2 = |x: f64| (x * 100.0).round() / 100.0;
+            Some(json!({ "metric": m, "min": round2(v * 0.7), "max": round2(v * 1.3) }))
+        })
+        .collect();
+    // 锚定样本：取样本中段 ~300 字（避开开头结尾的上下文依赖）
+    let chars: Vec<char> = sample.chars().collect();
+    let start = (chars.len() / 3).min(chars.len());
+    let anchor: String = chars[start..].iter().take(300).collect();
+    let id = uuid::Uuid::new_v4().to_string();
+    let style = crate::models::CustomStyle {
+        id: id.clone(),
+        name: name.to_string(),
+        card_json: serde_json::to_string(&card).map_err(err)?,
+        fingerprint_json: serde_json::to_string(&json!({"fingerprint": fp, "bands": bands}))
+            .map_err(err)?,
+        anchor,
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    e.db.upsert_custom_style(&style).map_err(err)?;
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "style_id": format!("custom:{id}"),
+        "card": card
+    })))
+}
+
+/// 删除自定义风格（已使用该风格的作品会回退为「不限」）
+async fn delete_custom_style(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let removed = e.db.delete_custom_style(&id).map_err(err)?;
+    Ok(Json(json!({"ok": true, "removed": removed})))
 }
 
 // ---------- 提示词模板 ----------
@@ -402,11 +533,14 @@ async fn clarify_idea(
     if idea.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "idea 不能为空".to_string()));
     }
-    let style = b.style_preset.as_deref().and_then(crate::styles::find);
+    let style = b
+        .style_preset
+        .as_deref()
+        .and_then(|s| crate::pipeline::resolve_style_spec(&e.db, s));
     let settings = e.llm_settings().map_err(err)?;
     let llm = crate::llm::Llm::new(settings.clone());
     let ov = e.prompt_overrides();
-    let (sys, usr) = crate::prompts::clarify_prompt(idea, style, &ov);
+    let (sys, usr) = crate::prompts::clarify_prompt(idea, style.as_ref(), &ov);
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, None, None, "clarify", &settings, &out.usage);
     let raw = out.text;
@@ -437,8 +571,19 @@ async fn create_novel(
     let style = b
         .style_preset
         .as_deref()
-        .and_then(crate::styles::find)
-        .map(|p| p.id)
+        .map(str::trim)
+        .filter(|s| {
+            !s.is_empty()
+                && (crate::styles::find(s).is_some()
+                    || s.strip_prefix("custom:")
+                        .map(|cid| {
+                            e.db.get_custom_style(cid.trim())
+                                .ok()
+                                .flatten()
+                                .is_some()
+                        })
+                        .unwrap_or(false))
+        })
         .unwrap_or("");
     let novel = e.db.create_novel(idea, mode, style).map_err(err)?;
     // 目标章节数 = 创建时填写的数量（后续可改；自动连载体以其为准）
@@ -917,10 +1062,22 @@ async fn patch_novel(
         let trimmed = style.trim();
         let normalized = if trimmed.is_empty() {
             ""
+        } else if crate::styles::find(trimmed).is_some() {
+            trimmed
+        } else if let Some(cid) = trimmed.strip_prefix("custom:") {
+            if e.db.get_custom_style(cid.trim()).map_err(err)?.is_some() {
+                trimmed
+            } else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("未知的自定义风格: {trimmed}"),
+                ));
+            }
         } else {
-            crate::styles::find(trimmed).map(|p| p.id).ok_or_else(|| {
-                (StatusCode::BAD_REQUEST, format!("未知的文风预设: {trimmed}"))
-            })?
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("未知的文风预设: {trimmed}"),
+            ));
         };
         e.db.set_novel_style(&id, normalized).map_err(err)?;
     }
@@ -1093,8 +1250,8 @@ async fn polish_chapter(
         .db
         .get_novel(&id)
         .map_err(err)?
-        .and_then(|n| crate::styles::find(&n.style_preset));
-    let (sys, usr) = crate::prompts::polish_prompt(&mode, sel, &ch.title, &b.instruction, style, &e.prompt_overrides());
+        .and_then(|n| crate::pipeline::resolve_style_spec(&e.db, &n.style_preset));
+    let (sys, usr) = crate::prompts::polish_prompt(&mode, sel, &ch.title, &b.instruction, style.as_ref(), &e.prompt_overrides());
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, Some(&id), Some(idx), "polish", &settings, &out.usage);
     Ok(Json(json!({"revised": out.text.trim(), "mode": mode})))
@@ -1206,8 +1363,8 @@ async fn review_chapter(
         .db
         .get_novel(&id)
         .map_err(err)?
-        .and_then(|n| crate::styles::find(&n.style_preset));
-    let (sys, usr) = crate::prompts::review_prompt(&ch.content, style, &e.prompt_overrides());
+        .and_then(|n| crate::pipeline::resolve_style_spec(&e.db, &n.style_preset));
+    let (sys, usr) = crate::prompts::review_prompt(&ch.content, style.as_ref(), &e.prompt_overrides());
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, Some(&id), Some(idx), "review", &settings, &out.usage);
     let raw = out.text;
@@ -1295,8 +1452,8 @@ async fn continue_chapter(
         .db
         .get_novel(&id)
         .map_err(err)?
-        .and_then(|n| crate::styles::find(&n.style_preset));
-    let (sys, usr) = crate::prompts::continue_prompt(&ch.title, &before, chars, &b.instruction, style, &e.prompt_overrides());
+        .and_then(|n| crate::pipeline::resolve_style_spec(&e.db, &n.style_preset));
+    let (sys, usr) = crate::prompts::continue_prompt(&ch.title, &before, chars, &b.instruction, style.as_ref(), &e.prompt_overrides());
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
     record_usage(&e.db, Some(&id), Some(idx), "continue", &settings, &out.usage);
     Ok(Json(json!({"text": out.text.trim(), "chars": chars})))
@@ -1341,14 +1498,14 @@ async fn rewrite_chapter(
         .db
         .get_novel(&id)
         .map_err(err)?
-        .and_then(|n| crate::styles::find(&n.style_preset));
+        .and_then(|n| crate::pipeline::resolve_style_spec(&e.db, &n.style_preset));
     let (sys, usr) = crate::prompts::rewrite_prompt(
         mode,
         &ch.title,
         &ch.goal,
         &ch.content,
         &b.instruction,
-        style,
+        style.as_ref(),
         &e.prompt_overrides(),
     );
     let out = llm.complete(&sys, &usr).await.map_err(err)?;
@@ -1541,6 +1698,38 @@ async fn novel_style_stats(
         .collect();
     let stats = crate::style_stats::compute(&done);
     Ok(Json(serde_json::to_value(stats).map_err(err)?))
+}
+
+/// 全书文风指纹（S1）：全书正文的统计画像 + 与风格指纹带的偏离（本地零 token）
+async fn novel_style_fingerprint(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let novel = e
+        .db
+        .get_novel(&id)
+        .map_err(err)?
+        .ok_or_else(|| not_found("novel"))?;
+    let chapters = e.db.list_chapters(&id).map_err(err)?;
+    let done_texts: Vec<&str> = chapters
+        .iter()
+        .filter(|c| c.status == "done" && !c.content.trim().is_empty())
+        .map(|c| c.content.as_str())
+        .collect();
+    let chapters_n = done_texts.len();
+    let combined = done_texts.join("\n");
+    let fp = crate::style_fingerprint::compute(&combined);
+    let spec = crate::pipeline::resolve_style_spec(&e.db, &novel.style_preset);
+    let deviations = spec
+        .as_ref()
+        .map(|s| crate::style_fingerprint::compare(&fp, &s.bands))
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "chapters": chapters_n,
+        "fingerprint": fp,
+        "style": spec.as_ref().map(|s| json!({"id": s.id, "name": s.name})),
+        "deviations": deviations,
+    })))
 }
 
 /// 卷末体检报告列表（每 20 章自动生成一条）

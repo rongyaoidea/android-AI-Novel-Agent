@@ -753,6 +753,18 @@ async function renderCreate() {
 
 function bindCreate() {
   $("#create-clarify").onclick = () => runClarify();
+  const customBtn = $("#create-style-custom");
+  if (customBtn) {
+    customBtn.onclick = () =>
+      openCustomStyleDialog(async () => {
+        mountStylePicker(
+          $("#create-style-grid"),
+          $("#create-style-groups"),
+          getStylePick(),
+          (id) => setStylePick(id),
+        );
+      });
+  }
   $("#create-clarify-clear").onclick = () => {
     $("#create-clarify-list").innerHTML = "";
     $("#create-clarify-clear").hidden = true;
@@ -800,13 +812,23 @@ function bindCreate() {
 
 /* ---------------- 文风预设 ---------------- */
 
-const STYLE_GROUPS = ["全部", "男频", "女频", "通用"];
+const STYLE_GROUPS = ["全部", "男频", "女频", "通用", "自定义"];
 const STYLE_PICK_KEY = "ainovel.style";
 
 async function loadStyles() {
   if (!state.styles) {
     const r = await api("/api/styles");
-    state.styles = r.items || [];
+    state.styles = (r.items || []).concat(
+      (r.custom || []).map((c) => ({
+        id: c.id,
+        name: c.name,
+        group: "自定义",
+        tagline: c.tagline || "用户样本提炼的风格",
+        genres: c.genres || "",
+        traits: [["来源", "样本提炼"], ["本地", "指纹带"]],
+        custom: true,
+      })),
+    );
   }
   return state.styles;
 }
@@ -847,11 +869,12 @@ function mountStylePicker(grid, groups, selectedId, onPick) {
       (g) => `<span class="chip chip-filter ${g === group ? "chip-dark" : ""}" data-sgroup="${g}">${g}</span>`,
     ).join("");
     const list = state.styles || [];
-    const card = (id, name, badge, tagline, genres, traits) => `
+    const card = (id, name, badge, tagline, genres, traits, delId) => `
       <div class="style-card ${id === selectedId ? "selected" : ""}" data-style="${id}">
         <div class="style-card-head">
           <h4>${esc(name)}</h4>
           ${badge ? `<span class="chip">${esc(badge)}</span>` : ""}
+          ${delId ? `<button class="icon-btn danger" data-style-del="${esc(delId)}" title="删除该自定义风格">${ic("i-x")}</button>` : ""}
         </div>
         <p class="style-tagline">${esc(tagline)}</p>
         ${genres ? `<p class="style-genres">${esc(genres)}</p>` : ""}
@@ -860,7 +883,7 @@ function mountStylePicker(grid, groups, selectedId, onPick) {
     const cards = [card("", "不限", "", "跟随模型自由发挥（默认写法）", "", [])];
     for (const s of list) {
       if (group !== "全部" && s.group !== group) continue;
-      cards.push(card(s.id, s.name, s.group, s.tagline, s.genres, s.traits));
+      cards.push(card(s.id, s.name, s.group, s.tagline, s.genres, s.traits, s.custom ? s.id : null));
     }
     grid.innerHTML = cards.join("");
   };
@@ -870,7 +893,24 @@ function mountStylePicker(grid, groups, selectedId, onPick) {
     group = g.dataset.sgroup;
     draw();
   };
-  grid.onclick = (e) => {
+  grid.onclick = async (e) => {
+    const del = e.target.closest("[data-style-del]");
+    if (del) {
+      e.stopPropagation();
+      const sid = del.dataset.styleDel;
+      const cid = sid.replace(/^custom:/, "");
+      if (!confirm("删除该自定义风格？已使用它的作品会回退为「不限」。")) return;
+      try {
+        await api(`/api/styles/custom/${cid}`, { method: "DELETE" });
+        state.styles = null;
+        await loadStyles();
+        toast("已删除自定义风格");
+        draw();
+      } catch (err) {
+        toast(err.message, true);
+      }
+      return;
+    }
     const c = e.target.closest("[data-style]");
     if (!c) return;
     selectedId = c.dataset.style;
@@ -878,6 +918,37 @@ function mountStylePicker(grid, groups, selectedId, onPick) {
     if (onPick) onPick(selectedId);
   };
   draw();
+}
+
+/** 从样本创建自定义风格（S5）：样本不出机；本地提取指纹，AI 只生成风格卡 */
+async function openCustomStyleDialog(onDone) {
+  openForm({
+    title: "从样本创建自定义风格",
+    fields: [
+      { name: "name", label: "风格名称", value: "", placeholder: "例如：我的都市悬疑风" },
+      {
+        name: "sample",
+        label: "风格样本（至少 1500 字；理想 5000 字以上、多章混合；请使用自己的作品或有权使用的内容）",
+        type: "textarea",
+        rows: 10,
+        value: "",
+        placeholder: "粘贴样本……样本只在本机处理，不上传（仅风格卡由模型生成）",
+      },
+    ],
+    onSubmit: async (v) => {
+      const name = (v.name || "").trim();
+      const sample = (v.sample || "").trim();
+      if (!name) throw new Error("请填写风格名称");
+      if (sample.length < 1500) {
+        throw new Error(`样本太短（${sample.length} 字）：建议至少 1500 字`);
+      }
+      const r = await apiSend("/api/styles/custom", "POST", { name, sample });
+      state.styles = null; // 刷新目录
+      await loadStyles();
+      toast(`已创建自定义风格「${name}」：可在风格选择器中使用`);
+      if (onDone) await onDone(r.style_id);
+    },
+  });
 }
 
 /** 工作台：更换文风预设（选择即 PATCH 保存） */
@@ -1154,6 +1225,36 @@ async function loadHealthExtras() {
     $("#health-style-stats").innerHTML = html;
   } catch (e) {
     $("#health-style-stats").textContent = "加载失败：" + e.message;
+  }
+  // 文风指纹（S1：全书画像 vs 预设指纹带）
+  try {
+    const f = await api(`/api/novels/${id}/style-fingerprint`);
+    if (state.novelId !== id) return;
+    const fp = f.fingerprint || {};
+    let html = `<div class="chips"><span class="chip">篇章 ${f.chapters}</span>`;
+    if (f.style) {
+      html += `<span class="chip chip-info">${esc(f.style.name)}</span>`;
+    }
+    html +=
+      `<span class="chip">段均长 ${fp.avg_para_len}</span>` +
+      `<span class="chip">句均长 ${fp.avg_sentence_len}</span>` +
+      `<span class="chip">短句率 ${Math.round((fp.short_sentence_ratio || 0) * 100)}%</span>` +
+      `<span class="chip">对话 ${Math.round((fp.quote_ratio || 0) * 100)}%</span>` +
+      `<span class="chip">逗号/句号 ${fp.comma_period_ratio}</span>` +
+      `</div>`;
+    const devs = f.deviations || [];
+    if (devs.length) {
+      html += devs
+        .map((d) => `<p class="health-line">${ic("i-flag")}<span>${esc(d.note)}</span></p>`)
+        .join("");
+    } else if (f.style) {
+      html += `<p class="muted" style="margin:6px 0 0;">各项指标都在指纹带内。</p>`;
+    } else {
+      html += `<p class="muted" style="margin:6px 0 0;">未选文风预设：仅统计画像，不做指纹带对照。</p>`;
+    }
+    $("#health-fingerprint").innerHTML = html;
+  } catch (e) {
+    $("#health-fingerprint").textContent = "加载失败：" + e.message;
   }
   // 卷末体检报告
   try {
@@ -1613,6 +1714,10 @@ function bindNovel() {
     if (e.target.closest("#novel-style-chip")) openStylePicker();
   });
   $("#style-close").onclick = () => { $("#style-backdrop").hidden = true; };
+  $("#style-custom").onclick = () =>
+    openCustomStyleDialog(async () => {
+      await openStylePicker();
+    });
   $("#insert-chapter").onclick = () => {
     const count = (state.novel?.chapters || []).length;
     openForm({
@@ -2225,6 +2330,17 @@ function renderStyleReport(report) {
       : "";
     detailEl.hidden = true;
   }
+  const fpChips = [];
+  if (report.overlap) {
+    fpChips.push(
+      `<span class="chip chip-danger" title="与风格样本存在逐字重叠（已触发重写）">防复述：${esc(String(report.overlap).slice(0, 10))}…</span>`,
+    );
+  }
+  for (const d of (report.deviations || []).slice(0, 3)) {
+    fpChips.push(
+      `<span class="chip chip-warning" title="文风指纹偏离（只告警，不阻断）">${esc(String(d).slice(0, 26))}</span>`,
+    );
+  }
   el.innerHTML =
     `<span class="chip chip-dark">文风检查 · ${esc(styleName)}</span>` +
     report.checks
@@ -2233,6 +2349,7 @@ function renderStyleReport(report) {
         return `<span class="chip ${cls}" title="${esc(c.detail)}">${c.passed ? "✓" : "✗"} ${esc(c.name)}</span>`;
       })
       .join("") +
+    fpChips.join("") +
     (failed.length ? `<span class="chip chip-filter" data-styledetail="1" title="点击查看细节">细节</span>` : "");
 }
 

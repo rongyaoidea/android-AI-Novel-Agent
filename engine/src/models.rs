@@ -266,6 +266,21 @@ pub fn cap_review_fixed(review: &mut Review, max_fixed: usize) {
     review.issues = keep;
 }
 
+/// 用户自定义风格（S5：导入样本 → 本地提取指纹 + LLM 生成风格卡）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomStyle {
+    pub id: String,
+    pub name: String,
+    /// 风格卡 JSON：{"tagline": ..., "genres": ..., "rules": [...], "avoid": [...], "word_target": ...}
+    pub card_json: String,
+    /// 指纹 JSON：{"fingerprint": {...}, "bands": [{"metric": ..., "min": ..., "max": ...}]}
+    pub fingerprint_json: String,
+    /// 锚定样本（用户样本节选；生成时注入，并作为防复述对照）
+    pub anchor: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// 卷级摘要（每 20 章归并一条，供长书回顾注入）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeSummary {

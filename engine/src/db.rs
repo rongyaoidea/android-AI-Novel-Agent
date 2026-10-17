@@ -241,6 +241,15 @@ impl Db {
                 updated_at  TEXT NOT NULL,
                 PRIMARY KEY(novel_id, kind)
              );
+             CREATE TABLE IF NOT EXISTS custom_styles (
+                id               TEXT PRIMARY KEY,
+                name             TEXT NOT NULL,
+                card_json        TEXT NOT NULL,
+                fingerprint_json TEXT NOT NULL,
+                anchor           TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS chapter_versions (
                 id           TEXT PRIMARY KEY,
                 novel_id     TEXT NOT NULL,
@@ -1141,6 +1150,74 @@ impl Db {
             params![novel_id, kind],
             |r| r.get(0),
         )?;
+        Ok(n > 0)
+    }
+
+    // ---------- 自定义风格（S5） ----------
+
+    pub fn upsert_custom_style(&self, s: &crate::models::CustomStyle) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO custom_styles(id, name, card_json, fingerprint_json, anchor, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?6)
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name,
+                card_json=excluded.card_json,
+                fingerprint_json=excluded.fingerprint_json,
+                anchor=excluded.anchor,
+                updated_at=excluded.updated_at",
+            params![s.id, s.name, s.card_json, s.fingerprint_json, s.anchor, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_custom_style(&self, id: &str) -> anyhow::Result<Option<crate::models::CustomStyle>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, card_json, fingerprint_json, anchor, created_at, updated_at
+             FROM custom_styles WHERE id=?1",
+        )?;
+        let mut rows = stmt.query_map([id], |r| {
+            Ok(crate::models::CustomStyle {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                card_json: r.get(2)?,
+                fingerprint_json: r.get(3)?,
+                anchor: r.get(4)?,
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn list_custom_styles(&self) -> anyhow::Result<Vec<crate::models::CustomStyle>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, card_json, fingerprint_json, anchor, created_at, updated_at
+             FROM custom_styles ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(crate::models::CustomStyle {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                card_json: r.get(2)?,
+                fingerprint_json: r.get(3)?,
+                anchor: r.get(4)?,
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_custom_style(&self, id: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM custom_styles WHERE id=?1", [id])?;
         Ok(n > 0)
     }
 

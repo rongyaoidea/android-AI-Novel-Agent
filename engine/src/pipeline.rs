@@ -178,7 +178,7 @@ async fn plan_range(
         from,
         to,
         prev_tail,
-        crate::styles::find(&novel.style_preset),
+        resolve_style_spec(&engine.db, &novel.style_preset).as_ref(),
         ov,
     );
     // JSON 解析失败自动重试一次（自愈）
@@ -565,7 +565,7 @@ async fn run_inner(
         });
         let (sys, usr) = crate::prompts::brief_prompt(
             &novel.idea,
-            crate::styles::find(&novel.style_preset),
+            resolve_style_spec(&engine.db, &novel.style_preset).as_ref(),
             &parse_clarify(&novel.clarify_json),
             &ov,
         );
@@ -636,6 +636,8 @@ async fn run_inner(
         }
     }
     let novel = engine.db.get_novel(novel_id)?.unwrap_or(novel);
+    // 风格规格（静态预设或自定义风格）：整轮共用
+    let style_spec = resolve_style_spec(&engine.db, &novel.style_preset);
 
     // ---- 3) 逐章：写正文 + 审校 ----
     let mut wrote_in_run = 0usize;
@@ -759,6 +761,12 @@ async fn run_inner(
             }
             hook_line.push('\n');
         }
+        // 风格锚定样本（S3：按章轮换注入；仅作语感参考，禁止照抄）
+        let style_sample_line = style_spec
+            .as_ref()
+            .and_then(|s| s.sample_for(idx))
+            .map(|t| format!("\n【风格锚定样本（仅作语感参考，禁止照抄其中内容）】\n{t}\n"))
+            .unwrap_or_default();
         let (sys, usr) = crate::prompts::chapter_prompt(
             &brief,
             &novel.book_outline,
@@ -766,7 +774,8 @@ async fn run_inner(
             &prev_tail,
             &context,
             &hook_line,
-            crate::styles::find(&novel.style_preset),
+            &style_sample_line,
+            style_spec.as_ref(),
             &ov,
         );
         // 流式输出按 ~80 字聚合后再推送；空内容自动重试一次（章节级自愈）
@@ -848,22 +857,30 @@ async fn run_inner(
         }
 
         // ---- 文风一致性检查（本地、零 token）----
-        // 命中硬指标（段落等长 / 对话占比严重不足 / 禁用短语等）时自动重写一次，取表现更好的一稿。
-        let style = crate::styles::find(&novel.style_preset);
+        // 硬指标（段落等长 / 对话占比 / 禁用短语）+ 防复述重叠（S4）：命中则自动重写一次，取表现更好的一稿。
+        let style = style_spec.as_ref();
         let mut content = content;
         let mut report = style.map(|p| crate::style_check::check_chapter(p, &content));
+        let mut overlap = style
+            .and_then(|s| crate::style_fingerprint::first_overlap(&content, &s.samples, 12));
+        let need_retry =
+            report.as_ref().map(|r| r.hard_fail).unwrap_or(false) || overlap.is_some();
         if let (Some(p), Some(r)) = (style, report.as_ref()) {
-            if r.hard_fail {
+            if need_retry {
+                let reason = match &overlap {
+                    Some(hit) => format!(
+                        "{}；与风格样本逐字重叠（{}…），禁止照抄样本",
+                        r.summary(),
+                        hit.chars().take(12).collect::<String>()
+                    ),
+                    None => r.summary(),
+                };
                 engine.hub.publish(novel_id, EngineEvent::Stage {
                     stage: "draft".into(),
-                    message: format!(
-                        "第 {idx} 章未通过文风检查（{}），自动重写一次…",
-                        r.summary()
-                    ),
+                    message: format!("第 {idx} 章未通过文风检查（{reason}），自动重写一次…"),
                 });
                 let usr_retry = format!(
-                    "{usr}\n\n【上一稿未通过文风检查，请重写】问题：{}。请严格按文风预设修正后重写本章。",
-                    r.summary()
+                    "{usr}\n\n【上一稿未通过文风检查，请重写】问题：{reason}。请严格按文风预设修正后重写本章。",
                 );
                 let mut buf2 = String::new();
                 let hub2 = engine.hub.clone();
@@ -912,9 +929,12 @@ async fn run_inner(
                         let c2 = streamed2.text.trim().to_string();
                         if !c2.is_empty() {
                             let r2 = crate::style_check::check_chapter(p, &c2);
-                            if r2.score() >= r.score() {
+                            let overlap2 =
+                                crate::style_fingerprint::first_overlap(&c2, &p.samples, 12);
+                            if r2.score() >= r.score() || overlap2.is_none() {
                                 content = c2;
                                 report = Some(r2);
+                                overlap = overlap2;
                             }
                         }
                     }
@@ -922,6 +942,30 @@ async fn run_inner(
                         tracing::warn!("chapter {idx} style retry failed: {e:#}（保留原稿）");
                     }
                 }
+            }
+        }
+        // 文风指纹（S1）：本地统计画像 + 指纹带偏离（只告警不硬判）；随文风报告留档
+        if let Some(p) = style {
+            let fp = crate::style_fingerprint::compute(&content);
+            let deviations = crate::style_fingerprint::compare(&fp, &p.bands);
+            if !deviations.is_empty() {
+                engine.hub.publish(novel_id, EngineEvent::Stage {
+                    stage: "draft".into(),
+                    message: format!(
+                        "第 {idx} 章文风指纹偏离：{}",
+                        deviations
+                            .iter()
+                            .take(2)
+                            .map(|d| d.note.clone())
+                            .collect::<Vec<_>>()
+                            .join("；")
+                    ),
+                });
+            }
+            if let Some(r) = report.as_mut() {
+                r.fingerprint = serde_json::to_value(&fp).ok();
+                r.deviations = deviations.iter().map(|d| d.note.clone()).collect();
+                r.overlap = overlap.clone();
             }
         }
 
@@ -1442,14 +1486,14 @@ async fn generate_volume_review(
         .get_novel(novel_id)?
         .map(|n| n.style_preset)
         .unwrap_or_default();
-    let style = crate::styles::find(&style_id);
+    let style = resolve_style_spec(&engine.db, &style_id);
     let ov = engine.prompt_overrides();
     let mut fixed = 0usize;
     for issue in &targets {
         if engine.stop_requested(novel_id) {
             break;
         }
-        if fix_chapter_by_global_issue(engine, novel_id, issue, style, &ov)
+        if fix_chapter_by_global_issue(engine, novel_id, issue, style.as_ref(), &ov)
             .await
             .unwrap_or(false)
         {
@@ -1569,7 +1613,7 @@ pub async fn reader_review_once(
         to,
         golden,
         &text,
-        crate::styles::find(&novel.style_preset),
+        resolve_style_spec(&engine.db, &novel.style_preset).as_ref(),
         &ov,
     );
     let out = llm.complete(&sys, &usr).await?;
@@ -1853,6 +1897,24 @@ pub fn stale_review_candidates(
     out
 }
 
+/// 解析作品风格：静态预设或用户自定义风格（`custom:<id>`）→ 运行时 StyleSpec。
+/// 空 id / 未知 id 返回 None（保持既有默认写法）。
+pub fn resolve_style_spec(db: &crate::db::Db, style_id: &str) -> Option<crate::styles::StyleSpec> {
+    let id = style_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    if let Some(p) = crate::styles::find(id) {
+        return Some(crate::styles::StyleSpec::from_preset(p));
+    }
+    if let Some(custom_id) = id.strip_prefix("custom:") {
+        if let Ok(Some(c)) = db.get_custom_style(custom_id.trim()) {
+            return Some(crate::styles::StyleSpec::from_custom(&c));
+        }
+    }
+    None
+}
+
 /// 解析立项澄清问答（宽容：畸形 JSON 视为无澄清）
 pub fn parse_clarify(raw: &str) -> Vec<crate::models::ClarifyQA> {
     serde_json::from_str::<Vec<crate::models::ClarifyQA>>(raw).unwrap_or_default()
@@ -1938,7 +2000,7 @@ pub async fn maintain_novel(
             .get_novel(novel_id)?
             .map(|n| n.style_preset)
             .unwrap_or_default();
-        let style = crate::styles::find(&style_id);
+        let style = resolve_style_spec(&engine.db, &style_id);
         let ov = engine.prompt_overrides();
         for (idx, title, goal) in candidates.iter().take(revisit_limit) {
             if engine.stop_requested(novel_id) {
@@ -1952,7 +2014,7 @@ pub async fn maintain_novel(
                 message: format!("开工巡检：复审第 {idx} 章（正文在审校后被改动过）…"),
             });
             let mut content = ch.content.clone();
-            match review_and_fix_chapter(engine, novel_id, *idx, title, goal, &mut content, style, &ov)
+            match review_and_fix_chapter(engine, novel_id, *idx, title, goal, &mut content, style.as_ref(), &ov)
                 .await
             {
                 Ok(_) => report.revisited += 1,
@@ -2156,7 +2218,7 @@ async fn fix_chapter_by_global_issue(
     engine: &Arc<Engine>,
     novel_id: &str,
     issue: &GlobalIssue,
-    style: Option<&crate::styles::StylePreset>,
+    style: Option<&crate::styles::StyleSpec>,
     ov: &crate::prompts::Overrides,
 ) -> anyhow::Result<bool> {
     let settings = engine.llm_settings()?;
@@ -2263,7 +2325,7 @@ pub async fn global_review_and_fix(
         .get_novel(novel_id)?
         .map(|n| n.style_preset)
         .unwrap_or_default();
-    let style = crate::styles::find(&style_id);
+    let style = resolve_style_spec(&engine.db, &style_id);
     let ov = engine.prompt_overrides();
     let mut fixed = 0usize;
     for issue in &targets {
@@ -2271,7 +2333,7 @@ pub async fn global_review_and_fix(
             engine.clear_stop(novel_id);
             break;
         }
-        if fix_chapter_by_global_issue(engine, novel_id, issue, style, &ov)
+        if fix_chapter_by_global_issue(engine, novel_id, issue, style.as_ref(), &ov)
             .await
             .unwrap_or(false)
         {
@@ -2360,9 +2422,9 @@ pub fn spawn_global_issue_fix(
             .flatten()
             .map(|n| n.style_preset)
             .unwrap_or_default();
-        let style = crate::styles::find(&style_id);
+        let style = resolve_style_spec(&engine.db, &style_id);
         let ov = engine.prompt_overrides();
-        match fix_chapter_by_global_issue(&engine, &nid, &issue, style, &ov).await {
+        match fix_chapter_by_global_issue(&engine, &nid, &issue, style.as_ref(), &ov).await {
             Ok(true) => {
                 let _ = run_global_review(&engine, &nid).await;
                 engine.hub.publish(&nid, EngineEvent::Stage {
@@ -2434,7 +2496,7 @@ pub async fn review_and_fix_chapter(
     title: &str,
     goal: &str,
     content_ref: &mut String,
-    style: Option<&crate::styles::StylePreset>,
+    style: Option<&crate::styles::StyleSpec>,
     ov: &crate::prompts::Overrides,
 ) -> anyhow::Result<Review> {
     let settings = engine.llm_settings()?;
@@ -2945,7 +3007,7 @@ pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i
     let nid = novel_id.to_string();
     tokio::spawn(async move {
         let _slot = slot; // 任务结束（含中途 return）才释放
-        let style = crate::styles::find(&style_id);
+        let style = resolve_style_spec(&engine.db, &style_id);
         let ov = engine.prompt_overrides();
         let mut digested = 0usize;
         for (i, (idx, title, goal)) in targets.iter().enumerate() {
@@ -2971,7 +3033,7 @@ pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i
                 .map(|r| medium_high_count(&r))
                 .unwrap_or(0);
             let mut content = ch.content.clone();
-            match review_and_fix_chapter(&engine, &nid, *idx, title, goal, &mut content, style, &ov)
+            match review_and_fix_chapter(&engine, &nid, *idx, title, goal, &mut content, style.as_ref(), &ov)
                 .await
             {
                 Ok(r) => {

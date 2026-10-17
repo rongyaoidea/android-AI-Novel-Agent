@@ -1261,7 +1261,7 @@ async fn prompt_overrides_endpoints() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
     let items = v["items"].as_array().unwrap();
-    assert_eq!(items.len(), 14, "任务数量应为 14");
+    assert_eq!(items.len(), 15, "任务数量应为 15");
     for t in items {
         assert!(!t["default_system"].as_str().unwrap().is_empty(), "{}", t["id"]);
         assert!(!t["default_user"].as_str().unwrap().is_empty(), "{}", t["id"]);
@@ -3616,6 +3616,158 @@ async fn auto_finish_generates_reader_report() {
         .unwrap();
     let v = json_body(resp).await;
     assert_eq!(v["novel"]["status"], "finished", "{v}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 自定义风格（S5）：样本 → 风格卡 + 指纹带；可建书使用；删除；样本过短 400
+#[tokio::test]
+async fn custom_style_create_use_and_fingerprint() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-customstyle-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    // 样本过短 → 400
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/styles/custom")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name": "太短", "sample": "很短的一段文字。"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 创建自定义风格（≥1500 字样本）
+    let sample = "他把伞收起来，雨水顺着伞骨往下淌。他数着台阶往上走。\n\n".repeat(60);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/styles/custom")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name": "测试自定义风格", "sample": sample}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let style_id = v["style_id"].as_str().unwrap().to_string();
+    assert!(style_id.starts_with("custom:"), "{v}");
+    assert!(
+        !v["card"]["rules"].as_array().unwrap().is_empty(),
+        "风格卡应含规则：{v}"
+    );
+
+    // 目录与自定义列表
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/api/styles").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["custom"].as_array().unwrap().len(), 1, "{v}");
+
+    // 用自定义风格建书 → 运行 → 指纹接口
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "idea": "自定义风格测试",
+                        "chapters": 2,
+                        "style_preset": style_id,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["novel"]["style_preset"], style_id, "{v}");
+
+    // 章节文风报告应带指纹（S1）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/chapters/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert!(
+        v["style_report"]["fingerprint"].is_object(),
+        "章节文风报告应含指纹：{v}"
+    );
+
+    // 全书指纹接口
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/style-fingerprint"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["chapters"], 2, "{v}");
+    assert_eq!(v["style"]["id"], style_id, "{v}");
+    assert!(v["fingerprint"]["words"].as_i64().unwrap_or(0) > 0, "{v}");
+
+    // 删除自定义风格
+    let cid = style_id.trim_start_matches("custom:");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/styles/custom/{cid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["removed"], true, "{v}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
