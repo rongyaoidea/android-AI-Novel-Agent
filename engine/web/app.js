@@ -209,7 +209,7 @@ async function route() {
 
   if (r.kind === "read") {
     $("#page-title").textContent = "阅读";
-    $("#page-subtitle").textContent = "沉浸阅读（← 返回书架）";
+    $("#page-subtitle").textContent = "沉浸阅读（左右滑动翻页 · ← 返回书架）";
     $("#view-read").hidden = false;
     try {
       await openRead(r.id);
@@ -493,6 +493,7 @@ function applyReadFont() {
 
 async function openRead(id) {
   state.readNovelId = id;
+  scrollReadToTop(); // 从别处进入阅读时先回顶（真正的滚动容器是页面窗口）
   const data = await api(`/api/novels/${id}`);
   state.readNovel = data.novel || {};
   state.readChapters = data.chapters || [];
@@ -555,8 +556,26 @@ async function readChapter(idx) {
   $("#read-prev").disabled = pos <= 0;
   $("#read-next").disabled = pos >= readable.length - 1;
   renderReadToc();
-  const scroller = document.querySelector(".content");
-  if (scroller) scroller.scrollTop = 0;
+  scrollReadToTop();
+}
+
+/** 回到本章头部：兼容窗口滚动与容器滚动，并在下一帧再校正一次
+ *（移动端 WebView 的惯性滚动 / 焦点回拉会覆盖同步设置） */
+function scrollReadToTop() {
+  const reset = () => {
+    const scroller = document.querySelector(".content");
+    if (scroller) scroller.scrollTop = 0;
+    document.documentElement.scrollTop = 0;
+    if (document.body) document.body.scrollTop = 0;
+    window.scrollTo(0, 0);
+  };
+  // 翻页后按钮仍处于焦点：先移开焦点，避免浏览器把按钮拉回视口
+  const active = document.activeElement;
+  if (active && active.tagName === "BUTTON" && document.querySelector("#view-read")?.contains(active)) {
+    active.blur();
+  }
+  reset();
+  requestAnimationFrame(reset);
 }
 
 function renderReadToc() {
@@ -615,6 +634,39 @@ function bindRead() {
     if (e.key === "ArrowLeft") { e.preventDefault(); readStep(-1); }
     if (e.key === "ArrowRight") { e.preventDefault(); readStep(1); }
     if (e.key === "Escape") location.hash = "#/shelf";
+  });
+  // 左右滑动翻页（Pointer Events：触屏 / 鼠标拖拽通用；不拦截纵向滚动）
+  const view = $("#view-read");
+  let sx = 0;
+  let sy = 0;
+  let st = 0;
+  let tracking = false;
+  view.addEventListener("pointerdown", (e) => {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    tracking = true;
+    sx = e.clientX;
+    sy = e.clientY;
+    st = Date.now();
+  });
+  view.addEventListener("pointerup", (e) => {
+    if (!tracking) return;
+    tracking = false;
+    const dx = e.clientX - sx;
+    const dy = e.clientY - sy;
+    const dt = Date.now() - st;
+    if (dt > 900) return; // 慢慢拖不算翻页
+    if (Math.abs(dx) < 56) return; // 位移阈值
+    if (Math.abs(dx) < Math.abs(dy) * 1.4) return; // 横向主导才翻页（纵向滚动不受影响）
+    const sel = window.getSelection ? String(window.getSelection()) : "";
+    if (sel.trim()) return; // 正在选中文字时不翻页
+    if (dx < 0) {
+      readStep(1); // 左滑 → 下一章
+    } else {
+      readStep(-1); // 右滑 → 上一章
+    }
+  });
+  view.addEventListener("pointercancel", () => {
+    tracking = false;
   });
 }
 
