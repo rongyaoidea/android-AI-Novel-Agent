@@ -249,6 +249,28 @@ async fn run_inner(
     let llm = Llm::new(settings.clone());
     let ov = engine.prompt_overrides();
 
+    // 开工巡检（轻量）：状态修正 + 缺摘要补齐 + 漏审复审；健康的书零开销（全部 bounded）
+    match maintain_novel(&engine, novel_id, 3, 1).await {
+        Ok(r) if r.touched() > 0 => {
+            engine.hub.publish(novel_id, EngineEvent::Stage {
+                stage: "extract".into(),
+                message: format!(
+                    "开工巡检：修正 {} 处状态，补 {} 条摘要，重审 {} 章{}",
+                    r.fixed_empty_status,
+                    r.filled_summaries,
+                    r.revisited,
+                    if r.stale_left > 0 {
+                        format!("（仍余 {} 章待重审，可点「AI 处理全部审校」）", r.stale_left)
+                    } else {
+                        String::new()
+                    }
+                ),
+            });
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("pre-run maintenance failed: {e:#}"),
+    }
+
     // ---- 1) 立项方案 ----
     let mut novel = engine
         .db
@@ -1095,6 +1117,206 @@ pub async fn ai_restore_chapter(
     Ok(Some(why))
 }
 
+// ---------- 开工巡检（每批自动 + 手动端点） ----------
+
+/// 内容指纹（FNV-1a 64）：审校时记录，正文一旦被改（手动编辑/单章操作）即可被巡检识别为「漏审」
+pub fn content_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// 漏审候选：正文在审校之后被改过、且仍有未解决高/中危意见的定稿章节。
+/// 旧数据（无指纹）跳过，避免升级后全量重审。
+pub fn stale_review_candidates(
+    db: &crate::db::Db,
+    novel_id: &str,
+    limit: usize,
+) -> Vec<(i64, String, String)> {
+    let Ok(chapters) = db.list_chapters(novel_id) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for c in chapters.iter() {
+        if c.status != "done" || c.content.trim().is_empty() {
+            continue;
+        }
+        let Some(r) = c
+            .review_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Review>(raw).ok())
+        else {
+            continue;
+        };
+        if r.content_hash.is_empty() || r.content_hash == content_hash(&c.content) {
+            continue;
+        }
+        if medium_high_count(&r) == 0 {
+            continue;
+        }
+        out.push((c.idx, c.title.clone(), c.goal.clone()));
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out
+}
+
+/// 开工巡检结果（全部为「本次实际做了多少」）
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct MaintenanceReport {
+    /// done 但无正文的章节：状态收回 planned（UI 不再误显示已完成）
+    pub fixed_empty_status: usize,
+    pub filled_summaries: usize,
+    pub missing_summaries_left: usize,
+    pub revisited: usize,
+    pub stale_left: usize,
+}
+
+impl MaintenanceReport {
+    pub fn touched(&self) -> usize {
+        self.fixed_empty_status + self.filled_summaries + self.revisited
+    }
+}
+
+/// 开工巡检：本地状态修正 + 缺摘要补齐（bounded）+ 漏审章节重审（bounded）。
+/// 每批运行开始自动跑轻量版（3/1）；手动端点跑全量版（10/3）。
+pub async fn maintain_novel(
+    engine: &Arc<Engine>,
+    novel_id: &str,
+    summary_limit: usize,
+    revisit_limit: usize,
+) -> anyhow::Result<MaintenanceReport> {
+    let mut report = MaintenanceReport::default();
+    let chapters = engine.db.list_chapters(novel_id)?;
+
+    // ① 状态修正：done 但无正文（此前抽取/落库中断造成），收回 planned 交给下一轮重写
+    for c in chapters.iter() {
+        if c.status == "done" && c.content.trim().is_empty() {
+            engine.db.set_chapter_status(novel_id, c.idx, "planned")?;
+            report.fixed_empty_status += 1;
+        }
+    }
+
+    // ② 缺摘要补齐（有正文、无摘要；影响后续章节的上下文注入质量）
+    let missing: Vec<&crate::models::Chapter> = chapters
+        .iter()
+        .filter(|c| !c.content.trim().is_empty() && c.summary.trim().is_empty())
+        .collect();
+    if !missing.is_empty() && summary_limit > 0 {
+        let settings = engine.llm_settings()?;
+        let llm = Llm::new(settings.clone());
+        let ov = engine.prompt_overrides();
+        for c in missing.iter().take(summary_limit) {
+            if engine.stop_requested(novel_id) {
+                // 保留停止标记不清：让随后运行的章节循环在检查点优雅收尾
+                break;
+            }
+            let (sys, usr) = crate::prompts::extract_prompt(c.idx, &c.content, &ov);
+            match llm.complete(&sys, &usr).await {
+                Ok(out) => {
+                    record_usage(
+                        &engine.db,
+                        Some(novel_id),
+                        Some(c.idx),
+                        "extract",
+                        &settings,
+                        &out.usage,
+                    );
+                    if let Some(j) = extract_json_object(&out.text) {
+                        apply_extraction(&engine.db, novel_id, c.idx, &j);
+                        report.filled_summaries += 1;
+                    }
+                }
+                Err(e) => tracing::warn!("maintain extract chapter {} failed: {e:#}", c.idx),
+            }
+        }
+    }
+    report.missing_summaries_left = missing.len().saturating_sub(report.filled_summaries);
+
+    // ③ 漏审修复：正文在审校后被改过且仍有高/中危意见（手动编辑/AI 单章操作会命中）
+    let candidates = stale_review_candidates(&engine.db, novel_id, 1000);
+    if !candidates.is_empty() && revisit_limit > 0 {
+        let style_id = engine
+            .db
+            .get_novel(novel_id)?
+            .map(|n| n.style_preset)
+            .unwrap_or_default();
+        let style = crate::styles::find(&style_id);
+        let ov = engine.prompt_overrides();
+        for (idx, title, goal) in candidates.iter().take(revisit_limit) {
+            if engine.stop_requested(novel_id) {
+                break;
+            }
+            let Some(ch) = engine.db.get_chapter(novel_id, *idx)? else {
+                continue;
+            };
+            engine.hub.publish(novel_id, EngineEvent::Stage {
+                stage: "review".into(),
+                message: format!("开工巡检：复审第 {idx} 章（正文在审校后被改动过）…"),
+            });
+            let mut content = ch.content.clone();
+            match review_and_fix_chapter(engine, novel_id, *idx, title, goal, &mut content, style, &ov)
+                .await
+            {
+                Ok(_) => report.revisited += 1,
+                Err(e) => tracing::warn!("maintain revisit chapter {idx} failed: {e:#}"),
+            }
+            if ch.status == "done" {
+                let _ =
+                    engine
+                        .db
+                        .save_chapter_content_sourced(novel_id, *idx, &content, "done", "maintain");
+            }
+        }
+    }
+    report.stale_left = candidates.len().saturating_sub(report.revisited);
+    Ok(report)
+}
+
+/// 手动「开工巡检」：后台执行（占审校名额），完成后推事件汇总
+pub fn spawn_maintenance(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<()> {
+    if !engine.begin_review(novel_id) {
+        anyhow::bail!("已有一轮审校处理在进行中");
+    }
+    let slot = ReviewSlot {
+        engine: engine.clone(),
+        novel_id: novel_id.to_string(),
+    };
+    let nid = novel_id.to_string();
+    tokio::spawn(async move {
+        let _slot = slot;
+        match maintain_novel(&engine, &nid, 10, 3).await {
+            Ok(r) => {
+                engine.hub.publish(&nid, EngineEvent::Stage {
+                    stage: "done".into(),
+                    message: format!(
+                        "开工巡检完成：修正 {} 处状态，补 {} 条摘要，重审 {} 章{}",
+                        r.fixed_empty_status,
+                        r.filled_summaries,
+                        r.revisited,
+                        if r.stale_left > 0 {
+                            format!("（仍余 {} 章待重审，可点「AI 处理全部审校」）", r.stale_left)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                });
+            }
+            Err(e) => {
+                engine.hub.publish(&nid, EngineEvent::Stage {
+                    stage: "done".into(),
+                    message: format!("开工巡检失败：{e:#}"),
+                });
+            }
+        }
+    });
+    Ok(())
+}
+
 // ---------- 全局（跨章）审校 ----------
 
 /// 全局审校意见的跨轮归并：文案相似视为同一条，不再出现的标 fixed，多出来的标「新发现」
@@ -1554,6 +1776,7 @@ pub async fn review_and_fix_chapter(
                                     .collect()
                             })
                             .unwrap_or_default(),
+                        content_hash: String::new(),
                     };
                     // 校验引用可定位性：模型引用不逐字 / 稿子改动后，标记 stale（UI 会提示）
                     mark_quote_flags(&content, &mut review.issues);
@@ -1718,6 +1941,8 @@ pub async fn review_and_fix_chapter(
                     if let Some(r) = &report {
                         review.issues.extend(r.as_review_issues());
                     }
+                    // 记录正文指纹：正文之后被改动（手动编辑/单章操作）即可被巡检识别为漏审
+                    review.content_hash = content_hash(&content);
                     engine.db.save_chapter_review(novel_id, idx, &review)?;
                     engine.hub.publish(novel_id, EngineEvent::ChapterReview {
                         chapter_idx: idx,
@@ -2242,6 +2467,7 @@ mod tests {
                 issue("medium", "b", "open"),
                 issue("low", "c", "open"),
             ],
+            content_hash: String::new(),
         };
         assert_eq!(medium_high_count(&review), 1);
     }
@@ -2496,6 +2722,7 @@ mod tests {
                 is_new: false,
                 stale: false,
             }],
+            content_hash: String::new(),
         };
         engine.db.save_chapter_review(&novel.id, 1, &review_one).unwrap();
         // 覆盖为更差版本：极短 + 3 条 open（旧版自动留档，带其审校快照）
@@ -2515,6 +2742,7 @@ mod tests {
                     stale: false,
                 })
                 .collect(),
+            content_hash: String::new(),
         };
         engine.db.save_chapter_review(&novel.id, 1, &review_three).unwrap();
 
@@ -2530,6 +2758,124 @@ mod tests {
         // 已是综合最优：再跑一次不应再改
         let again = ai_restore_chapter(&engine, &novel.id, 1, "ai-restore").await.unwrap();
         assert!(again.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_review_candidates_track_content_changes() {
+        let dir = tmp_dir("stale-cand");
+        let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+        let novel = engine.db.create_novel("漏审候选测试", "auto", "").unwrap();
+        engine
+            .db
+            .upsert_chapter_plan(
+                &novel.id,
+                &crate::models::ChapterPlan {
+                    idx: 1,
+                    title: "第一章".into(),
+                    goal: String::new(),
+                    beats: vec![],
+                },
+            )
+            .unwrap();
+        engine.db.save_chapter_content(&novel.id, 1, "第一版正文内容。", "done").unwrap();
+        // 旧数据：无指纹 → 不入选（避免升级后全量重审）
+        engine
+            .db
+            .save_chapter_review(
+                &novel.id,
+                1,
+                &Review {
+                    ok: false,
+                    issues: vec![issue("medium", "问题A", "open")],
+                    content_hash: String::new(),
+                },
+            )
+            .unwrap();
+        assert!(stale_review_candidates(&engine.db, &novel.id, 10).is_empty());
+        // 带指纹但内容未变 → 不入选
+        engine
+            .db
+            .save_chapter_review(
+                &novel.id,
+                1,
+                &Review {
+                    ok: false,
+                    issues: vec![issue("medium", "问题A", "open")],
+                    content_hash: content_hash("第一版正文内容。"),
+                },
+            )
+            .unwrap();
+        assert!(stale_review_candidates(&engine.db, &novel.id, 10).is_empty());
+        // 手动改动正文 → 入选（这正是「漏审」场景）
+        engine
+            .db
+            .save_chapter_edit(&novel.id, 1, Some("第二版正文，被手动改过了。"), None)
+            .unwrap();
+        let c = stale_review_candidates(&engine.db, &novel.id, 10);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].0, 1);
+        // 没有未解决的高/中危意见 → 不入选
+        engine
+            .db
+            .save_chapter_review(
+                &novel.id,
+                1,
+                &Review { ok: true, issues: vec![], content_hash: String::new() },
+            )
+            .unwrap();
+        assert!(stale_review_candidates(&engine.db, &novel.id, 10).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn maintenance_fixes_state_and_fills_summaries() {
+        let dir = tmp_dir("maintain");
+        let engine = std::sync::Arc::new(Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap());
+        engine
+            .db
+            .set_llm_settings(&crate::models::LlmSettings::default())
+            .unwrap();
+        let novel = engine.db.create_novel("巡检测试", "auto", "").unwrap();
+        // 章1：有正文但无摘要 → 应补
+        engine
+            .db
+            .upsert_chapter_plan(
+                &novel.id,
+                &crate::models::ChapterPlan {
+                    idx: 1,
+                    title: "第一章".into(),
+                    goal: String::new(),
+                    beats: vec![],
+                },
+            )
+            .unwrap();
+        engine
+            .db
+            .save_chapter_content(&novel.id, 1, "第一章正文，用于巡检补摘要。", "done")
+            .unwrap();
+        // 章2：done 但无正文（UI 会误显示已完成）→ 状态应收回 planned
+        engine
+            .db
+            .upsert_chapter_plan(
+                &novel.id,
+                &crate::models::ChapterPlan {
+                    idx: 2,
+                    title: "第二章".into(),
+                    goal: String::new(),
+                    beats: vec![],
+                },
+            )
+            .unwrap();
+        engine.db.save_chapter_content(&novel.id, 2, "", "done").unwrap();
+
+        let r = maintain_novel(&engine, &novel.id, 5, 0).await.unwrap();
+        assert_eq!(r.fixed_empty_status, 1);
+        assert_eq!(r.filled_summaries, 1);
+        let ch1 = engine.db.get_chapter(&novel.id, 1).unwrap().unwrap();
+        assert!(!ch1.summary.trim().is_empty(), "缺摘要应被补齐");
+        let ch2 = engine.db.get_chapter(&novel.id, 2).unwrap().unwrap();
+        assert_eq!(ch2.status, "planned", "done 无正文应被收回 planned");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

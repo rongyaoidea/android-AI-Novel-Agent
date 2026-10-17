@@ -2804,3 +2804,83 @@ async fn version_history_and_global_review_endpoints() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 开工巡检端点：done 无正文 → 状态修正；缺摘要 → 自动补齐
+#[tokio::test]
+async fn maintenance_endpoint_heals_state() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-maintain-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "巡检验证", "chapters": 2}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    // 人为破坏：章 2 正文清空但保持 done；章 1 摘要清空
+    engine.db.save_chapter_content(&novel_id, 2, "", "done").unwrap();
+    engine.db.set_chapter_summary(&novel_id, 1, "").unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/maintenance"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["queued"], true);
+
+    // 等巡检完成（章 2 状态被收回 + 章 1 摘要被补齐）
+    let mut healed_status = false;
+    let mut healed_summary = false;
+    for _ in 0..600 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let ch2 = engine.db.get_chapter(&novel_id, 2).unwrap().unwrap();
+        let ch1 = engine.db.get_chapter(&novel_id, 1).unwrap().unwrap();
+        healed_status = ch2.status != "done";
+        healed_summary = !ch1.summary.trim().is_empty();
+        if healed_status && healed_summary {
+            break;
+        }
+    }
+    assert!(healed_status, "done 无正文的章节应被收回重写状态");
+    assert!(healed_summary, "缺摘要应被自动补齐");
+    // 巡检消息可见（供 UI 日志）
+    let msgs: Vec<String> = engine
+        .hub
+        .history(&novel_id)
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::Stage { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        msgs.iter().any(|m| m.contains("开工巡检")),
+        "应有开工巡检事件：{msgs:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

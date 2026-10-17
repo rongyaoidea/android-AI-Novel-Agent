@@ -126,6 +126,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/novels/:id/chapters/:idx/ai-restore", post(ai_restore))
         .route("/api/novels/:id/global-review", get(get_global_review).post(run_global_review))
         .route("/api/novels/:id/global-review/fix", post(fix_global_issue))
+        .route("/api/novels/:id/maintenance", post(run_maintenance))
         .route("/api/novels/:id/chapters/:idx/continue", post(continue_chapter))
         .route("/api/novels/:id/chapters/:idx/rewrite", post(rewrite_chapter))
         .route("/api/novels/:id/chapters/:idx/extract", post(extract_chapter))
@@ -620,7 +621,6 @@ struct GlobalFixBody {
     /// 意见在最近一次全局审校里的下标
     index: usize,
 }
-
 /// 按指定的一条全局意见定向修复（手动触发）
 async fn fix_global_issue(
     State(e): State<Arc<Engine>>,
@@ -645,6 +645,32 @@ async fn fix_global_issue(
         ));
     }
     pipeline::spawn_global_issue_fix(e.clone(), &id, b.index).map_err(err)?;
+    Ok(Json(json!({"ok": true, "queued": true})))
+}
+
+/// 开工巡检（手动）：状态修正（done 无正文 → 回收重写）+ 缺摘要补齐 + 漏审章节重审；后台执行
+async fn run_maintenance(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    if let Some(run) = e.db.latest_run(&id).map_err(err)? {
+        if run.status == "running" {
+            return Err((
+                StatusCode::CONFLICT,
+                "有创作运行进行中，完成后再做巡检".to_string(),
+            ));
+        }
+    }
+    if e.is_reviewing(&id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "已有一轮审校处理在进行中，请稍候".to_string(),
+        ));
+    }
+    pipeline::spawn_maintenance(e.clone(), &id).map_err(err)?;
     Ok(Json(json!({"ok": true, "queued": true})))
 }
 
@@ -1016,6 +1042,7 @@ async fn review_chapter(
     let review = crate::models::Review {
         ok: v["ok"].as_bool().unwrap_or(true),
         issues: pipeline::merge_issue_statuses(&previous_issues, &new_issues),
+        content_hash: pipeline::content_hash(&ch.content),
     };
     e.db.save_chapter_review(&id, idx, &review).map_err(err)?;
     e.hub.publish(&id, pipeline::EngineEvent::ChapterReview {
@@ -1239,14 +1266,14 @@ async fn novel_health(
     }
     if !missing_summary.is_empty() {
         suggestions.push(format!(
-            "有 {} 章缺摘要，可点「补齐资料」自动生成：{}",
+            "有 {} 章缺摘要，点「开工巡检」会自动补齐（并顺带修复状态异常与漏审章节）：{}",
             missing_summary.len(),
             join_idx(&missing_summary)
         ));
     }
     if review_warnings > 0 {
         suggestions.push(format!(
-            "有 {} 章存在 AI 尚未完全消化的审校意见（共 {} 条）：{} —— 点「AI 处理全部审校」再跑一轮即可",
+            "有 {} 章存在 AI 尚未完全消化的审校意见（共 {} 条）：{} —— 点「AI 处理全部审校」批量重跑，或按章节表「余留 N 条」逐章处理",
             review_chapters.len(),
             review_warnings,
             join_idx(&review_chapters)

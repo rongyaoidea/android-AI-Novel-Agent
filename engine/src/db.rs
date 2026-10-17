@@ -936,6 +936,16 @@ impl Db {
         Ok(())
     }
 
+    /// 修正章节状态（巡检用：如 done 但无正文 → 收回 planned 让下一轮重写）
+    pub fn set_chapter_status(&self, novel_id: &str, idx: i64, status: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chapters SET status=?3, updated_at=?4 WHERE novel_id=?1 AND idx=?2",
+            params![novel_id, idx, status, now()],
+        )?;
+        Ok(())
+    }
+
     /// 章节摘要列表（只取 idx/title/summary，不加载正文；供回顾注入 / 卷摘要 / 伏笔审核复用）
     pub fn list_chapter_summaries(
         &self,
@@ -1917,7 +1927,7 @@ mod tests {
             is_new: false,
             stale: false,
         });
-        let mut review = Review { ok: false, issues };
+        let mut review = Review { ok: false, issues, content_hash: String::new() };
         cap_review_fixed(&mut review, 10);
         assert_eq!(review.issues.iter().filter(|i| i.status == "fixed").count(), 10);
         assert_eq!(review.issues.iter().filter(|i| i.status == "open").count(), 1);
@@ -1952,6 +1962,7 @@ mod tests {
                     stale: false,
                 })
                 .collect(),
+            content_hash: String::new(),
         };
         db.save_chapter_review(&novel.id, 1, &big).unwrap();
         let stored = db.get_chapter(&novel.id, 1).unwrap().unwrap().review_json.unwrap();
@@ -1984,6 +1995,7 @@ mod tests {
                 is_new: false,
                 stale: false,
             }],
+            content_hash: String::new(),
         };
         db.save_chapter_review(&novel.id, 1, &review).unwrap();
         // 保存正文（同内容）不改变标记
@@ -2138,6 +2150,7 @@ mod tests {
                 is_new: false,
                 stale: false,
             }],
+            content_hash: String::new(),
         };
         db.save_chapter_review(&novel.id, 1, &review).unwrap();
         db.save_chapter_content_sourced(&novel.id, 1, "第二版正文（更差）", "done", "manual").unwrap();

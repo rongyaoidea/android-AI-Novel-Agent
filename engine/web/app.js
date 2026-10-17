@@ -152,11 +152,17 @@ function parseReview(raw) {
   }
 }
 
-/** 章节表里的审校列：只呈现「AI 已处理」，不再向用户暴露待办数量（详情在编辑器里看） */
-function reviewChip(raw) {
+/** 章节表里的审校列：与编辑器保持同一套状态（有未解决意见就如实显示「余留 N 条」，全部解决才显示「AI 已处理」） */
+function reviewChip(raw, idx) {
   const r = parseReview(raw);
   if (!r) return `<span class="chip">—</span>`;
-  return `<span class="chip chip-success" title="AI 已自动审校并按意见修复（细节可打开章节查看）">AI 已处理</span>`;
+  const open = r.issues.filter((it) => it.status !== "fixed");
+  if (!open.length) {
+    const fixed = r.issues.length;
+    return `<span class="chip chip-success" title="审校意见均已解决${fixed ? `（含已修复留档 ${fixed} 条）` : ""}">AI 已处理</span>`;
+  }
+  const mh = open.filter((it) => it.severity === "high" || it.severity === "medium").length;
+  return `<span class="chip chip-warning chip-filter" data-review-open="${idx}" title="AI 审校仍有 ${open.length} 条意见未解决${mh ? `（其中高/中危 ${mh} 条）` : ""}：点击打开章节处理；也可用「AI 处理全部审校」批量重跑">余留 ${open.length} 条</span>`;
 }
 
 /* ---------------- 路由 ---------------- */
@@ -758,11 +764,17 @@ async function refreshInsights() {
   } catch { /* 忽略 */ }
   if (parseRoute().kind !== "novel" || state.novelId !== wantId) return;
   const reviewed = (state.novel?.chapters || []).filter((c) => c.review).length;
+  // 与章节表同口径：统计所有未解决意见（fixed 视为已解决）
+  let openTotal = 0;
+  for (const c of state.novel?.chapters || []) {
+    const r = parseReview(c.review);
+    if (r) openTotal += r.issues.filter((it) => it.status !== "fixed").length;
+  }
   const el = $("#novel-insights");
   if (!el) return;
   el.innerHTML =
     `<span class="chip chip-filter ${openF ? "chip-warning" : ""}" data-insight="foreshadowings" title="点击查看伏笔台账">${ic("i-flag")}未回收伏笔 ${openF}</span>` +
-    `<span class="chip chip-filter" data-insight="chapters" title="AI 已自动审校并按意见修复；细节可在章节里查看">${ic("i-check")}AI 审校已处理 ${reviewed} 章${fixCalls ? ` · 修复 ${fixCalls} 次` : ""}</span>`;
+    `<span class="chip chip-filter ${openTotal ? "chip-warning" : ""}" data-insight="chapters" title="${openTotal ? "还有未解决的审校意见：点章节表里的「余留 N 条」逐章处理，或点「AI 处理全部审校」批量重跑" : "所有审校意见均已解决"}">${ic("i-check")}AI 审校已覆盖 ${reviewed} 章${openTotal ? ` · 余留 ${openTotal} 条` : " · 全部解决"}${fixCalls ? ` · 修复 ${fixCalls} 次` : ""}</span>`;
 }
 
 /* ---------------- 书籍体检 ---------------- */
@@ -786,25 +798,16 @@ async function openHealth() {
 }
 
 async function fillMissing() {
-  const h = state.health;
-  if (!h) return;
-  const ids = (h.missing_summary || []).slice();
-  if (!ids.length) {
-    $("#health-status").textContent = "没有需要补齐的章节";
-    return;
-  }
   const btn = $("#health-fill");
   btn.disabled = true;
+  $("#health-status").textContent = "已开始开工巡检（状态修正 / 补摘要 / 漏审修复）…";
   try {
-    for (let i = 0; i < ids.length; i++) {
-      $("#health-status").textContent = `补齐资料 ${i + 1}/${ids.length}…`;
-      await api(`/api/novels/${state.novelId}/chapters/${ids[i]}/extract`, { method: "POST" });
-    }
-    toast("资料已补齐");
-    await refreshNovel();
-    await openHealth();
+    await apiSend(`/api/novels/${state.novelId}/maintenance`, "POST");
+    toast("开工巡检已在后台开始，进度与结果见「跟随生成」日志");
+    $("#health-status").textContent = "巡检进行中：完成后日志会给出汇总";
   } catch (err) {
     toast(err.message, true);
+    $("#health-status").textContent = "巡检失败：" + err.message;
   } finally {
     btn.disabled = false;
   }
@@ -889,7 +892,7 @@ function renderChapters() {
         <td>${esc(c.title || `第${c.idx}章`)}</td>
         <td>${c.status === "done" ? `<span class="chip chip-success">已完成</span>` : c.status === "drafted" ? `<span class="chip chip-info">待审校</span>` : `<span class="chip">已规划</span>`}</td>
         <td class="num">${c.words || 0}</td>
-        <td>${reviewChip(c.review)}</td>
+        <td>${reviewChip(c.review, c.idx)}</td>
         <td class="row-actions">
           ${c.status === "planned"
             ? `<button class="btn btn-outline btn-sm" data-plan="${c.idx}">改规划</button>`
@@ -992,6 +995,8 @@ function bindNovel() {
   $("#chapter-rows").addEventListener("click", async (e) => {
     const read = e.target.closest("[data-read]");
     if (read) { openEditor(parseInt(read.dataset.read, 10)).catch((err) => toast(err.message, true)); return; }
+    const rev = e.target.closest("[data-review-open]");
+    if (rev) { openEditor(parseInt(rev.dataset.reviewOpen, 10)).catch((err) => toast(err.message, true)); return; }
     const copy = e.target.closest("[data-copy]");
     if (copy) { copyChapter(parseInt(copy.dataset.copy, 10)).catch((err) => toast(err.message, true)); return; }
     const plan = e.target.closest("[data-plan]");
@@ -2207,6 +2212,7 @@ function handleEvent(ev) {
       break;
     case "chapter_review":
       novelLog(`第${ev.chapter_idx}章审校：${ev.ok ? "通过" : "有提醒"}（${ev.issues} 条）`);
+      refreshNovel();
       break;
     case "ledger_updated":
       novelLog(`资料整理：角色 ${ev.characters} 项 / 伏笔 ${ev.foreshadowings} 项`);

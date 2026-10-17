@@ -143,6 +143,9 @@ pub struct Review {
     pub ok: bool,
     #[serde(default)]
     pub issues: Vec<ReviewIssue>,
+    /// 审校时正文的内容指纹（用于识别「审校之后正文又被改过」的漏审章节；旧数据为空串）
+    #[serde(default)]
+    pub content_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
