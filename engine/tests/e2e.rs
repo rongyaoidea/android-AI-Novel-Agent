@@ -2884,3 +2884,113 @@ async fn maintenance_endpoint_heals_state() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 批量删除 + 从某章之后重写（自动启动重写运行，旧稿留档可回滚）
+#[tokio::test]
+async fn batch_delete_and_rewrite_after_endpoints() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-batch-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "批量操作测试", "chapters": 3}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    // ① 从第 1 章之后重写（章纲保留）：2~3 章清空后自动重写
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/chapters/rewrite-after"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"after_idx": 1, "replan": false}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["count"], 2, "{v}");
+    assert_eq!(v["from"], 2, "{v}");
+    // 等重写运行完成
+    wait_run_done(app.clone(), &novel_id).await;
+    let ch2 = engine.db.get_chapter(&novel_id, 2).unwrap().unwrap();
+    assert!(!ch2.content.trim().is_empty() && ch2.status == "done", "第 2 章应被重新写好");
+    // 旧稿留档（可回滚）
+    let versions = engine.db.list_chapter_versions(&novel_id, 2).unwrap();
+    assert!(
+        versions.iter().any(|x| x.source == "pre-rewrite-after" && !x.content.trim().is_empty()),
+        "重写前旧稿应留档：{versions:?}"
+    );
+
+    // ② 边界：末尾之后没有章节 → 400
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/chapters/rewrite-after"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"after_idx": 3}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // ③ 批量删除 2~3 → 只剩 1 章
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/chapters/batch-delete"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"from": 2, "to": 3}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json_body(resp).await["deleted"], 2);
+    let metas = engine.db.list_chapter_metas(&novel_id).unwrap();
+    assert_eq!(metas.len(), 1, "应只剩第 1 章");
+
+    // ④ 保底：不能全删 → 400
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/chapters/batch-delete"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"from": 1, "to": 1}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -232,6 +232,7 @@
           <div class="panel-head">
             <h3 class="panel-title">章节</h3>
             <input id="chapter-search" class="input-sm search-input" placeholder="全文检索：人名 / 道具 / 台词…" />
+            <button class="btn btn-outline btn-sm" id="novel-batch"><svg class="ic"><use href="#i-refresh"/></svg>批量</button>
             <button class="btn btn-outline btn-sm" id="insert-chapter"><svg class="ic"><use href="#i-plus"/></svg>插入章节</button>
           </div>
           <div id="chapter-search-results" class="search-results" hidden></div>
@@ -480,6 +481,43 @@
       <button class="btn btn-primary" id="diff-apply"><svg class="ic"><use href="#i-check"/></svg>应用修改</button>
       <button class="btn btn-outline" id="diff-reroll"><svg class="ic"><use href="#i-refresh"/></svg>换一版</button>
       <button class="btn btn-outline" id="diff-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 批量操作（删除范围 / 从某章之后重写） -->
+<div class="dialog-backdrop" id="batch-backdrop" hidden>
+  <div class="dialog" style="width:min(580px,94vw);">
+    <div class="dialog-head">
+      <h3>批量操作</h3>
+      <button class="btn btn-ghost" id="batch-close">关闭</button>
+    </div>
+    <div class="panel" style="padding:12px;margin:0;">
+      <h4 class="usage-sub" style="margin-top:0;">从某章之后重写</h4>
+      <div class="field-row">
+        <div class="field">
+          <label for="batch-rewrite-n">从第几章之后（0 = 全书重写）</label>
+          <input id="batch-rewrite-n" type="number" min="0" />
+        </div>
+        <div class="field" style="align-self:end;">
+          <label class="check-row" for="batch-replan">
+            <input type="checkbox" id="batch-replan" />
+            <span>同时重新规划章纲（标题 / 目标 / 节拍重新生成）</span>
+          </label>
+        </div>
+      </div>
+      <p class="muted" id="batch-rewrite-hint" style="margin:0 0 10px;"></p>
+      <button class="btn btn-primary" id="batch-rewrite-go"><svg class="ic"><use href="#i-refresh"/></svg>开始重写</button>
+    </div>
+    <div class="panel" style="padding:12px;margin:0;">
+      <h4 class="usage-sub" style="margin-top:0;">删除章节范围</h4>
+      <div class="field-row">
+        <div class="field"><label for="batch-del-from">从</label><input id="batch-del-from" type="number" min="1" /></div>
+        <div class="field"><label for="batch-del-to">到</label><input id="batch-del-to" type="number" min="1" /></div>
+      </div>
+      <button class="btn btn-outline btn-danger" id="batch-del-go"><svg class="ic"><use href="#i-x"/></svg>删除该范围</button>
+      <span class="muted" id="batch-del-status"></span>
+      <p class="muted" style="margin:8px 0 0;font-size:12px;">至少保留一章；删除后后续章节自动重排（版本历史与检索索引同步）。</p>
     </div>
   </div>
 </div>

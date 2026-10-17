@@ -112,6 +112,8 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/novels/:id/search", get(search_novel))
         .route("/api/novels/:id/stop", post(stop_novel))
         .route("/api/novels/:id/chapters", post(insert_chapter))
+        .route("/api/novels/:id/chapters/batch-delete", post(batch_delete_chapters))
+        .route("/api/novels/:id/chapters/rewrite-after", post(rewrite_after))
         .route(
             "/api/novels/:id/chapters/:idx",
             get(get_chapter).put(edit_chapter).delete(delete_chapter),
@@ -646,6 +648,121 @@ async fn fix_global_issue(
     }
     pipeline::spawn_global_issue_fix(e.clone(), &id, b.index).map_err(err)?;
     Ok(Json(json!({"ok": true, "queued": true})))
+}
+
+#[derive(Deserialize)]
+struct BatchDeleteBody {
+    from: i64,
+    to: i64,
+}
+
+/// 批量删除章号区间 [from, to]：至少保留一章；后续章节自动重排（版本历史与检索索引同步）
+async fn batch_delete_chapters(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(b): Json<BatchDeleteBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    if let Some(run) = e.db.latest_run(&id).map_err(err)? {
+        if run.status == "running" {
+            return Err((
+                StatusCode::CONFLICT,
+                "有创作运行进行中，完成后再做批量修改".to_string(),
+            ));
+        }
+    }
+    if e.is_reviewing(&id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "审校处理进行中，完成后再做批量修改".to_string(),
+        ));
+    }
+    let deleted = e
+        .db
+        .batch_delete_chapters(&id, b.from, b.to)
+        .map_err(|e2| (StatusCode::BAD_REQUEST, format!("{e2}")))?;
+    e.hub.publish(&id, pipeline::EngineEvent::Stage {
+        stage: "draft".into(),
+        message: format!(
+            "已批量删除第 {}~{} 章（共 {deleted} 章），后续章节已重排",
+            b.from, b.to
+        ),
+    });
+    Ok(Json(json!({"ok": true, "deleted": deleted})))
+}
+
+#[derive(Deserialize)]
+struct RewriteAfterBody {
+    /// 从该章之后开始重写（0 = 全书重写）
+    after_idx: i64,
+    /// true = 连章纲一起删除并重新规划（标题/目标/节拍重新生成）
+    #[serde(default)]
+    replan: bool,
+}
+
+/// 从第 after_idx 章之后重写：清空正文（保留章纲）或连章纲一起重规划，然后自动启动重写运行。
+/// 旧稿进版本历史（可回滚）；重写按章序推进，每章写完仍走审校/抽取/巡检全流程。
+async fn rewrite_after(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(b): Json<RewriteAfterBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    if let Some(run) = e.db.latest_run(&id).map_err(err)? {
+        if run.status == "running" {
+            return Err((
+                StatusCode::CONFLICT,
+                "有创作运行进行中，完成后再发起批量重写".to_string(),
+            ));
+        }
+    }
+    if e.is_reviewing(&id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "审校处理进行中，完成后再发起批量重写".to_string(),
+        ));
+    }
+    if b.after_idx < 0 {
+        return Err((StatusCode::BAD_REQUEST, "起始章号不合法".to_string()));
+    }
+    let metas = e.db.list_chapter_metas(&id).map_err(err)?;
+    let last_idx = metas.iter().map(|m| m.idx).max().unwrap_or(0);
+    if last_idx == 0 {
+        return Err((StatusCode::BAD_REQUEST, "还没有章节可重写".to_string()));
+    }
+    if b.after_idx >= last_idx {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("第 {} 章之后没有可重写的章节（当前共 {last_idx} 章）", b.after_idx),
+        ));
+    }
+    let affected = if b.replan {
+        e.db.delete_chapters_after(&id, b.after_idx).map_err(err)?
+    } else {
+        e.db.clear_chapters_after(&id, b.after_idx).map_err(err)?
+    };
+    e.hub.publish(&id, pipeline::EngineEvent::Stage {
+        stage: "draft".into(),
+        message: format!(
+            "批量重写：第 {} ~ {} 章（共 {affected} 章）已重置{}，开始重新生成…",
+            b.after_idx + 1,
+            last_idx,
+            if b.replan { "（含章纲重规划）" } else { "（章纲保留，旧稿可回滚）" }
+        ),
+    });
+    let run_id = pipeline::spawn(e.clone(), &id, last_idx).map_err(err)?;
+    Ok(Json(json!({
+        "ok": true,
+        "from": b.after_idx + 1,
+        "to": last_idx,
+        "count": affected,
+        "replan": b.replan,
+        "run_id": run_id,
+    })))
 }
 
 /// 开工巡检（手动）：状态修正（done 无正文 → 回收重写）+ 缺摘要补齐 + 漏审章节重审；后台执行

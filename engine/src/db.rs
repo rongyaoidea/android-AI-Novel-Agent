@@ -1577,6 +1577,7 @@ impl Db {
 
     /// 统一重排：先整体挪到负区（避免 UNIQUE(novel_id, idx) 冲突），再按新顺序写回。
     /// 整个过程在事务里：中断则回滚，不会留下「写了一半」的负区状态。
+    /// 版本历史跟随章节移动（idx 键需要重映射），已删除章节的版本一并清理。
     fn apply_chapter_order(
         conn: &Connection,
         novel_id: &str,
@@ -1584,6 +1585,21 @@ impl Db {
     ) -> anyhow::Result<()> {
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> anyhow::Result<()> {
+            // 记录每个章节的旧章号 → 新章号（供版本历史重映射）
+            let mut moves: Vec<(i64, i64)> = Vec::new();
+            for (id, new_idx) in order {
+                let old: i64 = conn.query_row(
+                    "SELECT idx FROM chapters WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                moves.push((old, *new_idx));
+            }
+            // 版本先整体挪到负区（避免交换场景的二次命中），章号编码为 -(old) - 1_000_000
+            conn.execute(
+                "UPDATE chapter_versions SET idx = -idx - 1000000 WHERE novel_id=?1",
+                params![novel_id],
+            )?;
             conn.execute(
                 "UPDATE chapters SET idx = -idx - 1 WHERE novel_id=?1",
                 params![novel_id],
@@ -1594,6 +1610,17 @@ impl Db {
                     params![id, new_idx, now()],
                 )?;
             }
+            // 版本跟随：负区编码 → 新章号；映射后仍为负的 = 已删除章节的版本 → 清理
+            for (old, new) in &moves {
+                conn.execute(
+                    "UPDATE chapter_versions SET idx=?2 WHERE novel_id=?1 AND idx=?3",
+                    params![novel_id, new, -(old) - 1000000],
+                )?;
+            }
+            conn.execute(
+                "DELETE FROM chapter_versions WHERE novel_id=?1 AND idx < 0",
+                params![novel_id],
+            )?;
             // 章号已整体重排：重建本书检索索引（索引里存的是旧章号）
             Self::reindex_novel_locked(conn, novel_id)?;
             Ok(())
@@ -1666,6 +1693,78 @@ impl Db {
         conn.execute("DELETE FROM chapters WHERE id=?1", [removed])?;
         Self::write_order(&conn, novel_id, &ids)?;
         Ok(true)
+    }
+
+    /// 批量删除章号区间 [from, to] 并重排；至少保留一章，否则报错。
+    pub fn batch_delete_chapters(&self, novel_id: &str, from: i64, to: i64) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let pairs = self.chapter_pairs_ordered(&conn, novel_id)?;
+        let total = pairs.len() as i64;
+        if from < 1 || to < from || to > total {
+            anyhow::bail!("范围不合法（当前共 {total} 章）");
+        }
+        let deleted = to - from + 1;
+        if total - deleted < 1 {
+            anyhow::bail!("至少要保留一章");
+        }
+        let ids: Vec<String> = pairs
+            .into_iter()
+            .filter(|(_, idx)| *idx < from || *idx > to)
+            .map(|(id, _)| id)
+            .collect();
+        // 先删行，再重排（重排会同步版本历史与检索索引）
+        conn.execute(
+            "DELETE FROM chapters WHERE novel_id=?1 AND idx >= ?2 AND idx <= ?3",
+            params![novel_id, from, to],
+        )?;
+        Self::write_order(&conn, novel_id, &ids)?;
+        Ok(deleted as usize)
+    }
+
+    /// 清空第 after 章之后的正文（保留章纲）：旧稿进版本历史，状态收回 planned，摘要/审校一并清空。
+    /// 返回受影响的章节数。
+    pub fn clear_chapters_after(&self, novel_id: &str, after: i64) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let pairs = self.chapter_pairs_ordered(&conn, novel_id)?;
+        let mut n = 0usize;
+        for (id, idx) in pairs {
+            if idx <= after {
+                continue;
+            }
+            Self::snapshot_chapter_version_locked(&conn, novel_id, idx, "rewrite-after", "")?;
+            conn.execute(
+                "UPDATE chapters SET content='', status='planned', summary='', review_json=NULL,
+                  style_report='', updated_at=?2 WHERE id=?1",
+                params![id, now()],
+            )?;
+            n += 1;
+        }
+        Self::reindex_novel_locked(&conn, novel_id)?;
+        Ok(n)
+    }
+
+    /// 删除第 after 章之后的全部章节（「重写并重新规划」用）：旧稿先进版本历史再删行。
+    /// 版本历史保留（重新生成后仍可查看/回滚到上一代稿）。返回删除的章节数。
+    pub fn delete_chapters_after(&self, novel_id: &str, after: i64) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let pairs = self.chapter_pairs_ordered(&conn, novel_id)?;
+        let mut n = 0usize;
+        for (_id, idx) in pairs.iter() {
+            if *idx <= after {
+                continue;
+            }
+            Self::snapshot_chapter_version_locked(&conn, novel_id, *idx, "rewrite-after", "")?;
+            n += 1;
+        }
+        conn.execute(
+            "DELETE FROM chapters WHERE novel_id=?1 AND idx > ?2",
+            params![novel_id, after],
+        )?;
+        conn.execute(
+            "DELETE FROM chapter_fts WHERE novel_id=?1 AND chapter_idx > ?2",
+            params![novel_id, after],
+        )?;
+        Ok(n)
     }
 
     /// 上下移动一章（direction: -1 上移 / 1 下移）；到边界返回 false。
@@ -2182,6 +2281,108 @@ mod tests {
         )
         .unwrap();
         assert!(db.get_chapter_version(&other.id, 1, &vid).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_chapter_keeps_versions_with_their_chapter() {
+        use crate::models::ChapterPlan;
+        let dir = tmp_dir("mvver");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("版本跟随移动测试", "auto", "").unwrap();
+        for (i, title) in [(1i64, "甲"), (2, "乙")] {
+            db.upsert_chapter_plan(
+                &novel.id,
+                &ChapterPlan { idx: i, title: title.into(), goal: String::new(), beats: vec![] },
+            )
+            .unwrap();
+            db.save_chapter_content(&novel.id, i, &format!("{title}章第一版"), "done").unwrap();
+            db.save_chapter_content_sourced(&novel.id, i, &format!("{title}章第二版"), "done", "manual")
+                .unwrap();
+        }
+        // 交换：现在 idx1 = 乙，idx2 = 甲；版本必须跟着章节走
+        db.move_chapter(&novel.id, 1, 1).unwrap();
+        assert_eq!(db.get_chapter(&novel.id, 1).unwrap().unwrap().title, "乙");
+        assert_eq!(db.get_chapter(&novel.id, 2).unwrap().unwrap().title, "甲");
+        let v1 = db.list_chapter_versions(&novel.id, 1).unwrap();
+        assert!(v1.iter().any(|v| v.content == "乙章第一版"), "{v1:?}");
+        assert!(!v1.iter().any(|v| v.content.contains("甲章")), "版本不得串章：{v1:?}");
+        let v2 = db.list_chapter_versions(&novel.id, 2).unwrap();
+        assert!(v2.iter().any(|v| v.content == "甲章第一版"), "{v2:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_delete_renumbers_and_drops_deleted_versions() {
+        use crate::models::ChapterPlan;
+        let dir = tmp_dir("batchdel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("批量删除测试", "auto", "").unwrap();
+        for i in 1..=4i64 {
+            db.upsert_chapter_plan(
+                &novel.id,
+                &ChapterPlan { idx: i, title: format!("第{i}章"), goal: String::new(), beats: vec![] },
+            )
+            .unwrap();
+            db.save_chapter_content(&novel.id, i, &format!("第{i}章第一版"), "done").unwrap();
+            db.save_chapter_content_sourced(&novel.id, i, &format!("第{i}章第二版"), "done", "manual")
+                .unwrap();
+        }
+        // 删除 2..3 → 原 4 重排为 2
+        let deleted = db.batch_delete_chapters(&novel.id, 2, 3).unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(db.get_chapter(&novel.id, 2).unwrap().unwrap().title, "第4章");
+        // 原第 4 章的版本跟随到新章号 2；被删章节的版本已清理
+        let v2 = db.list_chapter_versions(&novel.id, 2).unwrap();
+        assert!(v2.iter().any(|v| v.content == "第4章第一版"), "{v2:?}");
+        assert!(!v2.iter().any(|v| v.content.contains("第2章") || v.content.contains("第3章")));
+        assert!(db.list_chapter_versions(&novel.id, 3).unwrap().is_empty());
+        // 边界：范围非法 / 不能全删
+        assert!(db.batch_delete_chapters(&novel.id, 2, 1).is_err());
+        assert!(db.batch_delete_chapters(&novel.id, 1, 9).is_err());
+        assert!(db.batch_delete_chapters(&novel.id, 1, 2).is_err(), "至少要保留一章");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewrite_after_clears_tail_or_removes_it_with_versions() {
+        use crate::models::ChapterPlan;
+        let dir = tmp_dir("rewafter");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("后续重写测试", "auto", "").unwrap();
+        for i in 1..=3i64 {
+            db.upsert_chapter_plan(
+                &novel.id,
+                &ChapterPlan { idx: i, title: format!("第{i}章"), goal: format!("目标{i}"), beats: vec![] },
+            )
+            .unwrap();
+            db.save_chapter_content(&novel.id, i, &format!("第{i}章正文"), "done").unwrap();
+            db.set_chapter_summary(&novel.id, i, &format!("第{i}章摘要")).unwrap();
+        }
+        // 非 replan：清空第 2 章之后（章纲保留）
+        let n = db.clear_chapters_after(&novel.id, 1).unwrap();
+        assert_eq!(n, 2);
+        let ch2 = db.get_chapter(&novel.id, 2).unwrap().unwrap();
+        assert_eq!(ch2.content, "");
+        assert_eq!(ch2.status, "planned");
+        assert!(ch2.summary.is_empty(), "摘要应清空（由重写后的抽取重建）");
+        assert!(ch2.review_json.is_none());
+        assert_eq!(ch2.title, "第2章", "章纲保留");
+        assert_eq!(ch2.goal, "目标2");
+        let vs = db.list_chapter_versions(&novel.id, 2).unwrap();
+        assert!(
+            vs.iter().any(|v| v.source == "pre-rewrite-after" && v.content == "第2章正文"),
+            "旧稿应留档可回滚：{vs:?}"
+        );
+        // replan：删除第 1 章之后
+        let n2 = db.delete_chapters_after(&novel.id, 1).unwrap();
+        assert_eq!(n2, 2);
+        assert!(db.get_chapter(&novel.id, 2).unwrap().is_none());
+        let metas = db.list_chapter_metas(&novel.id).unwrap();
+        assert_eq!(metas.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

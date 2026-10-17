@@ -1343,6 +1343,97 @@ async function copyChapter(idx) {
   toast(`已复制第${idx}章（标题+正文），可直接粘贴到作家平台`);
 }
 
+/* ---------------- 批量操作（删除范围 / 从某章之后重写） ---------------- */
+
+function batchLastIdx() {
+  const chs = state.novel?.chapters || [];
+  return chs.length ? chs[chs.length - 1].idx : 0;
+}
+
+function updateBatchHint() {
+  const chs = state.novel?.chapters || [];
+  const last = batchLastIdx();
+  const n = parseInt($("#batch-rewrite-n").value || "0", 10) || 0;
+  const replan = $("#batch-replan").checked;
+  const count = chs.filter((c) => c.idx > n).length;
+  $("#batch-rewrite-hint").textContent = count
+    ? `将重写第 ${n + 1} ~ ${last} 章，共 ${count} 章；旧稿自动留档可回滚${replan ? "；章纲会重新规划（标题/目标/节拍重生成）" : "，章纲保留"}`
+    : "该章之后没有可重写的章节";
+}
+
+function openBatch() {
+  const last = batchLastIdx();
+  if (!last) throw new Error("还没有章节");
+  $("#batch-rewrite-n").value = last > 1 ? last - 1 : 0;
+  $("#batch-replan").checked = false;
+  $("#batch-del-from").value = 1;
+  $("#batch-del-to").value = last;
+  $("#batch-del-status").textContent = "";
+  updateBatchHint();
+  $("#batch-backdrop").hidden = false;
+}
+
+function bindBatch() {
+  $("#novel-batch").onclick = () => openBatch();
+  $("#batch-close").onclick = () => { $("#batch-backdrop").hidden = true; };
+  $("#batch-backdrop").addEventListener("click", (e) => {
+    if (e.target === $("#batch-backdrop")) $("#batch-backdrop").hidden = true;
+  });
+  $("#batch-rewrite-n").addEventListener("input", updateBatchHint);
+  $("#batch-replan").addEventListener("change", updateBatchHint);
+  $("#batch-rewrite-go").onclick = async () => {
+    const btn = $("#batch-rewrite-go");
+    const n = Math.max(0, parseInt($("#batch-rewrite-n").value || "0", 10) || 0);
+    const replan = $("#batch-replan").checked;
+    const last = batchLastIdx();
+    const count = (state.novel?.chapters || []).filter((c) => c.idx > n).length;
+    if (!count) {
+      toast("该章之后没有可重写的章节", true);
+      return;
+    }
+    const extra = replan ? "并重新规划章纲（原标题/目标/节拍会被替换）" : "（章纲保留）";
+    if (!confirm(`确认从第 ${n + 1} 章起重写 ${count} 章${extra}？旧稿会自动留档，之后可回滚。`)) return;
+    btn.disabled = true;
+    try {
+      const r = await apiSend(`/api/novels/${state.novelId}/chapters/rewrite-after`, "POST", {
+        after_idx: n,
+        replan,
+      });
+      toast(`已开始重写第 ${r.from} ~ ${r.to} 章（共 ${r.count} 章），进度见「跟随生成」`);
+      $("#batch-backdrop").hidden = true;
+      await refreshNovel();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+  $("#batch-del-go").onclick = async () => {
+    const btn = $("#batch-del-go");
+    const last = batchLastIdx();
+    const from = Math.max(1, parseInt($("#batch-del-from").value || "1", 10) || 1);
+    const to = Math.min(last, parseInt($("#batch-del-to").value || String(last), 10) || last);
+    if (to < from) {
+      toast("范围不合法：起始章号不能大于结束章号", true);
+      return;
+    }
+    const count = to - from + 1;
+    if (!confirm(`确认删除第 ${from} ~ ${to} 章（共 ${count} 章）？该操作不可恢复，后续章节会自动重排。`)) return;
+    btn.disabled = true;
+    try {
+      const r = await apiSend(`/api/novels/${state.novelId}/chapters/batch-delete`, "POST", { from, to });
+      toast(`已删除 ${r.deleted} 章，后续章节已重排`);
+      $("#batch-del-status").textContent = `已删除第 ${from} ~ ${to} 章`;
+      await refreshNovel();
+      openBatch();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
 /* ---------------- 章节历史（版本回滚 + AI 复原） ---------------- */
 
 let historyIdx = 0;
@@ -2723,6 +2814,7 @@ function init() {
   bindCreate();
   bindNovel();
   bindGlobalReview();
+  bindBatch();
   bindEditor();
   bindFormDialog();
   bindSettings();
