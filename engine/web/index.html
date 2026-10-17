@@ -39,6 +39,10 @@
   <symbol id="i-down" viewBox="0 0 24 24"><path d="M6.2 9.5 Q12 15.3 17.8 9.5"/></symbol>
   <symbol id="i-x" viewBox="0 0 24 24"><path d="M6.4 6.7 Q12 11.7 17.6 17.3 M17.4 6.5 Q12.2 11.8 6.3 17.2"/></symbol>
   <symbol id="i-stop" viewBox="0 0 24 24"><path d="M7.6 7.1 Q12 6.9 16.4 7.05 Q16.6 12 16.5 16.9 Q12 17.1 7.55 16.95 Q7.4 12 7.6 7.1 Z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24">
+    <path d="M12 4.6 a7.4 7.4 0 1 1 0 14.8 a7.4 7.4 0 1 1 0 -14.8"/>
+    <path d="M12 7.7 Q12.1 9.9 12 12.1 Q13.7 13.2 15 14.2"/>
+  </symbol>
   <symbol id="i-check" viewBox="0 0 24 24"><path d="M5.2 12.7 Q7.9 15.5 9.8 17.5 Q13.6 11.4 18.9 6.7"/></symbol>
   <symbol id="i-refresh" viewBox="0 0 24 24">
     <path d="M19.1 12 a7.2 7.2 0 1 1 -2.5 -5.5"/>
@@ -180,6 +184,7 @@
             <button class="btn btn-outline" id="novel-stop" disabled title="停止当前创作：流式生成立即中断，已写章节全部保留"><svg class="ic"><use href="#i-stop"/></svg>停止</button>
             <button class="btn btn-outline" id="novel-auto"><svg class="ic"><use href="#i-refresh"/></svg>自动连载</button>
             <button class="btn btn-outline" id="novel-review-all"><svg class="ic"><use href="#i-check"/></svg>AI 处理全部审校</button>
+            <button class="btn btn-outline" id="novel-global-review"><svg class="ic"><use href="#i-eye"/></svg>全局审校</button>
             <button class="btn btn-outline" id="novel-health"><svg class="ic"><use href="#i-pulse"/></svg>书籍体检</button>
             <button class="btn btn-outline" id="novel-usage"><svg class="ic"><use href="#i-chart"/></svg>AI 用量</button>
             <a class="btn btn-outline" id="novel-export" href="#"><svg class="ic"><use href="#i-download"/></svg>导出 TXT</a>
@@ -356,6 +361,20 @@
             <input type="checkbox" id="set-auto-fix" />
             <span>审校问题自动修复：高/中危意见自动修订一次并复核（仅在问题变少时采用），尽量不需要人工介入</span>
           </label>
+          <label class="check-row" for="set-auto-fix-global">
+            <input type="checkbox" id="set-auto-fix-global" />
+            <span>全局审校自动修复：跨章问题自动定向修复受影响章节（修复后若综合分更差会自动复原到更优版本）</span>
+          </label>
+          <div class="field" style="max-width:340px;">
+            <label for="set-global-every">全局审校频率</label>
+            <select id="set-global-every">
+              <option value="10">每 10 章自动审一次（默认）</option>
+              <option value="5">每 5 章</option>
+              <option value="20">每 20 章</option>
+              <option value="30">每 30 章</option>
+              <option value="0">关闭（仅手动）</option>
+            </select>
+          </div>
           <div class="field" style="max-width:340px;">
             <label for="set-budget">每月 Token 预算（0 = 不限）</label>
             <input id="set-budget" type="number" min="0" step="1000000" placeholder="0" />
@@ -377,6 +396,7 @@
           <p class="muted" style="margin:0;font-size:12px;">
             伏笔回收与资料整理均为自动：每章写后自动抽取台账；生成每章时会注入「未回收伏笔（含已拖延章数）」，回收后自动标记。
             伏笔自动审核会用章节摘要批量判定未回收伏笔是否已被后文实质回收（一次 LLM 调用）。
+            全局审校从全书视角检查跨章一致性/节奏/支线（每 N 章一次 + 手动随时可跑）；章节历史会自动留档最近 10 版，可回滚或让 AI 选最优版本复原。
             达到月度预算后自动连载会自动暂停（工作量以各厂商 token 计，不含价格折算）。
           </p>
         </div>
@@ -424,6 +444,7 @@
       <button class="btn btn-outline btn-sm" id="reader-continue"><svg class="ic"><use href="#i-pen"/></svg>光标续写</button>
       <button class="btn btn-outline btn-sm" id="reader-rewrite"><svg class="ic"><use href="#i-refresh"/></svg>重写本章</button>
       <button class="btn btn-outline btn-sm" id="reader-recheck"><svg class="ic"><use href="#i-refresh"/></svg>重新审校</button>
+      <button class="btn btn-outline btn-sm" id="reader-history"><svg class="ic"><use href="#i-clock"/></svg>历史</button>
       <span class="muted">AI 修文（先选中一段）：</span>
       <button class="btn btn-outline btn-sm" data-polish="rewrite">改写</button>
       <button class="btn btn-outline btn-sm" data-polish="expand">扩写</button>
@@ -459,6 +480,44 @@
       <button class="btn btn-primary" id="diff-apply"><svg class="ic"><use href="#i-check"/></svg>应用修改</button>
       <button class="btn btn-outline" id="diff-reroll"><svg class="ic"><use href="#i-refresh"/></svg>换一版</button>
       <button class="btn btn-outline" id="diff-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 章节历史（版本回滚 + AI 复原） -->
+<div class="dialog-backdrop" id="history-backdrop" hidden>
+  <div class="dialog" style="width:min(760px,94vw);">
+    <div class="dialog-head">
+      <h3 id="history-title">章节历史</h3>
+      <button class="btn btn-ghost" id="history-close">关闭</button>
+    </div>
+    <div class="chips" id="history-current"></div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>时间</th><th>版本来源</th><th class="num">字数</th><th class="num">综合分</th><th></th></tr></thead>
+        <tbody id="history-rows"></tbody>
+      </table>
+    </div>
+    <pre id="history-preview" class="stream muted" hidden style="max-height:220px;"></pre>
+    <div class="row">
+      <button class="btn btn-primary" id="history-ai"><svg class="ic"><use href="#i-refresh"/></svg>AI 复原（选最优版本）</button>
+      <span class="muted" id="history-status"></span>
+    </div>
+  </div>
+</div>
+
+<!-- 全局审校（跨章） -->
+<div class="dialog-backdrop" id="global-backdrop" hidden>
+  <div class="dialog" style="width:min(720px,94vw);">
+    <div class="dialog-head">
+      <h3>全局审校</h3>
+      <button class="btn btn-ghost" id="global-close">关闭</button>
+    </div>
+    <p class="muted" id="global-meta" style="margin:0;">跨章一致性 / 节奏 / 支线状态；发现问题按设置自动定向修复。</p>
+    <div id="global-issues"></div>
+    <div class="row">
+      <button class="btn btn-primary" id="global-run"><svg class="ic"><use href="#i-eye"/></svg>立即全局审校</button>
+      <span class="muted" id="global-status"></span>
     </div>
   </div>
 </div>

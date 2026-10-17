@@ -219,9 +219,34 @@ static FORESHADOW_AUDIT: TaskSpec = TaskSpec {
 只报告有把握的；没有把握就返回空数组。\n",
 };
 
+static GLOBAL_REVIEW: TaskSpec = TaskSpec {
+    id: "global_review",
+    label: "全局审校",
+    desc: "全书视角：跨章一致性 / 节奏 / 支线状态审查（JSON）",
+    vars: &[
+        VarSpec { name: "title", desc: "书名", sample: "深海鲸歌" },
+        VarSpec { name: "genre", desc: "题材", sample: "都市奇幻" },
+        VarSpec { name: "logline", desc: "一句话卖点", sample: "少年在深海城市寻找姐姐" },
+        VarSpec { name: "worldview", desc: "世界观设定", sample: "近代沿海孤城……" },
+        VarSpec { name: "chapter_count", desc: "已有章节数", sample: "36" },
+        VarSpec { name: "volume_text", desc: "卷摘要（可为「无」）", sample: "第1卷（至第20章）：……" },
+        VarSpec { name: "summaries", desc: "逐章摘要链（尾段截断）", sample: "第1章 风起：……\n第2章 暗涌：……" },
+        VarSpec { name: "ledger", desc: "角色与伏笔台账块（可能为空）", sample: "角色事实：\n- 林深（主角·active）：……" },
+    ],
+    default_system: "你是网文结构编辑兼追读读者。只输出一个 JSON 对象，不要输出其他文字、不要使用 Markdown 代码块。",
+    default_user: "TASK:global_review\n书名：{{title}}（{{genre}}）\n卖点：{{logline}}\n世界观：{{worldview}}\n共 {{chapter_count}} 章。\n\n\
+【卷摘要】\n{{volume_text}}\n\n【逐章摘要】\n{{summaries}}\n\n【台账】\n{{ledger}}\n\n\
+请以「追读读者 + 结构编辑」的双重视角审视全书，找出真正影响追读体验的**跨章问题**（最多 3 条，宁缺毋滥）：\n\
+- 一致性：设定/时间线/人物状态是否前后矛盾（引台账核对）\n\
+- 节奏：是否连续多章平淡、信息过载、或支线长期失踪\n\
+- 结构：主线推进是否停滞、主角目标是否模糊、悬念是否长期悬空\n\
+输出 JSON：{\"ok\": true, \"issues\": [{\"severity\": \"high|medium|low\", \"note\": \"问题的一句话描述\", \"affected_chapters\": [涉及章号整数], \"suggestion\": \"修改建议（一句话，指明改哪一章的什么）\"}]}\n\
+没有达到标准的跨章问题就返回空数组；不要为了凑数报告小问题。\n",
+};
+
 pub static TASKS: &[&TaskSpec] = &[
     &BRIEF, &OUTLINE, &CHAPTER, &REVIEW, &POLISH, &CONTINUE, &REWRITE, &EXTRACT,
-    &VOLUME_SUMMARY, &FORESHADOW_AUDIT,
+    &VOLUME_SUMMARY, &FORESHADOW_AUDIT, &GLOBAL_REVIEW,
 ];
 
 pub fn task(id: &str) -> Option<&'static TaskSpec> {
@@ -682,6 +707,32 @@ pub fn foreshadow_audit_prompt(list: &str, summaries: &str, ov: &Overrides) -> (
     build(&FORESHADOW_AUDIT, ov, &vars)
 }
 
+/// 全局审校：全书信息（设定 + 卷摘要 + 逐章摘要 + 台账）→ 跨章问题
+#[allow(clippy::too_many_arguments)]
+pub fn global_review_prompt(
+    title: &str,
+    genre: &str,
+    logline: &str,
+    worldview: &str,
+    chapter_count: i64,
+    volume_text: &str,
+    summaries: &str,
+    ledger: &str,
+    ov: &Overrides,
+) -> (String, String) {
+    let vars = vec![
+        ("title", title.to_string()),
+        ("genre", genre.to_string()),
+        ("logline", logline.to_string()),
+        ("worldview", if worldview.trim().is_empty() { "（未设定）".to_string() } else { worldview.to_string() }),
+        ("chapter_count", chapter_count.to_string()),
+        ("volume_text", if volume_text.trim().is_empty() { "无".to_string() } else { volume_text.to_string() }),
+        ("summaries", summaries.to_string()),
+        ("ledger", if ledger.trim().is_empty() { "（暂无台账）".to_string() } else { ledger.to_string() }),
+    ];
+    build(&GLOBAL_REVIEW, ov, &vars)
+}
+
 // 保留一个 JSON 约束后缀，便于其它模块复用
 pub const JSON_SUFFIX: &str = "只输出一个 JSON 对象，不要输出任何其他文字、不要使用 Markdown 代码块。";
 
@@ -750,7 +801,7 @@ mod tests {
 
     #[test]
     fn task_catalog_is_consistent() {
-        assert_eq!(TASKS.len(), 10, "任务数量应为 10");
+        assert_eq!(TASKS.len(), 11, "任务数量应为 11");
         for spec in TASKS {
             assert!(task(spec.id).is_some());
             assert!(!spec.label.is_empty() && !spec.desc.is_empty());

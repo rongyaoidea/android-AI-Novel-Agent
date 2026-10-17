@@ -672,6 +672,10 @@ fn mock_complete(user: &str) -> anyhow::Result<String> {
         })
         .to_string());
     }
+    if user.contains("TASK:global_review") {
+        // 离线演示不臆造跨章问题（保持审校系统可预测）
+        return Ok(serde_json::json!({"ok": true, "issues": []}).to_string());
+    }
     if user.contains("TASK:review") {
         return Ok(serde_json::json!({
             "ok": true,

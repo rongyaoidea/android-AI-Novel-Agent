@@ -1247,7 +1247,7 @@ async fn prompt_overrides_endpoints() {
     engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
     let app = api::build_router(engine.clone());
 
-    // 1) 目录：10 个任务，默认模板齐全，初始无覆盖
+    // 1) 目录：11 个任务，默认模板齐全，初始无覆盖
     let resp = app
         .clone()
         .oneshot(
@@ -1261,7 +1261,7 @@ async fn prompt_overrides_endpoints() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
     let items = v["items"].as_array().unwrap();
-    assert_eq!(items.len(), 10, "任务数量应为 10");
+    assert_eq!(items.len(), 11, "任务数量应为 11");
     for t in items {
         assert!(!t["default_system"].as_str().unwrap().is_empty(), "{}", t["id"]);
         assert!(!t["default_user"].as_str().unwrap().is_empty(), "{}", t["id"]);
@@ -2551,6 +2551,256 @@ async fn restore_and_review_concurrency_guards() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 章节历史版本（留档/复原/AI 复原）+ 全局审校接口 + 新设置项回环
+#[tokio::test]
+async fn version_history_and_global_review_endpoints() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-versions-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "版本与全局审校测试", "chapters": 3}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    // 记下原始正文
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/chapters/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let original = json_body(resp).await["content"].as_str().unwrap().to_string();
+    assert!(!original.is_empty());
+
+    // 连续两次手动编辑：每次覆盖前自动留档（pre-manual）
+    for content in ["第一次改写，内容较长以便对比评分。", "第二次改写，更短。"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/novels/{novel_id}/chapters/1"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"content": content}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/chapters/1/versions"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    let items = v["items"].as_array().unwrap();
+    assert!(items.len() >= 2, "应有至少两次留档：{v}");
+    assert!(
+        items.iter().all(|it| it["source"].as_str().unwrap_or("").starts_with("pre-")),
+        "{v}"
+    );
+    // 每个版本都带综合分与字数（供 UI 标「更优」）
+    assert!(items[0]["score"].is_i64() && items[0]["words"].as_i64().unwrap_or(0) > 0, "{v}");
+
+    // 手动复原最旧的一版 → 正文回到原始稿
+    let oldest = items.last().unwrap()["id"].as_str().unwrap().to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/chapters/1/versions/{oldest}/restore"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/chapters/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["content"].as_str().unwrap(), original, "复原应拿回原始稿");
+
+    // 当前稿已是最优 → AI 复原应报告「无需复原」
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/chapters/1/ai-restore"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["restored"], false, "{v}");
+
+    // 制造更差版本（极短稿）：AI 复原应自动恢复更优快照
+    engine
+        .db
+        .save_chapter_content_sourced(&novel_id, 1, "极短稿。", "done", "manual")
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/chapters/1/ai-restore"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["restored"], true, "应自动恢复更优快照：{v}");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/chapters/1"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_ne!(v["content"].as_str().unwrap(), "极短稿。", "更短稿应被替换");
+
+    // 全局审校：手动触发 → 等后台完成（用量里出现 global_review）→ 读取结论
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/global-review"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut saw_call = false;
+    for _ in 0..400 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}/usage"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let u = json_body(resp).await;
+        if u["by_task"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["key"] == "global_review")
+        {
+            saw_call = true;
+            break;
+        }
+    }
+    assert!(saw_call, "全局审校应产生一次 LLM 调用");
+    // 等槽位释放后再读结论（mock 很快）
+    for _ in 0..200 {
+        if !engine.is_reviewing(&novel_id) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/global-review"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(
+        !v["updated_at"].as_str().unwrap_or("").is_empty(),
+        "应有检查时间：{v}"
+    );
+
+    // 新设置项回环
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/settings/pipeline")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "auto_fix_review": true,
+                        "monthly_budget_tokens": 0,
+                        "auto_batch": 10,
+                        "foreshadow_audit_every": 1,
+                        "global_review_every": 5,
+                        "auto_fix_global": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/api/settings/pipeline").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["global_review_every"], 5, "{v}");
+    assert_eq!(v["auto_fix_global"], false, "{v}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

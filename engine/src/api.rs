@@ -120,6 +120,12 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/novels/:id/chapters/:idx/polish", post(polish_chapter))
         .route("/api/novels/:id/chapters/:idx/review", post(review_chapter))
         .route("/api/novels/:id/chapters/:idx/move", axum::routing::put(move_chapter))
+        .route("/api/novels/:id/chapters/:idx/versions", get(list_versions))
+        .route("/api/novels/:id/chapters/:idx/versions/:vid", get(get_version))
+        .route("/api/novels/:id/chapters/:idx/versions/:vid/restore", post(restore_version))
+        .route("/api/novels/:id/chapters/:idx/ai-restore", post(ai_restore))
+        .route("/api/novels/:id/global-review", get(get_global_review).post(run_global_review))
+        .route("/api/novels/:id/global-review/fix", post(fix_global_issue))
         .route("/api/novels/:id/chapters/:idx/continue", post(continue_chapter))
         .route("/api/novels/:id/chapters/:idx/rewrite", post(rewrite_chapter))
         .route("/api/novels/:id/chapters/:idx/extract", post(extract_chapter))
@@ -342,6 +348,7 @@ async fn put_pipeline(
     // 宽容归一化，防止越界值入库
     s.auto_batch = s.batch();
     s.foreshadow_audit_every = s.audit_every();
+    s.global_review_every = s.global_every();
     e.db.set_pipeline_settings(&s).map_err(err)?;
     Ok(Json(json!({"ok": true})))
 }
@@ -449,6 +456,196 @@ async fn search_novel(
         .map(|(idx, title, excerpt)| json!({"idx": idx, "title": title, "excerpt": excerpt}))
         .collect();
     Ok(Json(json!({"items": items})))
+}
+
+/// 章节历史版本列表（含每版综合评分，供 UI 标「更优」）
+async fn list_versions(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx)): Path<(String, i64)>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let ch = e
+        .db
+        .get_chapter(&id, idx)
+        .map_err(err)?
+        .ok_or_else(|| not_found("chapter"))?;
+    let versions = e.db.list_chapter_versions(&id, idx).map_err(err)?;
+    let max_words = versions
+        .iter()
+        .map(|v| v.content.chars().count() as i64)
+        .chain([ch.content.chars().count() as i64])
+        .max()
+        .unwrap_or(0);
+    let items: Vec<serde_json::Value> = versions
+        .iter()
+        .map(|v| {
+            let s = pipeline::score_snapshot(
+                &v.content,
+                v.review_json.as_deref(),
+                &v.style_report,
+                max_words,
+            );
+            json!({
+                "id": v.id,
+                "source": v.source,
+                "status": v.status,
+                "words": s.words,
+                "open_issues": s.open_issues,
+                "style": s.style,
+                "score": s.score,
+                "created_at": v.created_at,
+                "preview": v.content.chars().take(80).collect::<String>(),
+            })
+        })
+        .collect();
+    let cur = pipeline::score_snapshot(&ch.content, ch.review_json.as_deref(), &ch.style_report, max_words);
+    Ok(Json(json!({
+        "items": items,
+        "current": {
+            "words": cur.words,
+            "open_issues": cur.open_issues,
+            "style": cur.style,
+            "score": cur.score,
+        }
+    })))
+}
+
+/// 单条历史版本全文（预览用）
+async fn get_version(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx, vid)): Path<(String, i64, String)>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let v = e
+        .db
+        .get_chapter_version(&id, idx, &vid)
+        .map_err(err)?
+        .ok_or_else(|| not_found("version"))?;
+    Ok(Json(json!({
+        "id": v.id,
+        "source": v.source,
+        "status": v.status,
+        "words": v.content.chars().count(),
+        "content": v.content,
+        "created_at": v.created_at,
+    })))
+}
+
+/// 手动复原到某历史版本（当前稿先自动留一份快照）
+async fn restore_version(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx, vid)): Path<(String, i64, String)>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    let ok = e
+        .db
+        .restore_chapter_version(&id, idx, &vid, "restore")
+        .map_err(err)?;
+    if !ok {
+        return Err(not_found("version"));
+    }
+    e.hub.publish(&id, pipeline::EngineEvent::Stage {
+        stage: "autofix".into(),
+        message: format!("第 {idx} 章已复原到历史版本"),
+    });
+    Ok(Json(json!({"ok": true})))
+}
+
+/// AI 复原：在当前稿与历史快照中选「综合最优」，严格更优才恢复（本地评分，零 token）
+async fn ai_restore(
+    State(e): State<Arc<Engine>>,
+    Path((id, idx)): Path<(String, i64)>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    let changed = pipeline::ai_restore_chapter(&e, &id, idx, "ai-restore")
+        .await
+        .map_err(err)?;
+    Ok(Json(json!({
+        "ok": true,
+        "restored": changed.is_some(),
+        "detail": changed.unwrap_or_else(|| "当前稿已是综合最优（无需复原）".to_string()),
+    })))
+}
+
+/// 全局审校：读取最近一次结论
+async fn get_global_review(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    let review = e
+        .db
+        .get_global_review(&id)
+        .map_err(err)?
+        .unwrap_or(crate::models::GlobalReview {
+            ok: true,
+            issues: Vec::new(),
+            updated_at: String::new(),
+        });
+    Ok(Json(serde_json::to_value(review).map_err(err)?))
+}
+
+/// 全局审校：立即跑一轮（含按设置的自动定向修复）；后台执行，进度经 SSE 推送
+async fn run_global_review(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    if let Some(run) = e.db.latest_run(&id).map_err(err)? {
+        if run.status == "running" {
+            return Err((
+                StatusCode::CONFLICT,
+                "有创作运行进行中，完成后再做全局审校".to_string(),
+            ));
+        }
+    }
+    if e.is_reviewing(&id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "已有一轮审校处理在进行中，请稍候".to_string(),
+        ));
+    }
+    pipeline::spawn_global_review(e.clone(), &id).map_err(err)?;
+    Ok(Json(json!({"ok": true, "queued": true})))
+}
+
+#[derive(Deserialize)]
+struct GlobalFixBody {
+    /// 意见在最近一次全局审校里的下标
+    index: usize,
+}
+
+/// 按指定的一条全局意见定向修复（手动触发）
+async fn fix_global_issue(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(b): Json<GlobalFixBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    if let Some(run) = e.db.latest_run(&id).map_err(err)? {
+        if run.status == "running" {
+            return Err((
+                StatusCode::CONFLICT,
+                "有创作运行进行中，完成后再修复".to_string(),
+            ));
+        }
+    }
+    if e.is_reviewing(&id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "已有一轮审校处理在进行中，请稍候".to_string(),
+        ));
+    }
+    pipeline::spawn_global_issue_fix(e.clone(), &id, b.index).map_err(err)?;
+    Ok(Json(json!({"ok": true, "queued": true})))
 }
 
 /// 停止创作：中断进行中的运行（流式生成即断；其它步骤在下一检查点退出），并关闭自动连载。

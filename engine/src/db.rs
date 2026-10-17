@@ -21,6 +21,9 @@ fn now() -> String {
 
 const NOVEL_COLS: &str = "id,title,genre,idea,logline,protagonist,style,book_outline,status,mode,created_at,updated_at,style_preset,target_chapters,auto_continue,worldview";
 
+/// 每章保留的历史版本数
+const MAX_CHAPTER_VERSIONS: i64 = 10;
+
 /// CJK 判定（含扩展 A、兼容表意文字与日文假名；用于 FTS 逐字拆分）
 fn is_cjk(c: char) -> bool {
     matches!(
@@ -215,6 +218,23 @@ impl Db {
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL,
                 PRIMARY KEY(novel_id, volume_idx)
+             );
+             CREATE TABLE IF NOT EXISTS chapter_versions (
+                id           TEXT PRIMARY KEY,
+                novel_id     TEXT NOT NULL,
+                idx          INTEGER NOT NULL,
+                source       TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'done',
+                content      TEXT NOT NULL,
+                review_json  TEXT,
+                style_report TEXT NOT NULL DEFAULT '',
+                created_at   TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_chapter_versions ON chapter_versions(novel_id, idx, created_at);
+             CREATE TABLE IF NOT EXISTS global_reviews (
+                novel_id    TEXT PRIMARY KEY,
+                review_json TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
              );",
         )?;
         // 全文检索（FTS5，CJK 逐字空格化后入库；查询用同规则归一化）
@@ -558,6 +578,8 @@ impl Db {
         // FTS 表无外键级联：手动清理该书的检索索引
         conn.execute("DELETE FROM chapter_fts WHERE novel_id=?1", [id])?;
         conn.execute("DELETE FROM volume_summaries WHERE novel_id=?1", [id])?;
+        conn.execute("DELETE FROM chapter_versions WHERE novel_id=?1", [id])?;
+        conn.execute("DELETE FROM global_reviews WHERE novel_id=?1", [id])?;
         let n = conn.execute("DELETE FROM novels WHERE id=?1", [id])?;
         Ok(n > 0)
     }
@@ -650,13 +672,189 @@ impl Db {
     }
 
     pub fn save_chapter_content(&self, novel_id: &str, idx: i64, content: &str, status: &str) -> anyhow::Result<()> {
+        self.save_chapter_content_sourced(novel_id, idx, content, status, "auto")
+    }
+
+    /// 写正文（带来源标签）：覆盖非空旧稿前自动留一份历史快照（保留最近 10 版）
+    pub fn save_chapter_content_sourced(
+        &self,
+        novel_id: &str,
+        idx: i64,
+        content: &str,
+        status: &str,
+        source: &str,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
+        Self::snapshot_chapter_version_locked(&conn, novel_id, idx, source, content)?;
         conn.execute(
             "UPDATE chapters SET content=?3, status=?4, updated_at=?5 WHERE novel_id=?1 AND idx=?2",
             params![novel_id, idx, content, status, now()],
         )?;
         Self::reindex_chapter_locked(&conn, novel_id, idx)?;
         Self::refresh_review_staleness_locked(&conn, novel_id, idx)?;
+        Ok(())
+    }
+
+    /// 快照当前正文（供版本历史与 AI 复原）。规则：
+    /// - 旧内容为空、或与新内容相同 → 不留档
+    /// - 每章保留最近 MAX_CHAPTER_VERSIONS 版
+    /// - source 用「pre-操作」形态（pre-autofix / pre-manual / …）说明这是「什么操作之前」的版本
+    fn snapshot_chapter_version_locked(
+        conn: &Connection,
+        novel_id: &str,
+        idx: i64,
+        source: &str,
+        new_content: &str,
+    ) -> anyhow::Result<()> {
+        let row = conn.query_row(
+            "SELECT content, status, review_json, style_report FROM chapters WHERE novel_id=?1 AND idx=?2",
+            params![novel_id, idx],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        );
+        let (old, status, review, style) = match row {
+            Ok(v) => v,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if old.trim().is_empty() || old == new_content {
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT INTO chapter_versions(id, novel_id, idx, source, status, content, review_json, style_report, created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                novel_id,
+                idx,
+                format!("pre-{source}"),
+                status,
+                old,
+                review,
+                style,
+                now()
+            ],
+        )?;
+        // 保留最近 N 版，其余清理
+        conn.execute(
+            "DELETE FROM chapter_versions WHERE novel_id=?1 AND idx=?2 AND id NOT IN (
+                SELECT id FROM chapter_versions WHERE novel_id=?1 AND idx=?2
+                ORDER BY created_at DESC, rowid DESC LIMIT ?3
+             )",
+            params![novel_id, idx, MAX_CHAPTER_VERSIONS],
+        )?;
+        Ok(())
+    }
+
+    /// 章节历史版本（新的在前）
+    pub fn list_chapter_versions(
+        &self,
+        novel_id: &str,
+        idx: i64,
+    ) -> anyhow::Result<Vec<crate::models::ChapterVersion>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, novel_id, idx, source, status, content, review_json, style_report, created_at
+             FROM chapter_versions WHERE novel_id=?1 AND idx=?2 ORDER BY created_at DESC, rowid DESC",
+        )?;
+        let rows = stmt.query_map(params![novel_id, idx], |r| {
+            Ok(crate::models::ChapterVersion {
+                id: r.get(0)?,
+                novel_id: r.get(1)?,
+                idx: r.get(2)?,
+                source: r.get(3)?,
+                status: r.get(4)?,
+                content: r.get(5)?,
+                review_json: r.get(6)?,
+                style_report: r.get(7)?,
+                created_at: r.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 单条历史版本（校验归属，防跨书读取）
+    pub fn get_chapter_version(
+        &self,
+        novel_id: &str,
+        idx: i64,
+        version_id: &str,
+    ) -> anyhow::Result<Option<crate::models::ChapterVersion>> {
+        Ok(self
+            .list_chapter_versions(novel_id, idx)?
+            .into_iter()
+            .find(|v| v.id == version_id))
+    }
+
+    /// 复原到指定历史版本：先给当前稿留快照，再恢复正文 + 当时的审校/文风报告
+    pub fn restore_chapter_version(
+        &self,
+        novel_id: &str,
+        idx: i64,
+        version_id: &str,
+        via: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(v) = self.get_chapter_version(novel_id, idx, version_id)? else {
+            return Ok(false);
+        };
+        let conn = self.conn.lock().unwrap();
+        // 写正文（内部会先快照当前稿，标签 pre-<via>）
+        Self::snapshot_chapter_version_locked(&conn, novel_id, idx, via, &v.content)?;
+        conn.execute(
+            "UPDATE chapters SET content=?3, status=?4, review_json=?5, style_report=?6, updated_at=?7
+             WHERE novel_id=?1 AND idx=?2",
+            params![
+                novel_id,
+                idx,
+                v.content,
+                if v.status.trim().is_empty() { "done" } else { v.status.as_str() },
+                v.review_json,
+                v.style_report,
+                now()
+            ],
+        )?;
+        Self::reindex_chapter_locked(&conn, novel_id, idx)?;
+        // 复原的审校与其正文是一致快照，不需要 stale 刷新；但保持调用以保证结构一致
+        Self::refresh_review_staleness_locked(&conn, novel_id, idx)?;
+        Ok(true)
+    }
+
+    /// 全局审校结论
+    pub fn get_global_review(&self, novel_id: &str) -> anyhow::Result<Option<crate::models::GlobalReview>> {
+        let conn = self.conn.lock().unwrap();
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT review_json FROM global_reviews WHERE novel_id=?1",
+                [novel_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.and_then(|s| serde_json::from_str::<crate::models::GlobalReview>(&s).ok()))
+    }
+
+    /// 保存全局审校结论
+    pub fn save_global_review(
+        &self,
+        novel_id: &str,
+        review: &crate::models::GlobalReview,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let raw = serde_json::to_string(review)?;
+        conn.execute(
+            "INSERT INTO global_reviews(novel_id, review_json, updated_at) VALUES(?1,?2,?3)
+             ON CONFLICT(novel_id) DO UPDATE SET review_json=excluded.review_json, updated_at=excluded.updated_at",
+            params![novel_id, raw, now()],
+        )?;
         Ok(())
     }
 
@@ -1036,6 +1234,8 @@ impl Db {
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         if let Some(c) = content {
+            // 手动编辑前留快照（预置版本历史，供回滚与 AI 复原）
+            Self::snapshot_chapter_version_locked(&conn, novel_id, idx, "manual", c)?;
             conn.execute(
                 "UPDATE chapters SET content=?3, status='done', updated_at=?4 WHERE novel_id=?1 AND idx=?2",
                 params![novel_id, idx, c, now()],
@@ -1908,6 +2108,95 @@ mod tests {
         assert_eq!(hit.status, "resolved", "应命中 50%的真相");
         let other = items.iter().find(|f| f.title == "他们走了50步").unwrap();
         assert_eq!(other.status, "open", "不应把 % 当通配符误回收别的伏笔");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chapter_versions_snapshot_retention_and_restore() {
+        use crate::models::{ChapterPlan, Review, ReviewIssue};
+        let dir = tmp_dir("versions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("版本历史测试", "auto", "").unwrap();
+        db.upsert_chapter_plan(
+            &novel.id,
+            &ChapterPlan { idx: 1, title: "第一章".into(), goal: String::new(), beats: vec![] },
+        )
+        .unwrap();
+        // 首次写入：旧内容为空，不应留档
+        db.save_chapter_content(&novel.id, 1, "第一版正文", "done").unwrap();
+        assert!(db.list_chapter_versions(&novel.id, 1).unwrap().is_empty());
+
+        // 给第一版配一条审校（带 1 条 high open），随后覆盖 → 应留档且带审校快照
+        let review = Review {
+            ok: false,
+            issues: vec![ReviewIssue {
+                severity: "high".into(),
+                note: "开场冲突不足".into(),
+                quote: String::new(),
+                status: "open".into(),
+                is_new: false,
+                stale: false,
+            }],
+        };
+        db.save_chapter_review(&novel.id, 1, &review).unwrap();
+        db.save_chapter_content_sourced(&novel.id, 1, "第二版正文（更差）", "done", "manual").unwrap();
+        let versions = db.list_chapter_versions(&novel.id, 1).unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].source, "pre-manual");
+        assert!(versions[0].review_json.as_deref().unwrap().contains("开场冲突不足"));
+
+        // 复原：恢复第一版与当时的审校；当前稿（第二版）自动留档为 pre-restore
+        let vid = versions[0].id.clone();
+        assert!(db.restore_chapter_version(&novel.id, 1, &vid, "restore").unwrap());
+        let ch = db.get_chapter(&novel.id, 1).unwrap().unwrap();
+        assert_eq!(ch.content, "第一版正文");
+        assert!(ch.review_json.unwrap().contains("开场冲突不足"));
+        let versions = db.list_chapter_versions(&novel.id, 1).unwrap();
+        assert!(versions.iter().any(|v| v.source == "pre-restore" && v.content.contains("第二版")));
+
+        // 保留上限：连续覆盖 12 次 → 最多 10 版
+        for i in 0..12 {
+            db.save_chapter_content_sourced(&novel.id, 1, &format!("第{i}轮"), "done", "manual")
+                .unwrap();
+        }
+        assert_eq!(db.list_chapter_versions(&novel.id, 1).unwrap().len(), 10);
+        // 跨书版本不可见（作用域正确）
+        let other = db.create_novel("另一本", "auto", "").unwrap();
+        db.upsert_chapter_plan(
+            &other.id,
+            &ChapterPlan { idx: 1, title: "第一章".into(), goal: String::new(), beats: vec![] },
+        )
+        .unwrap();
+        assert!(db.get_chapter_version(&other.id, 1, &vid).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_review_roundtrip_and_merge() {
+        use crate::models::{GlobalIssue, GlobalReview};
+        let dir = tmp_dir("global");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("ainovel.db")).unwrap();
+        let novel = db.create_novel("全局审校存储测试", "auto", "").unwrap();
+        assert!(db.get_global_review(&novel.id).unwrap().is_none());
+        let review = GlobalReview {
+            ok: true,
+            issues: vec![GlobalIssue {
+                severity: "medium".into(),
+                note: "第 4~7 章连续平淡，缺少冲突升级".into(),
+                affected_chapters: vec![4, 5, 6, 7],
+                suggestion: "在第 6 章加入一次试探性对抗".into(),
+                status: "open".into(),
+                is_new: true,
+            }],
+            updated_at: "2026-10-17T00:00:00+00:00".into(),
+        };
+        db.save_global_review(&novel.id, &review).unwrap();
+        let loaded = db.get_global_review(&novel.id).unwrap().unwrap();
+        assert_eq!(loaded.issues.len(), 1);
+        assert_eq!(loaded.issues[0].affected_chapters, vec![4, 5, 6, 7]);
+        assert_eq!(loaded.updated_at, "2026-10-17T00:00:00+00:00");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

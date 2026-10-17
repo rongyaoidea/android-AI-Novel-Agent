@@ -231,6 +231,48 @@ pub struct VolumeSummary {
     pub summary: String,
 }
 
+/// 章节历史快照（每次覆盖正文前留档；AI 与人都可据此复原）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChapterVersion {
+    pub id: String,
+    pub novel_id: String,
+    pub idx: i64,
+    /// 内容来源：draft / autofix / rewrite / retry / global_fix / manual / restore / restore-pre / ai-restore
+    pub source: String,
+    pub status: String,
+    pub content: String,
+    pub review_json: Option<String>,
+    pub style_report: String,
+    pub created_at: String,
+}
+
+/// 全局（跨章）审校问题
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalIssue {
+    pub severity: String,
+    pub note: String,
+    /// 涉及的章节号（供定向修复）
+    #[serde(default)]
+    pub affected_chapters: Vec<i64>,
+    #[serde(default)]
+    pub suggestion: String,
+    #[serde(default = "default_issue_status")]
+    pub status: String,
+    #[serde(default)]
+    pub is_new: bool,
+}
+
+/// 全局审校结论（整本书维度）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalReview {
+    pub ok: bool,
+    #[serde(default)]
+    pub issues: Vec<GlobalIssue>,
+    /// 最近一次检查时间（展示用；解析 LLM 输出时为空）
+    #[serde(default)]
+    pub updated_at: String,
+}
+
 /// 章节列表轻量条目（不含正文，列表接口用；正文走章节详情）
 #[derive(Debug, Clone, Serialize)]
 pub struct ChapterMeta {
@@ -326,6 +368,12 @@ pub struct PipelineSettings {
     /// 伏笔自动审核间隔（章）：1 = 每批收尾都跑；N = 章节号逢 N 的倍数才跑；0 = 关闭（默认 1）
     #[serde(default = "default_audit_every")]
     pub foreshadow_audit_every: i64,
+    /// 全局审校间隔（章）：每写完 N 章做一次全书审校；0 = 关闭（默认 10）
+    #[serde(default = "default_global_every")]
+    pub global_review_every: i64,
+    /// 全局审校发现问题后自动定向修复（默认开）
+    #[serde(default = "default_true")]
+    pub auto_fix_global: bool,
 }
 
 fn default_auto_batch() -> i64 {
@@ -336,6 +384,14 @@ fn default_audit_every() -> i64 {
     1
 }
 
+fn default_global_every() -> i64 {
+    10
+}
+
+fn default_true() -> bool {
+    true
+}
+
 impl PipelineSettings {
     pub fn batch(&self) -> i64 {
         self.auto_batch.clamp(1, 50)
@@ -343,6 +399,10 @@ impl PipelineSettings {
 
     pub fn audit_every(&self) -> i64 {
         self.foreshadow_audit_every.clamp(0, 100)
+    }
+
+    pub fn global_every(&self) -> i64 {
+        self.global_review_every.clamp(0, 100)
     }
 }
 
@@ -353,6 +413,8 @@ impl Default for PipelineSettings {
             monthly_budget_tokens: 0,
             auto_batch: default_auto_batch(),
             foreshadow_audit_every: default_audit_every(),
+            global_review_every: default_global_every(),
+            auto_fix_global: true,
         }
     }
 }

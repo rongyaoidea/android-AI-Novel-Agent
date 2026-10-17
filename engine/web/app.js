@@ -825,6 +825,8 @@ const USAGE_TASK_LABEL = {
   extract: "资料整理",
   foreshadow_audit: "伏笔审核",
   volume_summary: "卷级摘要",
+  global_review: "全局审校",
+  global_fix: "全局修复",
   test: "连通测试",
 };
 
@@ -1336,6 +1338,162 @@ async function copyChapter(idx) {
   toast(`已复制第${idx}章（标题+正文），可直接粘贴到作家平台`);
 }
 
+/* ---------------- 章节历史（版本回滚 + AI 复原） ---------------- */
+
+let historyIdx = 0;
+
+/** 快照来源标签（pre-X = 在 X 操作之前的版本） */
+const VERSION_SOURCE = {
+  "pre-draft": "生成前",
+  "pre-autofix": "审校修复前",
+  "pre-retry": "文风重写前",
+  "pre-rewrite": "重写前",
+  "pre-manual": "手动编辑前",
+  "pre-global-fix": "全局修复前",
+  "pre-review-all": "审校处理前",
+  "pre-restore": "复原操作前",
+  "pre-ai-restore": "AI 复原前",
+  "pre-auto": "修改前",
+};
+
+async function openHistory() {
+  const ta = $("#reader-content");
+  const idx = parseInt(ta.dataset.idx || "0", 10);
+  if (!idx) return;
+  historyIdx = idx;
+  $("#history-backdrop").hidden = false;
+  $("#history-preview").hidden = true;
+  $("#history-preview").textContent = "";
+  $("#history-status").textContent = "";
+  await refreshHistory();
+}
+
+async function refreshHistory() {
+  const r = await api(`/api/novels/${state.novelId}/chapters/${historyIdx}/versions`);
+  const cur = r.current || {};
+  $("#history-current").innerHTML =
+    `<span class="chip chip-dark">当前稿 · ${cur.words || 0} 字 · 综合分 ${cur.score ?? "—"}</span>` +
+    (cur.open_issues
+      ? `<span class="chip chip-warning">仍存在 ${cur.open_issues} 条高/中危意见</span>`
+      : `<span class="chip chip-success">无高/中危意见</span>`);
+  const items = r.items || [];
+  $("#history-rows").innerHTML = items.length
+    ? items
+        .map((v) => {
+          const label = VERSION_SOURCE[v.source] || v.source || "历史版本";
+          const better = (v.score ?? -999) > (cur.score ?? -999);
+          return `<tr>
+            <td class="num">${fmtTime(v.created_at)}</td>
+            <td>${esc(label)}${
+              v.open_issues
+                ? `<span class="chip chip-warning" style="margin-left:6px;">问题 ${v.open_issues}</span>`
+                : `<span class="chip chip-success" style="margin-left:6px;">0 问题</span>`
+            }</td>
+            <td class="num">${v.words}</td>
+            <td class="num">${v.score}${better ? `<span class="chip chip-info" style="margin-left:6px;">更优</span>` : ""}</td>
+            <td>
+              <button class="btn btn-outline btn-sm" data-hview="${v.id}">预览</button>
+              <button class="btn btn-outline btn-sm" data-hrestore="${v.id}">恢复</button>
+            </td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="5" class="muted">还没有历史版本（首次修改/修复/重写后会自动留档，最多保留最近 10 版）</td></tr>`;
+}
+
+/* ---------------- 全局审校（跨章） ---------------- */
+
+async function openGlobalReview() {
+  $("#global-backdrop").hidden = false;
+  $("#global-status").textContent = "";
+  await refreshGlobalReview();
+}
+
+async function refreshGlobalReview() {
+  const r = await api(`/api/novels/${state.novelId}/global-review`);
+  $("#global-meta").textContent = r.updated_at
+    ? `上次检查：${fmtTime(r.updated_at)} · 从全书视角检查跨章一致性 / 节奏 / 支线状态`
+    : "还没有做过全局审校：点下方「立即全局审校」开始（建议写到 5 章以上再做）。";
+  const issues = r.issues || [];
+  const box = $("#global-issues");
+  if (!issues.length) {
+    box.innerHTML = `<p class="muted" style="margin:0;">${r.updated_at ? "最近一次检查没有发现跨章问题。" : ""}</p>`;
+    return;
+  }
+  box.innerHTML = issues
+    .map((it, i) => {
+      const cls = it.severity === "high" ? "chip-danger" : it.severity === "medium" ? "chip-warning" : "";
+      const st = it.status === "fixed"
+        ? `<span class="chip chip-fixed">已修复</span>`
+        : `<span class="chip ${cls}">${it.is_new ? "新发现" : "仍存在"}</span>`;
+      const chs = (it.affected_chapters || [])
+        .map((x) => `<span class="chip chip-filter" data-goto="${x}" title="打开第${x}章">第${x}章</span>`)
+        .join("");
+      const fixBtn = it.status !== "fixed" && (it.affected_chapters || []).length
+        ? `<button class="btn btn-outline btn-sm" data-gfix="${i}">按此修复</button>`
+        : "";
+      return `<div class="panel" style="padding:10px 12px;margin:0 0 8px;">
+        <div class="chips">${st}${chs}</div>
+        <div style="font-size:13px;line-height:1.7;margin-top:6px;">${esc(it.note)}</div>
+        ${it.suggestion ? `<div class="muted" style="font-size:12px;">建议：${esc(it.suggestion)}</div>` : ""}
+        ${fixBtn ? `<div style="margin-top:8px;">${fixBtn}</div>` : ""}
+      </div>`;
+    })
+    .join("");
+}
+
+function bindGlobalReview() {
+  $("#novel-global-review").onclick = () => openGlobalReview().catch((e) => toast(e.message, true));
+  $("#global-close").onclick = () => { $("#global-backdrop").hidden = true; };
+  $("#global-backdrop").addEventListener("click", (e) => {
+    if (e.target === $("#global-backdrop")) $("#global-backdrop").hidden = true;
+  });
+  $("#global-run").onclick = async () => {
+    const btn = $("#global-run");
+    btn.disabled = true;
+    $("#global-status").textContent = "已开始，进度见「跟随生成」…";
+    try {
+      await apiSend(`/api/novels/${state.novelId}/global-review`, "POST");
+      let tries = 0;
+      const timer = setInterval(async () => {
+        tries += 1;
+        try {
+          await refreshGlobalReview();
+        } catch { /* 忽略 */ }
+        if (tries >= 8 || $("#global-backdrop").hidden) {
+          clearInterval(timer);
+          $("#global-status").textContent = "";
+          btn.disabled = false;
+        }
+      }, 3000);
+    } catch (err) {
+      toast(err.message, true);
+      $("#global-status").textContent = "";
+      btn.disabled = false;
+    }
+  };
+  $("#global-issues").addEventListener("click", async (e) => {
+    const go = e.target.closest("[data-goto]");
+    if (go) {
+      $("#global-backdrop").hidden = true;
+      openEditor(parseInt(go.dataset.goto, 10)).catch((err) => toast(err.message, true));
+      return;
+    }
+    const fix = e.target.closest("[data-gfix]");
+    if (fix) {
+      try {
+        await apiSend(`/api/novels/${state.novelId}/global-review/fix`, "POST", {
+          index: parseInt(fix.dataset.gfix, 10),
+        });
+        toast("已开始按该意见定向修复（进度见「跟随生成」）");
+        setTimeout(() => refreshGlobalReview().catch(() => {}), 4000);
+      } catch (err) {
+        toast(err.message, true);
+      }
+    }
+  });
+}
+
 async function openEditor(idx) {
   const seq = (state.editorSeq = (state.editorSeq || 0) + 1);
   const wantNovel = state.novelId;
@@ -1563,6 +1721,54 @@ function bindEditor() {
   $("#diff-reroll").onclick = () => rerollPolish().catch((err) => toast(err.message, true));
   $("#reader-continue").onclick = () => continueFlow();
   $("#reader-rewrite").onclick = () => rewriteFlow();
+  $("#reader-history").onclick = () => openHistory().catch((err) => toast(err.message, true));
+  $("#history-close").onclick = () => { $("#history-backdrop").hidden = true; };
+  $("#history-backdrop").addEventListener("click", (e) => {
+    if (e.target === $("#history-backdrop")) $("#history-backdrop").hidden = true;
+  });
+  $("#history-ai").onclick = async () => {
+    const btn = $("#history-ai");
+    btn.disabled = true;
+    try {
+      const r = await apiSend(`/api/novels/${state.novelId}/chapters/${historyIdx}/ai-restore`, "POST");
+      toast(r.restored ? `AI 复原：${r.detail}` : `无需复原：${r.detail}`);
+      if (r.restored) {
+        $("#history-backdrop").hidden = true;
+        await openEditor(historyIdx);
+      } else {
+        await refreshHistory();
+      }
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+  $("#history-rows").addEventListener("click", async (e) => {
+    const view = e.target.closest("[data-hview]");
+    if (view) {
+      try {
+        const v = await api(`/api/novels/${state.novelId}/chapters/${historyIdx}/versions/${view.dataset.hview}`);
+        const pre = $("#history-preview");
+        pre.hidden = false;
+        pre.textContent = v.content || "";
+        pre.scrollTop = 0;
+      } catch (err) { toast(err.message, true); }
+      return;
+    }
+    const restore = e.target.closest("[data-hrestore]");
+    if (restore) {
+      const extra = state.editorDirty ? "编辑器里有未保存的修改也会被丢弃。" : "";
+      if (!confirm(`复原到该版本？当前稿会先自动留一份快照（以后还能再恢复）。${extra}`)) return;
+      try {
+        await apiSend(`/api/novels/${state.novelId}/chapters/${historyIdx}/versions/${restore.dataset.hrestore}/restore`, "POST");
+        toast("已复原该版本");
+        state.editorDirty = false;
+        $("#history-backdrop").hidden = true;
+        await openEditor(historyIdx);
+      } catch (err) { toast(err.message, true); }
+    }
+  });
   $("#gen-cancel").onclick = closeGen;
   $("#gen-apply").onclick = applyGen;
   $("#gen-retry").onclick = () => retryGen().catch((err) => toast(err.message, true));
@@ -2278,6 +2484,14 @@ async function loadSettingsForm() {
       sel.value = String(auditEvery);
       if (sel.value !== String(auditEvery)) sel.value = "1"; // 特殊值不在选项里时回退默认
     }
+    const autoFixGlobal = $("#set-auto-fix-global");
+    if (autoFixGlobal) autoFixGlobal.checked = p.auto_fix_global !== false;
+    const globalEvery = typeof p.global_review_every === "number" ? p.global_review_every : 10;
+    const gsel = $("#set-global-every");
+    if (gsel) {
+      gsel.value = String(globalEvery);
+      if (gsel.value !== String(globalEvery)) gsel.value = "10";
+    }
   } catch {
     /* 忽略：保持默认勾选状态 */
   }
@@ -2399,12 +2613,16 @@ function bindSettings() {
     const batchRaw = parseInt($("#set-auto-batch").value || "10", 10) || 10;
     const batch = Math.min(50, Math.max(1, batchRaw));
     const auditEvery = Math.min(100, Math.max(0, parseInt($("#set-audit-every").value || "1", 10) || 0));
+    const globalEvery = Math.min(100, Math.max(0, parseInt($("#set-global-every").value || "10", 10) || 0));
+    const autoFixGlobalEl = $("#set-auto-fix-global");
     try {
       await apiSend("/api/settings/pipeline", "PUT", {
         auto_fix_review: $("#set-auto-fix").checked,
         monthly_budget_tokens: budget,
         auto_batch: batch,
         foreshadow_audit_every: auditEvery,
+        auto_fix_global: autoFixGlobalEl ? autoFixGlobalEl.checked : true,
+        global_review_every: globalEvery,
       });
       const el = $("#pipeline-status");
       if (el) {
@@ -2428,6 +2646,19 @@ function bindSettings() {
     const v = parseInt($("#set-audit-every").value, 10) || 0;
     savePipeline(v === 0 ? "已关闭例行伏笔审核（一键处理时仍会审核）" : `伏笔审核已设为：每 ${v} 章一次`);
   });
+  const afg = $("#set-auto-fix-global");
+  if (afg) {
+    afg.addEventListener("change", () =>
+      savePipeline(afg.checked ? "已开启全局审校自动修复" : "已关闭全局审校自动修复（仍可手动按意见修复）"),
+    );
+  }
+  const ges = $("#set-global-every");
+  if (ges) {
+    ges.addEventListener("change", () => {
+      const v = parseInt(ges.value, 10) || 0;
+      savePipeline(v === 0 ? "已关闭例行全局审校（仍可手动随时跑）" : `全局审校已设为：每 ${v} 章一次`);
+    });
+  }
 }
 
 /* ---------------- 主题 / 引擎状态 ---------------- */
@@ -2485,6 +2716,7 @@ function init() {
   bindOutline();
   bindCreate();
   bindNovel();
+  bindGlobalReview();
   bindEditor();
   bindFormDialog();
   bindSettings();

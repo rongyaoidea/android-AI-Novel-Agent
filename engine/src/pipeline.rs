@@ -665,7 +665,7 @@ async fn run_inner(
             }
         }
 
-        engine.db.save_chapter_content(novel_id, idx, &content, "drafted")?;
+        engine.db.save_chapter_content_sourced(novel_id, idx, &content, "drafted", "draft")?;
         if let Some(r) = &report {
             engine.db
                 .save_chapter_style_report(novel_id, idx, &serde_json::to_string(r)?)?;
@@ -720,7 +720,7 @@ async fn run_inner(
             }
         }
 
-        engine.db.save_chapter_content(novel_id, idx, &content, "done")?;
+        engine.db.save_chapter_content_sourced(novel_id, idx, &content, "done", "draft")?;
         engine.db.update_run(run_id, "running", "draft", idx, None)?;
         wrote_in_run += 1;
     }
@@ -740,13 +740,15 @@ async fn run_inner(
     let _ = maybe_fill_volume_summaries(&engine, novel_id, last_done).await;
     // 伏笔自动审核（按设置间隔；1 = 每批都跑，N = 已完成章号逢 N 的倍数，0 = 关闭）
     if wrote_in_run > 0 {
-        let every = engine
-            .db
-            .pipeline_settings()
-            .unwrap_or_default()
-            .audit_every();
+        let settings = engine.db.pipeline_settings().unwrap_or_default();
+        let every = settings.audit_every();
         if every > 0 && (every == 1 || last_done % every == 0) {
             let _ = audit_foreshadowings(&engine, novel_id).await;
+        }
+        // 全局审校（按间隔；覆盖跨章一致性/节奏/支线状态，含自动定向修复）
+        let gevery = settings.global_every();
+        if gevery > 0 && last_done % gevery == 0 {
+            let _ = global_review_and_fix(&engine, novel_id, 2).await;
         }
     }
 
@@ -980,6 +982,493 @@ async fn maybe_fill_volume_summaries(
     Ok(made)
 }
 
+// ---------- 章节版本历史与 AI 复原 ----------
+
+/// 一版正文的综合评分（本地、零 token）：文风分 -（未解决的中/高危意见 × 20）- 篇幅塌陷罚分
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotScore {
+    pub words: i64,
+    pub open_issues: usize,
+    pub style: Option<i64>,
+    pub score: i64,
+}
+
+pub fn score_snapshot(
+    content: &str,
+    review_json: Option<&str>,
+    style_report: &str,
+    max_words: i64,
+) -> SnapshotScore {
+    let words = content.chars().count() as i64;
+    let open_issues = review_json
+        .and_then(|raw| serde_json::from_str::<Review>(raw).ok())
+        .map(|r| {
+            r.issues
+                .iter()
+                .filter(|i| !is_style_issue(i))
+                .filter(|i| i.status != "fixed")
+                .filter(|i| i.severity == "high" || i.severity == "medium")
+                .count()
+        })
+        .unwrap_or(0);
+    let style: Option<i64> = serde_json::from_str::<crate::style_check::StyleReport>(style_report)
+        .ok()
+        .map(|r| r.score() as i64);
+    let mut score = style.unwrap_or(60);
+    score -= (open_issues as i64) * 20;
+    if max_words > 0 && words * 100 < max_words * 40 {
+        score -= 25; // 不足最长版本 40%：更像异常截断而不是有意精简
+    }
+    SnapshotScore {
+        words,
+        open_issues,
+        style,
+        score,
+    }
+}
+
+/// AI 复原：在当前稿与历史快照之间选「综合最优」；只有严格更优才恢复（本地评分，零 token）。
+/// 返回 Some(说明) 表示发生了一次复原，事件流里会看到「AI 复原」提示。
+pub async fn ai_restore_chapter(
+    engine: &Arc<Engine>,
+    novel_id: &str,
+    idx: i64,
+    via: &str,
+) -> anyhow::Result<Option<String>> {
+    let Some(ch) = engine.db.get_chapter(novel_id, idx)? else {
+        return Ok(None);
+    };
+    if ch.content.trim().is_empty() {
+        return Ok(None);
+    }
+    let versions = engine.db.list_chapter_versions(novel_id, idx)?;
+    if versions.is_empty() {
+        return Ok(None);
+    }
+    let max_words = versions
+        .iter()
+        .map(|v| v.content.chars().count() as i64)
+        .chain([ch.content.chars().count() as i64])
+        .max()
+        .unwrap_or(0);
+    let cur = score_snapshot(&ch.content, ch.review_json.as_deref(), &ch.style_report, max_words);
+    let mut best: Option<(&crate::models::ChapterVersion, SnapshotScore)> = None;
+    for v in &versions {
+        if v.content.trim().is_empty() {
+            continue;
+        }
+        let s = score_snapshot(&v.content, v.review_json.as_deref(), &v.style_report, max_words);
+        match &best {
+            Some((_, bs)) if bs.score >= s.score => {}
+            _ => best = Some((v, s)),
+        }
+    }
+    let Some((v, vs)) = best else {
+        return Ok(None);
+    };
+    if vs.score <= cur.score {
+        return Ok(None);
+    }
+    if !engine
+        .db
+        .restore_chapter_version(novel_id, idx, &v.id, via)?
+    {
+        return Ok(None);
+    }
+    engine.hub.publish(novel_id, EngineEvent::ChapterSaved {
+        chapter_idx: idx,
+        title: ch.title.clone(),
+        words: vs.words.max(0) as usize,
+    });
+    let why = format!(
+        "问题 {} → {} 条，评分 {} → {}（快照 {}）",
+        cur.open_issues,
+        vs.open_issues,
+        cur.score,
+        vs.score,
+        v.created_at.chars().take(16).collect::<String>()
+    );
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "autofix".into(),
+        message: format!("AI 复原：第 {idx} 章已恢复更优快照（{why}）"),
+    });
+    Ok(Some(why))
+}
+
+// ---------- 全局（跨章）审校 ----------
+
+/// 全局审校意见的跨轮归并：文案相似视为同一条，不再出现的标 fixed，多出来的标「新发现」
+pub fn merge_global_issues(previous: &[GlobalIssue], latest: &[GlobalIssue]) -> Vec<GlobalIssue> {
+    let mut out: Vec<GlobalIssue> = Vec::new();
+    let mut matched: Vec<bool> = vec![false; latest.len()];
+    for p in previous {
+        if p.status == "fixed" {
+            out.push(p.clone());
+            continue;
+        }
+        let hit = latest
+            .iter()
+            .enumerate()
+            .find(|(i, l)| !matched[*i] && notes_similar(&p.note, &l.note));
+        match hit {
+            Some((i, l)) => {
+                matched[i] = true;
+                out.push(GlobalIssue {
+                    status: "open".into(),
+                    is_new: false,
+                    ..l.clone()
+                });
+            }
+            None => out.push(GlobalIssue {
+                status: "fixed".into(),
+                ..p.clone()
+            }),
+        }
+    }
+    for (i, l) in latest.iter().enumerate() {
+        if !matched[i] {
+            out.push(GlobalIssue {
+                status: "open".into(),
+                is_new: true,
+                ..l.clone()
+            });
+        }
+    }
+    out
+}
+
+/// 跑一次全局审校（全书视角）：设定 + 卷摘要 + 逐章摘要 + 台账 → 跨章问题（含跨轮状态归并）
+pub async fn run_global_review(
+    engine: &Arc<Engine>,
+    novel_id: &str,
+) -> anyhow::Result<GlobalReview> {
+    let novel = engine
+        .db
+        .get_novel(novel_id)?
+        .ok_or_else(|| anyhow::anyhow!("novel not found: {novel_id}"))?;
+    let summaries_list = engine.db.list_chapter_summaries(novel_id)?;
+    let with_summary = summaries_list
+        .iter()
+        .filter(|(_, _, s)| !s.trim().is_empty())
+        .count();
+    if with_summary < 3 {
+        // 章节太少，跨章问题没有统计意义
+        return Ok(GlobalReview {
+            ok: true,
+            issues: Vec::new(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        });
+    }
+    let lines: Vec<String> = summaries_list
+        .iter()
+        .filter(|(_, _, s)| !s.trim().is_empty())
+        .map(|(idx, title, summary)| format!("第{}章 {}：{}", idx, title, summary.trim()))
+        .collect();
+    let summaries_text = tail_chars(&lines.join("\n"), 6000);
+    let volumes = engine.db.list_volume_summaries(novel_id)?;
+    let vol_text = volumes
+        .iter()
+        .rev()
+        .take(5)
+        .rev()
+        .map(|v| format!("第{}卷（至第{}章）：{}", v.volume_idx, v.upto_chapter, v.summary.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let last_idx = summaries_list.iter().map(|(i, _, _)| *i).max().unwrap_or(0);
+    let ledger = ledger_context(&engine.db, novel_id, last_idx + 1).unwrap_or_default();
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "review".into(),
+        message: "全局审校：正在检查跨章一致性、节奏与支线…".into(),
+    });
+    let settings = engine.llm_settings()?;
+    let llm = Llm::new(settings.clone());
+    let ov = engine.prompt_overrides();
+    let (sys, usr) = crate::prompts::global_review_prompt(
+        &novel.title,
+        &novel.genre,
+        &novel.logline,
+        &novel.worldview,
+        with_summary as i64,
+        &vol_text,
+        &summaries_text,
+        &ledger,
+        &ov,
+    );
+    let out = llm.complete(&sys, &usr).await?;
+    record_usage(&engine.db, Some(novel_id), None, "global_review", &settings, &out.usage);
+    let raw = out.text;
+    let parsed = extract_json_object(&raw)
+        .filter(|j| j["issues"].is_array())
+        .map(|j| GlobalReview {
+            ok: j["ok"].as_bool().unwrap_or(true),
+            issues: j["issues"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|it| GlobalIssue {
+                            severity: str_field(it, "severity", "info"),
+                            note: str_field(it, "note", ""),
+                            affected_chapters: it["affected_chapters"]
+                                .as_array()
+                                .map(|x| x.iter().filter_map(|v| v.as_i64()).collect())
+                                .unwrap_or_default(),
+                            suggestion: str_field(it, "suggestion", ""),
+                            status: "open".into(),
+                            is_new: false,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            updated_at: String::new(),
+        })
+        .ok_or_else(|| anyhow::anyhow!("全局审校输出无法解析（缺 issues 数组）"))?;
+    let previous = engine
+        .db
+        .get_global_review(novel_id)?
+        .map(|g| g.issues)
+        .unwrap_or_default();
+    let review = GlobalReview {
+        ok: parsed.ok,
+        issues: merge_global_issues(&previous, &parsed.issues),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    engine.db.save_global_review(novel_id, &review)?;
+    Ok(review)
+}
+
+/// 按一条全局意见定向修复一个受影响章节：修复 → 章节级复核 → 若综合分反而更差则 AI 复原
+async fn fix_chapter_by_global_issue(
+    engine: &Arc<Engine>,
+    novel_id: &str,
+    issue: &GlobalIssue,
+    style: Option<&crate::styles::StylePreset>,
+    ov: &crate::prompts::Overrides,
+) -> anyhow::Result<bool> {
+    let settings = engine.llm_settings()?;
+    let llm = Llm::new(settings.clone());
+    for idx in &issue.affected_chapters {
+        let Some(ch) = engine.db.get_chapter(novel_id, *idx)? else {
+            continue;
+        };
+        if ch.content.trim().is_empty() {
+            continue;
+        }
+        let instruction = format!(
+            "全局审校意见（跨章问题）：{}。修改建议：{}",
+            issue.note.trim(),
+            issue.suggestion.trim()
+        );
+        engine.hub.publish(novel_id, EngineEvent::Stage {
+            stage: "autofix".into(),
+            message: format!("全局审校：按意见修复第 {idx} 章…"),
+        });
+        let (fsys, fusr) = crate::prompts::rewrite_prompt(
+            "revise",
+            &ch.title,
+            &ch.goal,
+            &ch.content,
+            &instruction,
+            style,
+            ov,
+        );
+        match llm.complete(&fsys, &fusr).await {
+            Ok(out) => {
+                record_usage(
+                    &engine.db,
+                    Some(novel_id),
+                    Some(*idx),
+                    "global_fix",
+                    &settings,
+                    &out.usage,
+                );
+                let new = out.text.trim().to_string();
+                let old_words = ch.content.chars().count();
+                if new.is_empty() || new == ch.content || new.chars().count() * 2 < old_words {
+                    tracing::warn!("global fix chapter {idx}: 结果为空/等长/疑似截断，放弃");
+                    continue;
+                }
+                engine
+                    .db
+                    .save_chapter_content_sourced(novel_id, *idx, &new, "done", "global-fix")?;
+                // 章节级复核（含自动修复）
+                let mut content = new.clone();
+                if let Err(e) = review_and_fix_chapter(
+                    engine, novel_id, *idx, &ch.title, &ch.goal, &mut content, style, ov,
+                )
+                .await
+                {
+                    tracing::warn!("chapter {idx} post-global-fix review failed: {e:#}");
+                }
+                if ch.status == "done" {
+                    let _ = engine
+                        .db
+                        .save_chapter_content_sourced(novel_id, *idx, &content, "done", "global-fix");
+                }
+                // 若修复后综合分反而更差，交给 AI 复原（恢复修复前快照）
+                let _ = ai_restore_chapter(engine, novel_id, *idx, "ai-restore").await;
+                return Ok(true);
+            }
+            Err(e) => {
+                tracing::warn!("global fix chapter {idx} failed: {e:#}");
+                return Ok(false);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// 全局审校 + 自动定向修复：修复过至少一章后复检一次（状态自动归并）
+pub async fn global_review_and_fix(
+    engine: &Arc<Engine>,
+    novel_id: &str,
+    fix_limit: usize,
+) -> anyhow::Result<(GlobalReview, usize)> {
+    let review = run_global_review(engine, novel_id).await?;
+    let settings = engine.db.pipeline_settings().unwrap_or_default();
+    let targets: Vec<GlobalIssue> = if settings.auto_fix_global && fix_limit > 0 {
+        review
+            .issues
+            .iter()
+            .filter(|i| {
+                i.status == "open"
+                    && (i.severity == "high" || i.severity == "medium")
+                    && !i.affected_chapters.is_empty()
+            })
+            .take(fix_limit)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if targets.is_empty() {
+        return Ok((review, 0));
+    }
+    let style_id = engine
+        .db
+        .get_novel(novel_id)?
+        .map(|n| n.style_preset)
+        .unwrap_or_default();
+    let style = crate::styles::find(&style_id);
+    let ov = engine.prompt_overrides();
+    let mut fixed = 0usize;
+    for issue in &targets {
+        if engine.stop_requested(novel_id) {
+            engine.clear_stop(novel_id);
+            break;
+        }
+        if fix_chapter_by_global_issue(engine, novel_id, issue, style, &ov)
+            .await
+            .unwrap_or(false)
+        {
+            fixed += 1;
+        }
+    }
+    if fixed == 0 {
+        return Ok((review, 0));
+    }
+    // 复检一次：消失的意见自动转 fixed，仍存在的保持 open（「新发现」只给真正的新问题）
+    let refreshed = run_global_review(engine, novel_id).await?;
+    Ok((refreshed, fixed))
+}
+
+/// 后台运行一次全局审校（含自动修复）；占用与「一键处理」同一名额，结束后自动释放
+pub fn spawn_global_review(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<()> {
+    if !engine.begin_review(novel_id) {
+        anyhow::bail!("已有一轮审校处理在进行中");
+    }
+    let slot = ReviewSlot {
+        engine: engine.clone(),
+        novel_id: novel_id.to_string(),
+    };
+    let nid = novel_id.to_string();
+    tokio::spawn(async move {
+        let _slot = slot;
+        match global_review_and_fix(&engine, &nid, 3).await {
+            Ok((r, fixed)) => {
+                let open = r.issues.iter().filter(|i| i.status != "fixed").count();
+                engine.hub.publish(&nid, EngineEvent::Stage {
+                    stage: "done".into(),
+                    message: format!(
+                        "全局审校完成：共 {} 条意见（仍存在 {}），自动修复 {fixed} 章",
+                        r.issues.len(),
+                        open
+                    ),
+                });
+            }
+            Err(e) => {
+                engine.hub.publish(&nid, EngineEvent::Stage {
+                    stage: "done".into(),
+                    message: format!("全局审校失败：{e:#}"),
+                });
+            }
+        }
+    });
+    Ok(())
+}
+
+/// 后台按指定的一条全局意见定向修复（手动触发）；结束前复检刷新状态
+pub fn spawn_global_issue_fix(
+    engine: Arc<Engine>,
+    novel_id: &str,
+    index: usize,
+) -> anyhow::Result<()> {
+    if !engine.begin_review(novel_id) {
+        anyhow::bail!("已有一轮审校处理在进行中");
+    }
+    let slot = ReviewSlot {
+        engine: engine.clone(),
+        novel_id: novel_id.to_string(),
+    };
+    let nid = novel_id.to_string();
+    tokio::spawn(async move {
+        let _slot = slot;
+        let issue = engine
+            .db
+            .get_global_review(&nid)
+            .ok()
+            .flatten()
+            .and_then(|r| r.issues.get(index).cloned());
+        let Some(issue) = issue else {
+            engine.hub.publish(&nid, EngineEvent::Stage {
+                stage: "done".into(),
+                message: "全局审校：未找到该条意见（可能已刷新）".into(),
+            });
+            return;
+        };
+        let style_id = engine
+            .db
+            .get_novel(&nid)
+            .ok()
+            .flatten()
+            .map(|n| n.style_preset)
+            .unwrap_or_default();
+        let style = crate::styles::find(&style_id);
+        let ov = engine.prompt_overrides();
+        match fix_chapter_by_global_issue(&engine, &nid, &issue, style, &ov).await {
+            Ok(true) => {
+                let _ = run_global_review(&engine, &nid).await;
+                engine.hub.publish(&nid, EngineEvent::Stage {
+                    stage: "done".into(),
+                    message: "全局审校：该意见的定向修复已完成（状态已刷新）".into(),
+                });
+            }
+            Ok(false) => {
+                engine.hub.publish(&nid, EngineEvent::Stage {
+                    stage: "done".into(),
+                    message: "全局审校：该意见暂无可修复的章节（可能未指明章节或章节为空）".into(),
+                });
+            }
+            Err(e) => {
+                engine.hub.publish(&nid, EngineEvent::Stage {
+                    stage: "done".into(),
+                    message: format!("全局审校修复失败：{e:#}"),
+                });
+            }
+        }
+    });
+    Ok(())
+}
+
 /// 组装台账上下文：活跃角色事实（最近 6 人 × 3 条）+ 未回收伏笔（最多 8 条，标注已拖延章数）
 fn ledger_context(db: &crate::db::Db, novel_id: &str, current_idx: i64) -> anyhow::Result<String> {
     let mut s = String::new();
@@ -1157,10 +1646,14 @@ pub async fn review_and_fix_chapter(
                                                 None
                                             }
                                         };
+                                    // 篇幅兜底：修复稿不足原稿一半视为疑似截断，不采纳（版本快照仍保留可回溯）
+                                    let words_ok =
+                                        fixed.chars().count() * 2 >= content.chars().count().max(1);
                                     let better = rechecked
                                         .as_ref()
                                         .map(|list| list.len() < review.issues.len())
-                                        .unwrap_or(false);
+                                        .unwrap_or(false)
+                                        && words_ok;
                                     if better {
                                         let before = review.issues.len();
                                         let previous_issues = review.issues.clone();
@@ -1184,8 +1677,8 @@ pub async fn review_and_fix_chapter(
                                             );
                                             report = Some(r2);
                                         }
-                                        engine.db.save_chapter_content(
-                                            novel_id, idx, &content, "drafted",
+                                        engine.db.save_chapter_content_sourced(
+                                            novel_id, idx, &content, "drafted", "autofix",
                                         )?;
                                         engine.hub.publish(novel_id, EngineEvent::ChapterSaved {
                                             chapter_idx: idx,
@@ -1202,10 +1695,17 @@ pub async fn review_and_fix_chapter(
                                     } else {
                                         engine.hub.publish(novel_id, EngineEvent::Stage {
                                             stage: "autofix".into(),
-                                            message: format!(
-                                                "第 {idx} 章自动修复未比原稿更好，保留原稿（仍存在 {} 条意见，可打开章节逐条处理或点「重新审校」）",
-                                                review.issues.iter().filter(|i| i.status != "fixed").count()
-                                            ),
+                                            message: if !words_ok {
+                                                format!(
+                                                    "第 {idx} 章自动修复稿篇幅异常（疑似截断），保留原稿（仍存在 {} 条意见）",
+                                                    review.issues.iter().filter(|i| i.status != "fixed").count()
+                                                )
+                                            } else {
+                                                format!(
+                                                    "第 {idx} 章自动修复未比原稿更好，保留原稿（仍存在 {} 条意见，可打开章节逐条处理或点「重新审校」）",
+                                                    review.issues.iter().filter(|i| i.status != "fixed").count()
+                                                )
+                                            },
                                         });
                                     }
                                 }
@@ -1470,22 +1970,24 @@ pub fn apply_foreshadow_audit(
     n
 }
 
+/// 审校名额守卫：无论函数从哪条路径返回、任务如何结束（含 panic），Drop 都会释放
+struct ReviewSlot {
+    engine: Arc<Engine>,
+    novel_id: String,
+}
+
+impl Drop for ReviewSlot {
+    fn drop(&mut self) {
+        self.engine.end_review(&self.novel_id);
+    }
+}
+
 /// 「AI 处理全部审校」：对有内容的、存在待处理问题的章节重新审校并自动修复。
 /// 返回待处理章节数（0 = 都已处理）；后台执行，进度经 SSE 推送。
 /// 同一本书同时只允许一轮（Engine 里有名额）；处理期间可被「停止」中断，且与创作运行互斥。
 pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i64> {
     if !engine.begin_review(novel_id) {
         anyhow::bail!("已有一轮审校处理在进行中");
-    }
-    // 名额守卫：无论函数从哪条路径返回、任务如何结束（含 panic），Drop 都会释放
-    struct ReviewSlot {
-        engine: Arc<Engine>,
-        novel_id: String,
-    }
-    impl Drop for ReviewSlot {
-        fn drop(&mut self) {
-            self.engine.end_review(&self.novel_id);
-        }
     }
     let slot = ReviewSlot {
         engine: engine.clone(),
@@ -1553,8 +2055,10 @@ pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i
                     // 保持定稿状态：内部采纳修复稿时会以 drafted 落库，这里恢复 done，
                     // 否则下一轮「继续创作」会按章纲整章重写、覆盖刚修好的稿
                     if ch.status == "done" {
-                        let _ = engine.db.save_chapter_content(&nid, *idx, &content, "done");
+                        let _ = engine.db.save_chapter_content_sourced(&nid, *idx, &content, "done", "review-all");
                     }
+                    // AI 复原检查：若处理过程把综合分改差（问题变多/篇幅塌陷），自动恢复更优快照
+                    let _ = ai_restore_chapter(&engine, &nid, *idx, "ai-restore").await;
                 }
                 Err(e) => tracing::warn!("review-all chapter {idx} failed: {e:#}"),
             }
@@ -1573,9 +2077,24 @@ pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i
             .unwrap_or(0);
         let _ = maybe_fill_volume_summaries(&engine, &nid, last_done).await;
         let resolved = audit_foreshadowings(&engine, &nid).await.unwrap_or(0);
+        // 阶段三：全局审校（跨章一致性/节奏/支线；含自动定向修复与复检）
+        let (gr, gfixed) = match global_review_and_fix(&engine, &nid, 3).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("global review in review-all failed: {e:#}");
+                (GlobalReview { ok: true, issues: Vec::new(), updated_at: String::new() }, 0)
+            }
+        };
+        let gopen = gr.issues.iter().filter(|i| i.status != "fixed").count();
         let message = if total > 0 {
             format!(
-                "AI 审校处理完成：复核 {total} 章，消化 {digested} 条问题；伏笔自动审核回收 {resolved} 条"
+                "AI 审校处理完成：复核 {total} 章，消化 {digested} 条问题；全局审校 {} 条（仍存在 {gopen}，自动修复 {gfixed} 章）；伏笔自动审核回收 {resolved} 条",
+                gr.issues.len()
+            )
+        } else if !gr.issues.is_empty() {
+            format!(
+                "章节审校均已处理；全局审校 {} 条（仍存在 {gopen}，自动修复 {gfixed} 章）；伏笔自动审核回收 {resolved} 条",
+                gr.issues.len()
             )
         } else {
             format!("章节审校均已处理；伏笔自动审核回收 {resolved} 条")
@@ -1903,6 +2422,114 @@ mod tests {
         // 幂等：再跑一次不重复生成
         let again = maybe_fill_volume_summaries(&engine, &novel.id, 20).await.unwrap();
         assert_eq!(again, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_global_issues_reuses_status_lifecycle() {
+        use crate::models::GlobalIssue;
+        let gi = |note: &str, status: &str| GlobalIssue {
+            severity: "medium".into(),
+            note: note.into(),
+            affected_chapters: vec![2],
+            suggestion: String::new(),
+            status: status.into(),
+            is_new: false,
+        };
+        let previous = vec![
+            gi("连续三章缺乏冲突升级", "open"),
+            gi("主角目标模糊，读者不知道他想干什么", "open"),
+        ];
+        let latest = vec![
+            gi("连续三章缺乏冲突升级（第 5~7 章）", "open"),
+            gi("第 9 章信息过载，塞入了太多新设定", "open"),
+        ];
+        let merged = merge_global_issues(&previous, &latest);
+        assert_eq!(merged.len(), 3);
+        let find = |n: &str| merged.iter().find(|i| i.note.contains(n)).unwrap();
+        assert_eq!(find("连续三章").status, "open");
+        assert!(!find("连续三章").is_new, "换措辞的描述应归并为同一条");
+        assert!(find("连续三章").note.contains("第 5~7 章"), "采用新表述");
+        assert_eq!(find("主角目标模糊").status, "fixed");
+        assert_eq!(find("信息过载").status, "open");
+        assert!(find("信息过载").is_new);
+    }
+
+    #[tokio::test]
+    async fn ai_restore_picks_better_version() {
+        let dir = tmp_dir("airestore");
+        let engine = std::sync::Arc::new(Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap());
+        engine
+            .db
+            .set_llm_settings(&crate::models::LlmSettings::default())
+            .unwrap();
+        let novel = engine.db.create_novel("AI 复原测试", "auto", "").unwrap();
+        engine
+            .db
+            .upsert_chapter_plan(
+                &novel.id,
+                &crate::models::ChapterPlan {
+                    idx: 1,
+                    title: "第一章".into(),
+                    goal: String::new(),
+                    beats: vec![],
+                },
+            )
+            .unwrap();
+        // 第一版：篇幅正常、带 1 条 high open
+        engine
+            .db
+            .save_chapter_content(
+                &novel.id,
+                1,
+                "第一版正文，内容较长，至少要有足够的字数用于评分比较。",
+                "done",
+            )
+            .unwrap();
+        let review_one = crate::models::Review {
+            ok: false,
+            issues: vec![ReviewIssue {
+                severity: "high".into(),
+                note: "开场冲突不足".into(),
+                quote: String::new(),
+                status: "open".into(),
+                is_new: false,
+                stale: false,
+            }],
+        };
+        engine.db.save_chapter_review(&novel.id, 1, &review_one).unwrap();
+        // 覆盖为更差版本：极短 + 3 条 open（旧版自动留档，带其审校快照）
+        engine
+            .db
+            .save_chapter_content_sourced(&novel.id, 1, "第二版，太短。", "done", "manual")
+            .unwrap();
+        let review_three = crate::models::Review {
+            ok: false,
+            issues: (0..3)
+                .map(|i| ReviewIssue {
+                    severity: "medium".into(),
+                    note: format!("问题{i}"),
+                    quote: String::new(),
+                    status: "open".into(),
+                    is_new: false,
+                    stale: false,
+                })
+                .collect(),
+        };
+        engine.db.save_chapter_review(&novel.id, 1, &review_three).unwrap();
+
+        // AI 复原：旧版（1 问题 + 篇幅正常）综合分更高 → 应恢复
+        let changed = ai_restore_chapter(&engine, &novel.id, 1, "ai-restore").await.unwrap();
+        assert!(changed.is_some(), "应发生一次复原");
+        let ch = engine.db.get_chapter(&novel.id, 1).unwrap().unwrap();
+        assert!(ch.content.contains("第一版正文"), "{}", ch.content);
+        assert!(
+            ch.review_json.as_deref().unwrap_or("").contains("开场冲突不足"),
+            "复原的审校应与其正文是一致快照"
+        );
+        // 已是综合最优：再跑一次不应再改
+        let again = ai_restore_chapter(&engine, &novel.id, 1, "ai-restore").await.unwrap();
+        assert!(again.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

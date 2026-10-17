@@ -11,8 +11,6 @@
 //! 判定分两档：`passed`（是否满足）与 `hard`（不满足时是否算硬伤）。
 //! 硬伤会触发流水线的自动重写（最多一次），软伤只进审校提醒。
 
-use serde::Serialize;
-
 use crate::models::ReviewIssue;
 use crate::styles::StylePreset;
 
@@ -37,7 +35,7 @@ pub const MODERN_WORDS: &[&str] = &[
     "及时止损",
 ];
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct CheckItem {
     pub name: String,
     pub passed: bool,
@@ -46,7 +44,7 @@ pub struct CheckItem {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StyleReport {
     pub style: String,
     pub ok: bool,
