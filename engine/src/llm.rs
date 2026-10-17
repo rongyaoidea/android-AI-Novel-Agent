@@ -689,6 +689,31 @@ fn mock_complete(user: &str) -> anyhow::Result<String> {
         // 离线演示不臆造跨章问题（保持审校系统可预测）
         return Ok(serde_json::json!({"ok": true, "issues": []}).to_string());
     }
+    if user.contains("TASK:volume_review") {
+        // 离线演示给一条温和建议，便于验证报告链路
+        return Ok(serde_json::json!({
+            "ok": true,
+            "findings": [{
+                "severity": "low",
+                "note": "（模拟）本卷中段节奏偏平：第 3~5 章强度都较低",
+                "chapters": [3, 4, 5],
+                "suggestion": "给第 4 章补一个动作截断钩，把强度提到 3"
+            }]
+        })
+        .to_string());
+    }
+    if user.contains("TASK:reader_review") {
+        return Ok(serde_json::json!({
+            "overall_score": 7.5,
+            "overall_comment": "（模拟）开篇信息量合适，但第 2 章推进略慢",
+            "chapters": [
+                {"idx": 1, "score": 8, "verdict": "（模拟）开场冲突到位", "issues": []},
+                {"idx": 2, "score": 7, "verdict": "（模拟）节奏略缓", "issues": ["中段信息密度偏低"]},
+                {"idx": 3, "score": 8, "verdict": "（模拟）核心契约清楚", "issues": []}
+            ]
+        })
+        .to_string());
+    }
     if user.contains("TASK:review") {
         return Ok(serde_json::json!({
             "ok": true,

@@ -1064,6 +1064,115 @@ async function openHealth() {
     .join("");
   $("#health-status").textContent = "";
   $("#health-backdrop").hidden = false;
+  loadHealthExtras().catch(() => {});
+}
+
+/** 书籍体检扩展块：卷末体检报告 + 文体统计（本地零 token；失败不影响主体检） */
+async function loadHealthExtras() {
+  const id = state.novelId;
+  $("#health-volume-reports").textContent = "加载中…";
+  $("#health-style-stats").textContent = "加载中…";
+  // 文体统计
+  try {
+    const s = await api(`/api/novels/${id}/style-stats`);
+    let html = `<div class="chips"><span class="chip">篇章 ${s.chapters}</span><span class="chip">字数中位数 ${s.median_words}</span>`;
+    for (const o of (s.word_outliers || []).slice(0, 6)) {
+      html += `<span class="chip chip-warning">第${o.idx}章 ${esc(o.kind)}（${o.words}字）</span>`;
+    }
+    html += `</div>`;
+    const reps = s.repeated_sentences || [];
+    if (reps.length) {
+      html += `<p class="muted" style="margin:8px 0 2px;">跨章重复句（Top ${Math.min(8, reps.length)}；连续的重复句式是 AI 味头号特征）：</p>`;
+      html += reps
+        .slice(0, 8)
+        .map(
+          (r) =>
+            `<p class="health-line">${ic("i-flag")}<span>「${esc(String(r.sentence).slice(0, 42))}」× ${r.count} 章（第 ${(r.chapters || []).join("、")} 章）</span></p>`,
+        )
+        .join("");
+    } else if (s.chapters > 0) {
+      html += `<p class="muted" style="margin:6px 0 0;">未发现跨章重复句。</p>`;
+    }
+    if (s.same_ending_ratio >= 0.7 && s.chapters >= 4) {
+      html += `<p class="health-line">${ic("i-flag")}<span>章末类型偏单一（最高占比 ${Math.round(s.same_ending_ratio * 100)}%）：建议变换断章方式（动作截断/疑问/信息投放交替）</span></p>`;
+    }
+    if (state.novelId !== id) return;
+    $("#health-style-stats").innerHTML = html;
+  } catch (e) {
+    $("#health-style-stats").textContent = "加载失败：" + e.message;
+  }
+  // 卷末体检报告
+  try {
+    const r = await api(`/api/novels/${id}/volume-reports`);
+    const items = r.items || [];
+    if (state.novelId !== id) return;
+    if (!items.length) {
+      $("#health-volume-reports").innerHTML = `<p class="muted" style="margin:0;">写满 20 章后自动生成第一卷体检；缺失的报告会在下次创作/巡检时自动补跑。</p>`;
+    } else {
+      $("#health-volume-reports").innerHTML = items
+        .map((v) => {
+          const findings = (v.report && v.report.findings) || [];
+          const head = `<div class="chips"><span class="chip chip-info">第 ${v.volume_idx} 卷（至第 ${v.upto_chapter} 章）</span>${
+            findings.length
+              ? `<span class="chip chip-warning">${findings.length} 条建议</span>`
+              : `<span class="chip chip-success">无明显问题</span>`
+          }</div>`;
+          const lines = findings
+            .map((f) => {
+              const chs = (f.chapters || []).length ? `（第 ${(f.chapters || []).join("、")} 章）` : "";
+              const sug = f.suggestion ? ` → ${esc(f.suggestion)}` : "";
+              return `<p class="health-line">${ic("i-flag")}<span>[${esc(f.severity || "")}] ${esc(f.note || "")}${chs}${sug}</span></p>`;
+            })
+            .join("");
+          return `<div style="margin:8px 0;">${head}${lines}</div>`;
+        })
+        .join("");
+    }
+  } catch (e) {
+    $("#health-volume-reports").textContent = "加载失败：" + e.message;
+  }
+}
+
+/** 读者视角评审：按区间调用（黄金三章 / 前 10 / 最近 10） */
+async function runReaderReview() {
+  const pick = $("#readerv-range").value;
+  let from = 1;
+  let to = 3;
+  if (pick === "first10") {
+    to = 10;
+  } else if (pick === "last10") {
+    const done = (state.novel?.chapters || []).filter((c) => c.status === "done" && (c.words || 0) > 0);
+    if (!done.length) {
+      toast("还没有已写正文的章节", true);
+      return;
+    }
+    to = done[done.length - 1].idx;
+    from = Math.max(1, to - 9);
+  }
+  const btn = $("#readerv-run");
+  btn.disabled = true;
+  $("#readerv-status").textContent = "AI 正在以读者视角评审…";
+  try {
+    const r = await apiSend(`/api/novels/${state.novelId}/reader-review`, "POST", { from, to });
+    const res = r.result || {};
+    const chapters = res.chapters || [];
+    $("#readerv-result").innerHTML =
+      `<div class="chips"><span class="chip chip-info">总评 ${esc(String(res.overall_score ?? "—"))}/10</span>${r.golden ? `<span class="chip chip-warning">黄金三章专项</span>` : ""}</div>` +
+      `<p class="muted" style="margin:6px 0;">${esc(res.overall_comment || "")}</p>` +
+      chapters
+        .map(
+          (c) =>
+            `<p class="health-line">${ic("i-flag")}<span>第 ${c.idx} 章 ${esc(String(c.score ?? "—"))}/10：${esc(c.verdict || "")}${
+              (c.issues || []).length ? `（${(c.issues || []).map(esc).join("；")}）` : ""
+            }</span></p>`,
+        )
+        .join("");
+    $("#readerv-status").textContent = `已完成（第 ${r.from}~${r.to} 章，覆盖 ${r.included} 章）`;
+  } catch (err) {
+    $("#readerv-status").textContent = "评审失败：" + err.message;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function fillMissing() {
@@ -1090,6 +1199,8 @@ const USAGE_TASK_LABEL = {
   outline: "章节规划",
   chapter: "正文生成",
   chapter_retry: "文风重写",
+  volume_review: "卷末体检",
+  reader_review: "读者视角评审",
   auto_fix: "自动修复",
   review: "章节审校",
   polish: "选段修文",
@@ -1481,6 +1592,7 @@ function bindNovel() {
   $("#novel-health").onclick = () => openHealth().catch((err) => toast(err.message, true));
   $("#health-close").onclick = () => { $("#health-backdrop").hidden = true; };
   $("#health-fill").onclick = () => fillMissing().catch((err) => toast(err.message, true));
+  $("#readerv-run").onclick = () => runReaderReview();
   $("#novel-usage").onclick = () => openUsage().catch((err) => toast(err.message, true));
   $("#usage-close").onclick = () => { $("#usage-backdrop").hidden = true; };
   $("#stream-clear").onclick = () => {

@@ -270,9 +270,53 @@ static GLOBAL_REVIEW: TaskSpec = TaskSpec {
 没有达到标准的跨章问题就返回空数组；不要为了凑数报告小问题。\n",
 };
 
+static VOLUME_REVIEW: TaskSpec = TaskSpec {
+    id: "volume_review",
+    label: "卷末体检",
+    desc: "卷边界从留存与爽感角度复查节奏 / 爽点 / 伏笔 / 支线 / 字数（JSON）",
+    vars: &[
+        VarSpec { name: "volume_idx", desc: "卷号", sample: "1" },
+        VarSpec { name: "from", desc: "起始章号", sample: "1" },
+        VarSpec { name: "to", desc: "结束章号", sample: "20" },
+        VarSpec { name: "volume_summary", desc: "本卷卷级摘要", sample: "本卷行至第 20 章：主角逐步逼近真相……" },
+        VarSpec { name: "chapter_lines", desc: "逐章概览（标题/强度/钩型/字数/摘要）", sample: "第1章 风起｜强度2｜钩-危机｜2400字｜主角在码头接到陌生人传话" },
+        VarSpec { name: "foreshadow_text", desc: "未回收伏笔（含拖延章数；可能为空）", sample: "录音笔（第1章埋下，拖 15 章）" },
+        VarSpec { name: "stylestat_text", desc: "本地文体统计摘要", sample: "篇章 20 章；字数中位数 2400 字；字数异常 1 处；……" },
+    ],
+    default_system: "你是网文读者代表兼结构编辑。只输出一个 JSON 对象，不要输出其他文字、不要使用 Markdown 代码块。",
+    default_user: "TASK:volume_review\n第 {{volume_idx}} 卷（第 {{from}}~{{to}} 章）体检。\n卷摘要：{{volume_summary}}\n\n\
+【逐章概览】\n{{chapter_lines}}\n\n【未回收伏笔】\n{{foreshadow_text}}\n\n【文体统计】\n{{stylestat_text}}\n\n\
+请从「留存与爽感」角度找出会影响追读的问题（最多 6 条，宁缺毋滥；没有问题就返回空数组），输出 JSON：\n\
+- ok: 布尔，是否存在值得修的问题\n\
+- findings: 数组，每项 {\"severity\": \"high|medium|low\", \"note\": \"问题（一句话）\", \"chapters\": [涉及章号整数], \"suggestion\": \"可执行建议（一句话，指明改哪一章的什么）\"}\n\
+检查维度：节奏起伏（强度曲线是否过平或连续高能）、爽点分布（是否连续多章无推进）、钩子质量（同型连发/空钩）、伏笔逾期、支线失踪、字数异常、与本卷目标的一致性。\n",
+};
+
+static READER_REVIEW: TaskSpec = TaskSpec {
+    id: "reader_review",
+    label: "读者视角评审",
+    desc: "按留存要素给指定章节区间打分（代入 / 爽点 / 章末牵引 / 信息密度；JSON）",
+    vars: &[
+        VarSpec { name: "from", desc: "起始章号", sample: "1" },
+        VarSpec { name: "to", desc: "结束章号", sample: "3" },
+        VarSpec { name: "book_title", desc: "书名", sample: "深海鲸歌" },
+        VarSpec { name: "genre", desc: "题材", sample: "都市奇幻" },
+        VarSpec { name: "style_line", desc: "文风预设提示行（未选预设时为空）", sample: "文风预设：悬疑限知·反转烧脑——按该风格的标准评价语言与节奏。\n" },
+        VarSpec { name: "golden_note", desc: "黄金三章专项清单（非开篇区间时为空）", sample: "\n【黄金三章专项】按平台开篇留存清单检查：……\n" },
+        VarSpec { name: "chapters_text", desc: "逐章输入（目标 / 摘要 / 章末三行）", sample: "【第1章 风起】目标：接到陌生人传话\n摘要：……\n章末三行：\n……" },
+    ],
+    default_system: "你是最挑剔的网文读者兼编辑。只输出一个 JSON 对象，不要输出其他文字、不要使用 Markdown 代码块。",
+    default_user: "TASK:reader_review\n书名：{{book_title}}（{{genre}}）\n{{style_line}}{{golden_note}}\n以下是第 {{from}}~{{to}} 章的关键信息（目标 / 摘要 / 章末三行）：\n---\n{{chapters_text}}\n---\n\n\
+请你像一个真实读者一样读完，输出 JSON：\n\
+- overall_score: 0-10 的数字（读完还想不想继续追下去）\n\
+- overall_comment: 一句话总评（最影响留存的一点）\n\
+- chapters: 数组，每项 {\"idx\": 章号, \"score\": 0-10 的数字, \"verdict\": \"一句话评价\", \"issues\": [\"具体问题（可空）\"]}\n\
+评分维度：代入感（前 300 字能否抓住人）、爽点/信息密度、章末牵引（钩子是否有效）、节奏（拖沓或赶）、语言（AI 腔/重复）。\n",
+};
+
 pub static TASKS: &[&TaskSpec] = &[
     &BRIEF, &CLARIFY, &OUTLINE, &CHAPTER, &REVIEW, &POLISH, &CONTINUE, &REWRITE, &EXTRACT,
-    &VOLUME_SUMMARY, &FORESHADOW_AUDIT, &GLOBAL_REVIEW,
+    &VOLUME_SUMMARY, &FORESHADOW_AUDIT, &GLOBAL_REVIEW, &VOLUME_REVIEW, &READER_REVIEW,
 ];
 
 pub fn task(id: &str) -> Option<&'static TaskSpec> {
@@ -762,6 +806,83 @@ pub fn volume_summary_prompt(
     build(&VOLUME_SUMMARY, ov, &vars)
 }
 
+/// 卷末体检：卷摘要 + 逐章概览 + 未回收伏笔 + 文体统计 → findings
+#[allow(clippy::too_many_arguments)]
+pub fn volume_review_prompt(
+    volume_idx: i64,
+    from: i64,
+    to: i64,
+    volume_summary: &str,
+    chapter_lines: &str,
+    foreshadow_text: &str,
+    stylestat_text: &str,
+    ov: &Overrides,
+) -> (String, String) {
+    let vars = vec![
+        ("volume_idx", volume_idx.to_string()),
+        ("from", from.to_string()),
+        ("to", to.to_string()),
+        (
+            "volume_summary",
+            if volume_summary.trim().is_empty() {
+                "（暂无）".to_string()
+            } else {
+                volume_summary.trim().to_string()
+            },
+        ),
+        ("chapter_lines", chapter_lines.to_string()),
+        (
+            "foreshadow_text",
+            if foreshadow_text.trim().is_empty() {
+                "无".to_string()
+            } else {
+                foreshadow_text.to_string()
+            },
+        ),
+        (
+            "stylestat_text",
+            if stylestat_text.trim().is_empty() {
+                "（无）".to_string()
+            } else {
+                stylestat_text.to_string()
+            },
+        ),
+    ];
+    build(&VOLUME_REVIEW, ov, &vars)
+}
+
+/// 读者视角评审：指定区间的目标 / 摘要 / 章末三行 → 评分与问题
+#[allow(clippy::too_many_arguments)]
+pub fn reader_review_prompt(
+    brief: &Brief,
+    from: i64,
+    to: i64,
+    golden: bool,
+    chapters_text: &str,
+    style: Option<&StylePreset>,
+    ov: &Overrides,
+) -> (String, String) {
+    let style_line = match style {
+        Some(p) => format!("文风预设：{}——按该风格的标准评价语言与节奏。\n", p.name),
+        None => String::new(),
+    };
+    let golden_note = if golden {
+        "\n【黄金三章专项】按平台开篇留存清单检查：第 1 章 300 字内出冲突/悬念且不铺世界观、金手指/核心设定首现、章末有反转钩；第 2 章有打脸/名场面并埋长期伏笔；第 3 章亮出全书核心契约（主角要做什么）；前 1 万字人名 ≤5 个。\n".to_string()
+    } else {
+        String::new()
+    };
+    let vars = vec![
+        ("from", from.to_string()),
+        ("to", to.to_string()),
+        ("book_title", brief.title.clone()),
+        ("genre", brief.genre.clone()),
+        ("style_line", style_line),
+        ("golden_note", golden_note),
+        ("chapters_text", chapters_text.to_string()),
+    ];
+    build(&READER_REVIEW, ov, &vars)
+}
+
 /// 伏笔自动审核：未回收清单 + 各章摘要 → 判定哪些已实质回收
 pub fn foreshadow_audit_prompt(list: &str, summaries: &str, ov: &Overrides) -> (String, String) {
     let vars = vec![
@@ -907,7 +1028,7 @@ mod tests {
 
     #[test]
     fn task_catalog_is_consistent() {
-        assert_eq!(TASKS.len(), 12, "任务数量应为 12");
+        assert_eq!(TASKS.len(), 14, "任务数量应为 14");
         for spec in TASKS {
             assert!(task(spec.id).is_some());
             assert!(!spec.label.is_empty() && !spec.desc.is_empty());

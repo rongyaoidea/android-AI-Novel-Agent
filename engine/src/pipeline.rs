@@ -821,10 +821,16 @@ async fn run_inner(
             Err(e) => tracing::warn!("chapter {idx} extract failed: {e:#}"),
         }
 
-        // 卷级摘要：每写满 VOLUME_SPAN 章归并一条（长书记忆；失败不阻断）
+        // 卷级摘要 + 卷末体检：每写满 VOLUME_SPAN 章（失败不阻断）
         if idx % VOLUME_SPAN == 0 {
-            if let Err(e) = generate_volume_summary(&engine, novel_id, idx / VOLUME_SPAN).await {
-                tracing::warn!("volume summary at {idx} failed: {e:#}");
+            let volume_idx = idx / VOLUME_SPAN;
+            match generate_volume_summary(&engine, novel_id, volume_idx).await {
+                Ok(()) => {
+                    if let Err(e) = generate_volume_review(&engine, novel_id, volume_idx).await {
+                        tracing::warn!("volume review at {idx} failed: {e:#}");
+                    }
+                }
+                Err(e) => tracing::warn!("volume summary at {idx} failed: {e:#}"),
             }
         }
 
@@ -1099,6 +1105,134 @@ async fn generate_volume_summary(
     Ok(())
 }
 
+/// 卷末体检（每卷一次 LLM 调用）：卷摘要 + 逐章概览（强度/钩型/字数/摘要）+ 未回收伏笔 + 本地文体统计。
+/// 报告存 volume_reports（「书籍体检」里查看）；失败不阻断创作。
+async fn generate_volume_review(
+    engine: &Arc<Engine>,
+    novel_id: &str,
+    volume_idx: i64,
+) -> anyhow::Result<()> {
+    if engine.db.has_volume_report(novel_id, volume_idx)? {
+        return Ok(());
+    }
+    let from = (volume_idx - 1) * VOLUME_SPAN + 1;
+    let to = volume_idx * VOLUME_SPAN;
+    let metas = engine.db.list_chapter_metas(novel_id)?;
+    let summaries: std::collections::HashMap<i64, String> = engine
+        .db
+        .list_chapter_summaries(novel_id)?
+        .into_iter()
+        .map(|(idx, _, s)| (idx, s))
+        .collect();
+    let mut lines: Vec<String> = Vec::new();
+    let mut contents: Vec<(i64, String)> = Vec::new();
+    for m in metas.iter().filter(|m| m.idx >= from && m.idx <= to) {
+        let sum: String = summaries
+            .get(&m.idx)
+            .map(|s| s.trim().chars().take(50).collect())
+            .unwrap_or_default();
+        lines.push(format!(
+            "第{}章 {}｜强度{}｜钩-{}｜{}字｜{}",
+            m.idx,
+            m.title,
+            if m.intensity > 0 {
+                m.intensity.to_string()
+            } else {
+                "未标注".into()
+            },
+            if m.hook_type.trim().is_empty() {
+                "未标注"
+            } else {
+                m.hook_type.trim()
+            },
+            m.words,
+            sum
+        ));
+        if let Some(ch) = engine.db.get_chapter(novel_id, m.idx)? {
+            if ch.status == "done" && !ch.content.trim().is_empty() {
+                contents.push((m.idx, ch.content));
+            }
+        }
+    }
+    if contents.is_empty() {
+        // 该卷还没有已写正文（只规划）：不体检
+        return Ok(());
+    }
+    let stats = crate::style_stats::compute(
+        &contents
+            .iter()
+            .map(|(i, c)| (*i, c.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let volume_summary = engine
+        .db
+        .list_volume_summaries(novel_id)?
+        .iter()
+        .find(|v| v.volume_idx == volume_idx)
+        .map(|v| v.summary.clone())
+        .unwrap_or_default();
+    let fores: Vec<String> = engine
+        .db
+        .list_foreshadowings(novel_id)?
+        .iter()
+        .filter(|f| f.status == "open")
+        .map(|f| {
+            if f.planted_chapter > 0 {
+                format!(
+                    "{}（第{}章埋下，拖 {} 章）",
+                    f.title,
+                    f.planted_chapter,
+                    (to - f.planted_chapter).max(0)
+                )
+            } else {
+                format!("{}（手动记录）", f.title)
+            }
+        })
+        .collect();
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "extract".into(),
+        message: format!("第 {volume_idx} 卷体检（第 {from}~{to} 章）…"),
+    });
+    let settings = engine.llm_settings()?;
+    let llm = Llm::new(settings.clone());
+    let ov = engine.prompt_overrides();
+    let (sys, usr) = crate::prompts::volume_review_prompt(
+        volume_idx,
+        from,
+        to,
+        &volume_summary,
+        &lines.join("\n"),
+        &fores.join("；"),
+        &stats.summary_text,
+        &ov,
+    );
+    let out = llm.complete(&sys, &usr).await?;
+    record_usage(
+        &engine.db,
+        Some(novel_id),
+        None,
+        "volume_review",
+        &settings,
+        &out.usage,
+    );
+    let report = extract_json_object(&out.text).unwrap_or_else(|| {
+        serde_json::json!({ "ok": true, "findings": [], "note": "输出无法解析（已跳过）" })
+    });
+    let findings = report["findings"].as_array().map(|a| a.len()).unwrap_or(0);
+    engine
+        .db
+        .upsert_volume_report(novel_id, volume_idx, to, &serde_json::to_string(&report)?)?;
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "extract".into(),
+        message: if findings > 0 {
+            format!("第 {volume_idx} 卷体检完成：{findings} 条建议（可在「书籍体检」查看）")
+        } else {
+            format!("第 {volume_idx} 卷体检完成：无明显问题")
+        },
+    });
+    Ok(())
+}
+
 /// 补写缺失的卷级摘要：覆盖「第 20/40… 章由人工或单章接口完成」导致跳过边界触发的情况。
 async fn maybe_fill_volume_summaries(
     engine: &Arc<Engine>,
@@ -1123,6 +1257,12 @@ async fn maybe_fill_volume_summaries(
         match generate_volume_summary(engine, novel_id, v).await {
             Ok(()) => made += 1,
             Err(e) => tracing::warn!("volume summary {v} failed: {e:#}"),
+        }
+    }
+    // 卷末体检补跑：摘要已存在但缺报告的卷（有界：每卷一次，内部自带去重检查）
+    for v in 1..=max_vol {
+        if let Err(e) = generate_volume_review(engine, novel_id, v).await {
+            tracing::warn!("volume review {v} failed: {e:#}");
         }
     }
     Ok(made)

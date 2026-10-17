@@ -134,6 +134,9 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/novels/:id/chapters/:idx/rewrite", post(rewrite_chapter))
         .route("/api/novels/:id/chapters/:idx/extract", post(extract_chapter))
         .route("/api/novels/:id/health", get(novel_health))
+        .route("/api/novels/:id/style-stats", get(novel_style_stats))
+        .route("/api/novels/:id/volume-reports", get(volume_reports))
+        .route("/api/novels/:id/reader-review", post(reader_review))
         .route("/api/novels/:id/run", post(run_novel))
         .route(
             "/api/novels/:id/auto",
@@ -1516,6 +1519,151 @@ struct RunBody {
     /// 显式指定「写到第几章」；省略时按当前进度再写一批（受全书目标约束）
     #[serde(default)]
     chapters: Option<i64>,
+}
+
+/// 文体统计（本地零 token）：跨章重复句 / 章末类型 / 字数异常 / 句均长
+async fn novel_style_stats(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    let chapters = e.db.list_chapters(&id).map_err(err)?;
+    let done: Vec<(i64, &str)> = chapters
+        .iter()
+        .filter(|c| c.status == "done" && !c.content.trim().is_empty())
+        .map(|c| (c.idx, c.content.as_str()))
+        .collect();
+    let stats = crate::style_stats::compute(&done);
+    Ok(Json(serde_json::to_value(stats).map_err(err)?))
+}
+
+/// 卷末体检报告列表（每 20 章自动生成一条）
+async fn volume_reports(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    let items: Vec<serde_json::Value> = e
+        .db
+        .list_volume_reports(&id)
+        .map_err(err)?
+        .into_iter()
+        .map(|(volume_idx, upto_chapter, report_json)| {
+            json!({
+                "volume_idx": volume_idx,
+                "upto_chapter": upto_chapter,
+                "report": serde_json::from_str::<serde_json::Value>(&report_json)
+                    .unwrap_or(serde_json::Value::Null)
+            })
+        })
+        .collect();
+    Ok(Json(json!({"items": items})))
+}
+
+#[derive(Deserialize)]
+struct ReaderReviewBody {
+    #[serde(default = "default_review_from")]
+    from: i64,
+    #[serde(default = "default_review_to")]
+    to: i64,
+    /// 黄金三章专项（省略时：区间为 1~3 自动开启）
+    #[serde(default)]
+    golden: Option<bool>,
+}
+
+fn default_review_from() -> i64 {
+    1
+}
+
+fn default_review_to() -> i64 {
+    3
+}
+
+/// 读者视角评审（同步 LLM 调用）：指定区间的目标 / 摘要 / 章末三行 → 评分与问题；区间上限 20 章
+async fn reader_review(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(b): Json<ReaderReviewBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let novel = e
+        .db
+        .get_novel(&id)
+        .map_err(err)?
+        .ok_or_else(|| not_found("novel"))?;
+    let from = b.from.max(1);
+    let to = b.to.max(from).min(from + 19);
+    let mut text = String::new();
+    let mut included = 0usize;
+    for idx in from..=to {
+        let Some(ch) = e.db.get_chapter(&id, idx).map_err(err)? else {
+            continue;
+        };
+        if ch.status != "done" || ch.content.trim().is_empty() {
+            continue;
+        }
+        let tail = ch
+            .content
+            .lines()
+            .rev()
+            .filter(|l| !l.trim().is_empty())
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary: String = ch.summary.trim().chars().take(60).collect();
+        text.push_str(&format!(
+            "【第{}章 {}】目标：{}\n摘要：{}\n章末三行：\n{}\n\n",
+            ch.idx, ch.title, ch.goal, summary, tail
+        ));
+        included += 1;
+    }
+    if included == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "该区间还没有已写正文的章节".to_string(),
+        ));
+    }
+    let golden = b.golden.unwrap_or(from == 1 && to <= 3);
+    let brief = crate::models::Brief {
+        title: novel.title.clone(),
+        genre: novel.genre.clone(),
+        logline: novel.logline.clone(),
+        protagonist: novel.protagonist.clone(),
+        style: novel.style.clone(),
+        worldview: novel.worldview.clone(),
+    };
+    let settings = e.llm_settings().map_err(err)?;
+    let llm = crate::llm::Llm::new(settings.clone());
+    let ov = e.prompt_overrides();
+    let (sys, usr) = crate::prompts::reader_review_prompt(
+        &brief,
+        from,
+        to,
+        golden,
+        &text,
+        crate::styles::find(&novel.style_preset),
+        &ov,
+    );
+    let out = llm.complete(&sys, &usr).await.map_err(err)?;
+    record_usage(&e.db, Some(&id), None, "reader_review", &settings, &out.usage);
+    let result = crate::llm::extract_json_object(&out.text).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "读者评审输出不是 JSON（可重试一次）".to_string(),
+    ))?;
+    Ok(Json(json!({
+        "ok": true,
+        "from": from,
+        "to": to,
+        "included": included,
+        "golden": golden,
+        "result": result
+    })))
 }
 
 async fn run_novel(

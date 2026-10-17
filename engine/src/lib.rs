@@ -9,6 +9,7 @@ pub mod models;
 pub mod pipeline;
 pub mod prompts;
 pub mod style_check;
+pub mod style_stats;
 pub mod styles;
 pub mod webui;
 

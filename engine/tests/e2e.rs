@@ -1261,7 +1261,7 @@ async fn prompt_overrides_endpoints() {
     assert_eq!(resp.status(), StatusCode::OK);
     let v = json_body(resp).await;
     let items = v["items"].as_array().unwrap();
-    assert_eq!(items.len(), 12, "任务数量应为 12");
+    assert_eq!(items.len(), 14, "任务数量应为 14");
     for t in items {
         assert!(!t["default_system"].as_str().unwrap().is_empty(), "{}", t["id"]);
         assert!(!t["default_user"].as_str().unwrap().is_empty(), "{}", t["id"]);
@@ -3328,6 +3328,187 @@ async fn manual_continue_advances_one_batch_from_progress() {
     assert_eq!(v["batch_until"], 12, "达标后终点不再增长：{v}");
     wait_run_done(app.clone(), &novel_id).await;
     assert_eq!(done_count(app.clone(), novel_id.clone()).await, 12);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 质量体检接口：文体统计（本地零 token）+ 读者视角评审（默认黄金三章）
+#[tokio::test]
+async fn health_extras_style_stats_and_reader_review() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-health-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "质量体检测试", "chapters": 3}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    // 文体统计：mock 正文含跨章重复句，应被检出
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/style-stats"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["chapters"], 3, "{v}");
+    assert!(
+        !v["summary_text"].as_str().unwrap_or("").is_empty(),
+        "{v}"
+    );
+    assert!(
+        !v["repeated_sentences"].as_array().unwrap().is_empty(),
+        "mock 正文的跨章重复句应被检出：{v}"
+    );
+
+    // 读者视角评审（默认 1~3 章 → 黄金三章专项）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/reader-review"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"from": 1, "to": 3}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    assert_eq!(v["golden"], true, "{v}");
+    assert!(v["result"]["overall_score"].is_number(), "{v}");
+    assert!(
+        !v["result"]["chapters"].as_array().unwrap().is_empty(),
+        "{v}"
+    );
+
+    // 区间没有正文 → 400
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/reader-review"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"from": 50, "to": 60}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // 未满一卷 → 卷末体检报告为空
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/volume-reports"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(json_body(resp).await["items"].as_array().unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 卷末体检：写满第 20 章（一卷）自动生成报告，体检接口可读
+#[tokio::test]
+async fn volume_review_generated_at_volume_boundary() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-volrev-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    engine
+        .db
+        .set_pipeline_settings(&PipelineSettings {
+            auto_batch: 20,
+            ..PipelineSettings::default()
+        })
+        .unwrap();
+    let app = api::build_router(engine.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "卷末体检测试", "chapters": 20}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/volume-reports"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = json_body(resp).await;
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "写满一卷应生成一条体检报告：{v}");
+    assert_eq!(items[0]["volume_idx"], 1, "{v}");
+    assert_eq!(items[0]["upto_chapter"], 20, "{v}");
+    assert!(
+        !items[0]["report"]["findings"].as_array().unwrap().is_empty(),
+        "mock 体检应带 findings：{v}"
+    );
+
+    // 文体统计覆盖 20 章
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}/style-stats"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["chapters"], 20, "{v}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
