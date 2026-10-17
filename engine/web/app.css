@@ -642,6 +642,43 @@ mark.add { background: hsl(var(--success) / .2); color: inherit; border-radius: 
 .search-hit-title { font-size: 13px; font-weight: 600; white-space: nowrap; }
 .search-hit-excerpt { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 
+/* ---------- 阅读模式 ---------- */
+.read-top {
+  position: sticky; top: 0; z-index: 5;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 4px 0 12px; border-bottom: 1px solid hsl(var(--border));
+  background: hsl(var(--background));
+}
+.read-meta { flex: 1; min-width: 0; }
+.read-meta #read-title { font-weight: 600; font-size: 15px; }
+.read-actions { display: flex; gap: 6px; }
+.read-toc {
+  max-width: 44em; margin: 14px auto 0;
+  border: 1px solid hsl(var(--border)); border-radius: var(--radius);
+  max-height: 46vh; overflow-y: auto; background: hsl(var(--card));
+}
+.read-toc-item {
+  display: flex; justify-content: space-between; gap: 10px;
+  padding: 9px 12px; border-bottom: 1px dashed hsl(var(--border));
+  cursor: pointer; font-size: 13.5px;
+}
+.read-toc-item:last-child { border-bottom: 0; }
+.read-toc-item:hover { background: hsl(var(--primary) / .05); }
+.read-toc-item.active { background: hsl(var(--primary) / .08); font-weight: 600; }
+.read-toc-item.disabled { opacity: .45; cursor: default; }
+.read-content {
+  max-width: 44em; margin: 0 auto; padding: 26px 0 40px;
+  font-family: Georgia, "Songti SC", "Noto Serif CJK SC", "SimSun", serif;
+  font-size: 18px; line-height: 2.05; color: hsl(var(--foreground));
+  word-break: break-word;
+}
+.read-content h2 { font-size: 1.22em; margin: 0 0 1.15em; font-family: inherit; }
+.read-content .read-empty { color: hsl(var(--muted-foreground)); }
+.read-bottom {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding-top: 12px; border-top: 1px solid hsl(var(--border));
+}
+
 /* ---------- 平板 / 横屏（≥900px）：更宽的阅读与编辑区 ---------- */
 @media (min-width: 900px) {
   #reader-backdrop .dialog { width: min(1020px, 94vw); }

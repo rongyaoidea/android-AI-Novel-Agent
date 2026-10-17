@@ -176,6 +176,8 @@ const PAGES = {
 
 function parseRoute() {
   const hash = location.hash || "#/shelf";
+  const rd = hash.match(/^#\/read\/(.+)$/);
+  if (rd) return { kind: "read", id: decodeURIComponent(rd[1]) };
   const m = hash.match(/^#\/novel\/(.+)$/);
   if (m) return { kind: "novel", id: decodeURIComponent(m[1]) };
   return { kind: "page", path: PAGES[hash] ? hash : "#/shelf" };
@@ -199,9 +201,22 @@ async function route() {
   }
 
   const r = parseRoute();
-  const activeNav = r.kind === "novel" ? "#/shelf" : r.path;
+  const activeNav = r.kind === "novel" || r.kind === "read" ? "#/shelf" : r.path;
   $$(".nav-item").forEach((a) => a.classList.toggle("active", a.dataset.route === activeNav));
   $$(".view").forEach((v) => (v.hidden = true));
+
+  if (r.kind === "read") {
+    $("#page-title").textContent = "阅读";
+    $("#page-subtitle").textContent = "沉浸阅读（← 返回书架）";
+    $("#view-read").hidden = false;
+    try {
+      await openRead(r.id);
+    } catch (e) {
+      toast("打开阅读失败：" + e.message, true);
+      location.hash = "#/shelf";
+    }
+    return;
+  }
 
   if (r.kind === "novel") {
     $("#page-title").textContent = "本书工作台";
@@ -329,7 +344,8 @@ function renderShelf() {
         ${it.last_error ? `<p class="err">${esc(it.last_error)}</p>` : ""}
       </div>
       <div class="row">
-        <button class="btn btn-primary btn-sm" data-act="open">进入工作台</button>
+        <button class="btn btn-primary btn-sm" data-act="read"><svg class="ic"><use href="#i-book"/></svg>阅读</button>
+        <button class="btn btn-outline btn-sm" data-act="open">进入工作台</button>
         <button class="btn btn-outline btn-sm" data-act="outline"><svg class="ic"><use href="#i-book"/></svg>总纲</button>
         <a class="btn btn-outline btn-sm" data-act="export" href="${esc(withToken(`/api/novels/${n.id}/export`))}">导出 TXT</a>
         <button class="btn btn-ghost btn-sm btn-danger" data-act="delete">删除</button>
@@ -349,10 +365,19 @@ function bindShelf() {
   });
   $("#shelf-grid").addEventListener("click", async (e) => {
     const card = e.target.closest(".novel-card");
-    const act = e.target.closest("[data-act]");
-    if (!card || !act) return;
+    if (!card) return;
     const id = card.dataset.id;
+    const act = e.target.closest("[data-act]");
+    if (!act) {
+      // 点击卡片正文（非按钮区域）→ 直接进入阅读模式
+      if (id && !card.classList.contains("empty-card")) location.hash = `#/read/${id}`;
+      return;
+    }
     const kind = act.dataset.act;
+    if (kind === "read") {
+      location.hash = `#/read/${id}`;
+      return;
+    }
     if (kind === "open") {
       location.hash = `#/novel/${id}`;
       return;
@@ -441,6 +466,153 @@ function bindOutline() {
   $("#outline-close").onclick = () => { $("#outline-backdrop").hidden = true; };
   $("#outline-backdrop").addEventListener("click", (e) => {
     if (e.target === $("#outline-backdrop")) $("#outline-backdrop").hidden = true;
+  });
+}
+
+/* ---------------- 阅读模式（沉浸阅读：目录 / 上下章 / 字号 / 记忆进度） ---------------- */
+
+const READ_POS_KEY = "ainovel.reading."; // + novelId → 章节号
+const READ_FONT_KEY = "ainovel.reading.font";
+
+function readFontSize() {
+  let v = 18;
+  try {
+    v = parseInt(localStorage.getItem(READ_FONT_KEY) || "18", 10) || 18;
+  } catch {
+    v = 18;
+  }
+  return Math.min(26, Math.max(14, v));
+}
+
+function applyReadFont() {
+  const el = $("#read-content");
+  if (el) el.style.fontSize = readFontSize() + "px";
+}
+
+async function openRead(id) {
+  state.readNovelId = id;
+  const data = await api(`/api/novels/${id}`);
+  state.readNovel = data.novel || {};
+  state.readChapters = data.chapters || [];
+  const title =
+    (state.readNovel.title && state.readNovel.title.trim()) ||
+    (state.readNovel.idea || "").slice(0, 16) ||
+    "（未命名）";
+  $("#read-title").textContent = title;
+  $("#read-toc-list").hidden = true;
+  applyReadFont();
+  const readable = state.readChapters.filter((c) => (c.words || 0) > 0);
+  if (!readable.length) {
+    $("#read-content").innerHTML = `<h2>${esc(title)}</h2><p class="read-empty">这本书还没有可阅读的章节：先到工作台写一章吧。</p>`;
+    $("#read-sub").textContent = "";
+    $("#read-hint").textContent = "";
+    $("#read-prev").disabled = true;
+    $("#read-next").disabled = true;
+    $("#read-toc-btn").disabled = true;
+    return;
+  }
+  $("#read-toc-btn").disabled = false;
+  let saved = 0;
+  try {
+    saved = parseInt(localStorage.getItem(READ_POS_KEY + id) || "0", 10) || 0;
+  } catch {
+    saved = 0;
+  }
+  // 续读上次位置；否则从第一章有正文的开始
+  const target = readable.some((c) => c.idx === saved) ? saved : readable[0].idx;
+  await readChapter(target);
+}
+
+async function readChapter(idx) {
+  const id = state.readNovelId;
+  if (!id) return;
+  const readable = (state.readChapters || []).filter((c) => (c.words || 0) > 0);
+  if (!readable.some((c) => c.idx === idx)) {
+    toast(`第 ${idx} 章还没有正文`, true);
+    return;
+  }
+  const c = await api(`/api/novels/${id}/chapters/${idx}`);
+  state.readIdx = idx;
+  try {
+    localStorage.setItem(READ_POS_KEY + id, String(idx));
+  } catch {
+    /* 忽略 */
+  }
+  // 正文首行若是章节标题（生成契约），渲染为标题行；否则补一行
+  const lines = String(c.content || "").split("\n");
+  const first = (lines[0] || "").trim();
+  const hasHead = first.length > 0 && first.length <= 30 && /^第\s*\S{0,10}章/.test(first);
+  const body = hasHead ? lines.slice(1).join("\n") : String(c.content || "");
+  const head = hasHead ? first : `第${idx}章 ${(c.title || "").trim()}`;
+  $("#read-content").innerHTML = `<h2>${esc(head)}</h2>` + esc(body.trim()).replace(/\n/g, "<br>");
+  const pos = readable.findIndex((x) => x.idx === idx);
+  const totalChapters = (state.readChapters || []).length || 1;
+  const pct = Math.min(100, Math.round(((pos + 1) / readable.length) * 100));
+  $("#read-sub").textContent = `第 ${pos + 1} / ${readable.length} 章（全书 ${totalChapters} 章） · 本章 ${c.words || 0} 字 · 进度 ${pct}%`;
+  $("#read-hint").textContent = `第 ${pos + 1} / ${readable.length} 章`;
+  $("#read-prev").disabled = pos <= 0;
+  $("#read-next").disabled = pos >= readable.length - 1;
+  renderReadToc();
+  const scroller = document.querySelector(".content");
+  if (scroller) scroller.scrollTop = 0;
+}
+
+function renderReadToc() {
+  const list = $("#read-toc-list");
+  if (!list || list.hidden) return;
+  list.innerHTML = (state.readChapters || [])
+    .map((c) => {
+      const readable = (c.words || 0) > 0;
+      return `<div class="read-toc-item ${readable ? "" : "disabled"} ${c.idx === state.readIdx ? "active" : ""}" data-toc="${c.idx}">
+        <span>第${c.idx}章 ${esc(c.title || "")}</span>
+        <span class="muted">${readable ? `${c.words} 字` : "未写"}</span>
+      </div>`;
+    })
+    .join("");
+}
+
+function readStep(delta) {
+  const readable = (state.readChapters || []).filter((c) => (c.words || 0) > 0);
+  const pos = readable.findIndex((x) => x.idx === state.readIdx);
+  const next = pos + delta;
+  if (pos < 0 || next < 0 || next >= readable.length) return;
+  readChapter(readable[next].idx).catch((e) => toast(e.message, true));
+}
+
+function bindRead() {
+  $("#read-back").onclick = () => { location.hash = "#/shelf"; };
+  $("#read-prev").onclick = () => readStep(-1);
+  $("#read-next").onclick = () => readStep(1);
+  $("#read-toc-btn").onclick = () => {
+    const list = $("#read-toc-list");
+    list.hidden = !list.hidden;
+    if (!list.hidden) renderReadToc();
+  };
+  $("#read-toc-list").addEventListener("click", (e) => {
+    const item = e.target.closest("[data-toc]");
+    if (!item || item.classList.contains("disabled")) return;
+    $("#read-toc-list").hidden = true;
+    readChapter(parseInt(item.dataset.toc, 10)).catch((err) => toast(err.message, true));
+  });
+  $("#read-font-dec").onclick = () => {
+    try {
+      localStorage.setItem(READ_FONT_KEY, String(Math.max(14, readFontSize() - 1)));
+    } catch { /* 忽略 */ }
+    applyReadFont();
+  };
+  $("#read-font-inc").onclick = () => {
+    try {
+      localStorage.setItem(READ_FONT_KEY, String(Math.min(26, readFontSize() + 1)));
+    } catch { /* 忽略 */ }
+    applyReadFont();
+  };
+  // 键盘翻页（桌面 / 横屏带键盘时）
+  document.addEventListener("keydown", (e) => {
+    if (parseRoute().kind !== "read") return;
+    if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
+    if (e.key === "ArrowLeft") { e.preventDefault(); readStep(-1); }
+    if (e.key === "ArrowRight") { e.preventDefault(); readStep(1); }
+    if (e.key === "Escape") location.hash = "#/shelf";
   });
 }
 
@@ -2904,6 +3076,7 @@ function init() {
   bindTheme();
   bindShelf();
   bindOutline();
+  bindRead();
   bindCreate();
   bindNovel();
   bindGlobalReview();

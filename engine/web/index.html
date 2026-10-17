@@ -177,6 +177,29 @@
         </form>
       </section>
 
+      <!-- 阅读模式 -->
+      <section class="view" id="view-read" hidden>
+        <div class="read-top">
+          <button class="btn btn-outline btn-sm" id="read-back"><svg class="ic"><use href="#i-book"/></svg>书架</button>
+          <div class="read-meta">
+            <div id="read-title">—</div>
+            <div class="muted" id="read-sub"></div>
+          </div>
+          <div class="read-actions">
+            <button class="btn btn-outline btn-sm" id="read-toc-btn"><svg class="ic"><use href="#i-eye"/></svg>目录</button>
+            <button class="btn btn-outline btn-sm" id="read-font-dec" title="减小字号">A-</button>
+            <button class="btn btn-outline btn-sm" id="read-font-inc" title="增大字号">A+</button>
+          </div>
+        </div>
+        <div id="read-toc-list" class="read-toc" hidden></div>
+        <article class="read-content" id="read-content"></article>
+        <div class="read-bottom">
+          <button class="btn btn-outline" id="read-prev"><svg class="ic"><use href="#i-up"/></svg>上一章</button>
+          <span class="muted" id="read-hint"></span>
+          <button class="btn btn-outline" id="read-next">下一章<svg class="ic"><use href="#i-down"/></svg></button>
+        </div>
+      </section>
+
       <!-- 本书工作台 -->
       <section class="view" id="view-novel" hidden>
         <div class="novel-head">
