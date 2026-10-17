@@ -117,6 +117,7 @@ const NOVEL_STATUS = {
   writing: { label: "创作中", cls: "chip-info" },
   await_confirm: { label: "待确认", cls: "chip-warning" },
   drafted: { label: "已完成", cls: "chip-success" },
+  finished: { label: "已完成（可读）", cls: "chip-success" },
   failed: { label: "异常", cls: "chip-danger" },
 };
 const RUN_STATUS = { running: "执行中", paused: "待确认", done: "已完成", failed: "失败" };
@@ -130,6 +131,7 @@ const STAGE_LABEL = {
   extract: "资料整理",
   auto: "自动连载",
   budget: "预算护栏",
+  finish: "完本收尾",
   stop: "正在停止",
   stopped: "已停止",
   done: "全部完成",
@@ -1131,6 +1133,75 @@ async function loadHealthExtras() {
   } catch (e) {
     $("#health-volume-reports").textContent = "加载失败：" + e.message;
   }
+  // 完本报告（读者审查：只在完本时自动生成）
+  try {
+    const r = await api(`/api/novels/${id}/book-reports`);
+    if (state.novelId !== id) return;
+    const item = (r.items || []).find((x) => x.kind === "finish");
+    $("#health-finish-report").innerHTML = item
+      ? renderFinishReport(item.report || {})
+      : `<p class="muted" style="margin:0;">达标完成（自动连载写到目标）后会自动生成：全局审校 + 卷末体检（含自动修复）+ 读者审查（黄金三章 + 每 20 章分块）。也可用下方按钮手动跑一次。</p>`;
+  } catch (e) {
+    $("#health-finish-report").textContent = "加载失败：" + e.message;
+  }
+}
+
+/** 完本报告渲染：黄金三章 + 每 20 章分块的读者审查 */
+function renderFinishReport(rep) {
+  const chips = [`<span class="chip">共 ${rep.chapters || 0} 章</span>`];
+  if (rep.finished_at) {
+    chips.push(`<span class="chip">${esc(String(rep.finished_at).slice(0, 16).replace("T", " "))}</span>`);
+  }
+  const g = rep.golden;
+  if (g && typeof g.overall_score !== "undefined") {
+    chips.push(`<span class="chip chip-info">黄金三章 ${esc(String(g.overall_score))}/10</span>`);
+  }
+  let html = `<div class="chips">${chips.join("")}</div>`;
+  if (g && g.overall_comment) {
+    html += `<p class="muted" style="margin:6px 0;">开篇总评：${esc(g.overall_comment)}</p>`;
+  }
+  html += (rep.blocks || [])
+    .map((b) => {
+      const score = typeof b.overall_score !== "undefined" ? `${esc(String(b.overall_score))}/10` : "—";
+      return `<p class="health-line">${ic("i-flag")}<span>第 ${esc(String(b.from ?? "?"))}~${esc(String(b.to ?? "?"))} 章 · ${score}：${esc(b.overall_comment || "")}</span></p>`;
+    })
+    .join("");
+  return html;
+}
+
+/** 手动跑完本收尾（重跑读者审查）；完成后自动刷新区块 */
+async function runFinishBook() {
+  const btn = $("#finish-run");
+  btn.disabled = true;
+  $("#finish-status").textContent = "已开始：全局审校 + 卷末体检 + 读者审查（后台进行）…";
+  try {
+    await apiSend(`/api/novels/${state.novelId}/finish`, "POST", {});
+    const id = state.novelId;
+    let tries = 0;
+    const timer = setInterval(async () => {
+      tries += 1;
+      if (state.novelId !== id || tries > 40) {
+        clearInterval(timer);
+        btn.disabled = false;
+        return;
+      }
+      try {
+        const r = await api(`/api/novels/${id}/book-reports`);
+        const item = (r.items || []).find((x) => x.kind === "finish");
+        if (item && state.novelId === id) {
+          $("#health-finish-report").innerHTML = renderFinishReport(item.report || {});
+          $("#finish-status").textContent = "完本报告已生成";
+          clearInterval(timer);
+          btn.disabled = false;
+        }
+      } catch {
+        /* 忽略：继续等 */
+      }
+    }, 3000);
+  } catch (err) {
+    $("#finish-status").textContent = "启动失败：" + err.message;
+    btn.disabled = false;
+  }
 }
 
 /** 读者视角评审：按区间调用（黄金三章 / 前 10 / 最近 10） */
@@ -1593,6 +1664,7 @@ function bindNovel() {
   $("#health-close").onclick = () => { $("#health-backdrop").hidden = true; };
   $("#health-fill").onclick = () => fillMissing().catch((err) => toast(err.message, true));
   $("#readerv-run").onclick = () => runReaderReview();
+  $("#finish-run").onclick = () => runFinishBook();
   $("#novel-usage").onclick = () => openUsage().catch((err) => toast(err.message, true));
   $("#usage-close").onclick = () => { $("#usage-backdrop").hidden = true; };
   $("#stream-clear").onclick = () => {

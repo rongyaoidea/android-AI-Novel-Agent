@@ -28,6 +28,14 @@ pub struct Engine {
     stop_flags: std::sync::Mutex<std::collections::HashSet<String>>,
     /// 「AI 处理全部审校」进行中的作品（同一时刻只允许一个；也用于与创作运行互斥）
     reviewing: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// 自动连载失败重试计数（内存态：按作品；成功一轮后清零）
+    retry_counts: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    /// 已排期的失败重试（防止同一本书并发排多个）
+    retry_scheduled: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// 超预算待机中的作品（下个自然月自动恢复；内存态）
+    budget_waiting: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// 已排期的预算恢复任务（防重复）
+    budget_resume_scheduled: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Engine {
@@ -51,7 +59,78 @@ impl Engine {
             secret,
             stop_flags: std::sync::Mutex::new(std::collections::HashSet::new()),
             reviewing: std::sync::Mutex::new(std::collections::HashSet::new()),
+            retry_counts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            retry_scheduled: std::sync::Mutex::new(std::collections::HashSet::new()),
+            budget_waiting: std::sync::Mutex::new(std::collections::HashSet::new()),
+            budget_resume_scheduled: std::sync::Mutex::new(std::collections::HashSet::new()),
         }))
+    }
+
+    // ---------- 无人值守状态（失败重试 / 预算待机） ----------
+
+    /// 记录一次自动重试尝试并返回第几次（1 起）
+    pub fn bump_retry_attempt(&self, novel_id: &str) -> u32 {
+        let Ok(mut m) = self.retry_counts.lock() else {
+            return 1;
+        };
+        let n = m.entry(novel_id.to_string()).or_insert(0);
+        *n += 1;
+        *n
+    }
+
+    /// 成功一轮后清零失败计数
+    pub fn clear_retry(&self, novel_id: &str) {
+        if let Ok(mut m) = self.retry_counts.lock() {
+            m.remove(novel_id);
+        }
+    }
+
+    /// 标记「已排期重试」（返回 false = 已有排期，不重复排）
+    pub fn mark_retry_scheduled(&self, novel_id: &str) -> bool {
+        self.retry_scheduled
+            .lock()
+            .map(|mut s| s.insert(novel_id.to_string()))
+            .unwrap_or(false)
+    }
+
+    pub fn unmark_retry_scheduled(&self, novel_id: &str) {
+        if let Ok(mut s) = self.retry_scheduled.lock() {
+            s.remove(novel_id);
+        }
+    }
+
+    /// 标记「超预算待机」（下个自然月自动恢复）
+    pub fn mark_budget_wait(&self, novel_id: &str) {
+        if let Ok(mut s) = self.budget_waiting.lock() {
+            s.insert(novel_id.to_string());
+        }
+    }
+
+    pub fn clear_budget_wait(&self, novel_id: &str) {
+        if let Ok(mut s) = self.budget_waiting.lock() {
+            s.remove(novel_id);
+        }
+    }
+
+    pub fn is_budget_waiting(&self, novel_id: &str) -> bool {
+        self.budget_waiting
+            .lock()
+            .map(|s| s.contains(novel_id))
+            .unwrap_or(false)
+    }
+
+    /// 标记「已排期预算恢复」（返回 false = 已有排期）
+    pub fn mark_budget_resume_scheduled(&self, novel_id: &str) -> bool {
+        self.budget_resume_scheduled
+            .lock()
+            .map(|mut s| s.insert(novel_id.to_string()))
+            .unwrap_or(false)
+    }
+
+    pub fn unmark_budget_resume_scheduled(&self, novel_id: &str) {
+        if let Ok(mut s) = self.budget_resume_scheduled.lock() {
+            s.remove(novel_id);
+        }
     }
 
     /// 尝试占用「审校处理」名额（false = 已有审校处理在跑）

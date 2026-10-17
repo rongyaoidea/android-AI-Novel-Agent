@@ -1967,30 +1967,35 @@ async fn auto_continue_chain_and_budget() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // 等待：批次运行因预算提前收尾 → 自动连载关闭
-    let mut stopped = false;
+    // 等待：批次运行因预算提前收尾 → 自动连载转入「待机」（开关保持开启，下月自动恢复）
+    let mut waited = false;
     for _ in 0..400 {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        let resp = app
-            .clone()
-            .oneshot(Request::builder().uri(format!("/api/novels/{n2}")).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let v = json_body(resp).await;
-        if !v["novel"]["auto_continue"].as_bool().unwrap_or(true) {
-            stopped = true;
+        let msgs: Vec<String> = engine
+            .hub
+            .history(&n2)
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Stage { stage, message } if stage == "budget" => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        if msgs.iter().any(|m| m.contains("待机")) {
+            waited = true;
             break;
         }
     }
-    assert!(stopped, "预算耗尽后自动连载应自动暂停");
-    let stages2: Vec<String> = engine.hub.history(&n2)
-        .iter()
-        .filter_map(|e| match e {
-            EngineEvent::Stage { stage, .. } => Some(stage.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(stages2.contains(&"budget".to_string()), "应有预算护栏事件: {stages2:?}");
+    assert!(waited, "预算耗尽后应进入待机（含「待机」事件）");
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(format!("/api/novels/{n2}")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(
+        v["novel"]["auto_continue"], true,
+        "预算待机不关闭自动连载（下月自动恢复的依据）：{v}"
+    );
 
     // 月度用量接口
     let resp = app
@@ -3509,6 +3514,106 @@ async fn volume_review_generated_at_volume_boundary() {
         .unwrap();
     let v = json_body(resp).await;
     assert_eq!(v["chapters"], 20, "{v}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 完本收尾：自动连载达标 → 自动生成读者审查报告（读者审查只在完本时自动执行）
+#[tokio::test]
+async fn auto_finish_generates_reader_report() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-finish-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    engine
+        .db
+        .set_pipeline_settings(&PipelineSettings {
+            auto_batch: 3,
+            ..PipelineSettings::default()
+        })
+        .unwrap();
+    let app = api::build_router(engine.clone());
+
+    // 目标 6 章：首批写 3；再启动自动连载 → 自动补 3 章达标 → 完本收尾
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "完本收尾测试", "chapters": 6}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/auto"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 轮询：完本收尾生成 finish 报告（含黄金三章与分块）
+    let mut found: Option<serde_json::Value> = None;
+    for _ in 0..800 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}/book-reports"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = json_body(resp).await;
+        if let Some(item) = v["items"]
+            .as_array()
+            .and_then(|a| a.iter().find(|i| i["kind"] == "finish"))
+        {
+            found = Some(item.clone());
+            break;
+        }
+    }
+    let item = found.expect("达标后应自动生成完本收尾报告");
+    let rep = &item["report"];
+    assert_eq!(rep["chapters"], 6, "{item}");
+    assert!(rep["golden"].is_object(), "应含黄金三章读者审查：{item}");
+    assert_eq!(
+        rep["blocks"].as_array().unwrap().len(),
+        1,
+        "6 章应为 1 个分块：{item}"
+    );
+
+    // 书籍状态 → finished（完本可读）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/novels/{novel_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v = json_body(resp).await;
+    assert_eq!(v["novel"]["status"], "finished", "{v}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

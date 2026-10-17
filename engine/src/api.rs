@@ -137,6 +137,8 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/novels/:id/style-stats", get(novel_style_stats))
         .route("/api/novels/:id/volume-reports", get(volume_reports))
         .route("/api/novels/:id/reader-review", post(reader_review))
+        .route("/api/novels/:id/finish", post(finish_book))
+        .route("/api/novels/:id/book-reports", get(book_reports))
         .route("/api/novels/:id/run", post(run_novel))
         .route(
             "/api/novels/:id/auto",
@@ -1589,81 +1591,73 @@ async fn reader_review(
     Path(id): Path<String>,
     Json(b): Json<ReaderReviewBody>,
 ) -> Result<Json<serde_json::Value>, ApiErr> {
-    let novel = e
-        .db
-        .get_novel(&id)
-        .map_err(err)?
-        .ok_or_else(|| not_found("novel"))?;
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
     let from = b.from.max(1);
-    let to = b.to.max(from).min(from + 19);
-    let mut text = String::new();
-    let mut included = 0usize;
-    for idx in from..=to {
-        let Some(ch) = e.db.get_chapter(&id, idx).map_err(err)? else {
-            continue;
-        };
-        if ch.status != "done" || ch.content.trim().is_empty() {
-            continue;
-        }
-        let tail = ch
-            .content
-            .lines()
-            .rev()
-            .filter(|l| !l.trim().is_empty())
-            .take(3)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        let summary: String = ch.summary.trim().chars().take(60).collect();
-        text.push_str(&format!(
-            "【第{}章 {}】目标：{}\n摘要：{}\n章末三行：\n{}\n\n",
-            ch.idx, ch.title, ch.goal, summary, tail
-        ));
-        included += 1;
-    }
-    if included == 0 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "该区间还没有已写正文的章节".to_string(),
-        ));
-    }
+    let to = b.to.max(from);
     let golden = b.golden.unwrap_or(from == 1 && to <= 3);
-    let brief = crate::models::Brief {
-        title: novel.title.clone(),
-        genre: novel.genre.clone(),
-        logline: novel.logline.clone(),
-        protagonist: novel.protagonist.clone(),
-        style: novel.style.clone(),
-        worldview: novel.worldview.clone(),
-    };
-    let settings = e.llm_settings().map_err(err)?;
-    let llm = crate::llm::Llm::new(settings.clone());
-    let ov = e.prompt_overrides();
-    let (sys, usr) = crate::prompts::reader_review_prompt(
-        &brief,
-        from,
-        to,
-        golden,
-        &text,
-        crate::styles::find(&novel.style_preset),
-        &ov,
-    );
-    let out = llm.complete(&sys, &usr).await.map_err(err)?;
-    record_usage(&e.db, Some(&id), None, "reader_review", &settings, &out.usage);
-    let result = crate::llm::extract_json_object(&out.text).ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "读者评审输出不是 JSON（可重试一次）".to_string(),
-    ))?;
+    let (included, result) = crate::pipeline::reader_review_once(&e, &id, from, to, golden)
+        .await
+        .map_err(|e2| {
+            let msg = format!("{e2:#}");
+            if msg.contains("还没有已写正文") {
+                (StatusCode::BAD_REQUEST, msg)
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, msg)
+            }
+        })?;
     Ok(Json(json!({
         "ok": true,
         "from": from,
-        "to": to,
+        "to": to.min(from + 19),
         "included": included,
         "golden": golden,
         "result": result
     })))
+}
+
+/// 完本收尾（手动重跑）：全局审校 + 卷末体检补齐（含修复复检）+ 读者审查报告
+async fn finish_book(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    let started = pipeline::spawn_finish_book(e.clone(), &id, true).map_err(err)?;
+    if !started {
+        return Err((
+            StatusCode::CONFLICT,
+            "已有一轮审校/收尾正在进行，稍后再试".to_string(),
+        ));
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
+/// 全书报告列表（kind=finish：完本收尾与读者审查）
+async fn book_reports(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if e.db.get_novel(&id).map_err(err)?.is_none() {
+        return Err(not_found("novel"));
+    }
+    let items: Vec<serde_json::Value> = e
+        .db
+        .list_book_reports(&id)
+        .map_err(err)?
+        .into_iter()
+        .map(|(kind, report_json, updated_at)| {
+            json!({
+                "kind": kind,
+                "updated_at": updated_at,
+                "report": serde_json::from_str::<serde_json::Value>(&report_json)
+                    .unwrap_or(serde_json::Value::Null)
+            })
+        })
+        .collect();
+    Ok(Json(json!({"items": items})))
 }
 
 async fn run_novel(

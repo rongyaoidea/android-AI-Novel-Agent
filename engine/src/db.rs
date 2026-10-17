@@ -233,6 +233,14 @@ impl Db {
                 updated_at   TEXT NOT NULL,
                 PRIMARY KEY(novel_id, volume_idx)
              );
+             CREATE TABLE IF NOT EXISTS book_reports (
+                novel_id    TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                PRIMARY KEY(novel_id, kind)
+             );
              CREATE TABLE IF NOT EXISTS chapter_versions (
                 id           TEXT PRIMARY KEY,
                 novel_id     TEXT NOT NULL,
@@ -595,6 +603,7 @@ impl Db {
         conn.execute("DELETE FROM chapter_fts WHERE novel_id=?1", [id])?;
         conn.execute("DELETE FROM volume_summaries WHERE novel_id=?1", [id])?;
         conn.execute("DELETE FROM volume_reports WHERE novel_id=?1", [id])?;
+        conn.execute("DELETE FROM book_reports WHERE novel_id=?1", [id])?;
         conn.execute("DELETE FROM chapter_versions WHERE novel_id=?1", [id])?;
         conn.execute("DELETE FROM global_reviews WHERE novel_id=?1", [id])?;
         let n = conn.execute("DELETE FROM novels WHERE id=?1", [id])?;
@@ -1073,6 +1082,63 @@ impl Db {
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM volume_reports WHERE novel_id=?1 AND volume_idx=?2",
             params![novel_id, volume_idx],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 删除某卷体检报告（复检前强制重出时用）
+    pub fn delete_volume_report(&self, novel_id: &str, volume_idx: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM volume_reports WHERE novel_id=?1 AND volume_idx=?2",
+            params![novel_id, volume_idx],
+        )?;
+        Ok(())
+    }
+
+    /// 保存 / 更新全书报告（kind: "finish" 完本收尾与读者审查）
+    pub fn upsert_book_report(
+        &self,
+        novel_id: &str,
+        kind: &str,
+        report_json: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO book_reports(novel_id, kind, report_json, created_at, updated_at)
+             VALUES(?1,?2,?3,?4,?4)
+             ON CONFLICT(novel_id, kind) DO UPDATE SET
+                report_json=excluded.report_json,
+                updated_at=excluded.updated_at",
+            params![novel_id, kind, report_json, now()],
+        )?;
+        Ok(())
+    }
+
+    /// 全书报告列表：(kind, report_json, updated_at)
+    pub fn list_book_reports(&self, novel_id: &str) -> anyhow::Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT kind, report_json, updated_at FROM book_reports
+             WHERE novel_id=?1 ORDER BY kind ASC",
+        )?;
+        let rows = stmt.query_map([novel_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 是否已有某类全书报告（完本收尾去重用）
+    pub fn has_book_report(&self, novel_id: &str, kind: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM book_reports WHERE novel_id=?1 AND kind=?2",
+            params![novel_id, kind],
             |r| r.get(0),
         )?;
         Ok(n > 0)
@@ -1746,6 +1812,10 @@ impl Db {
                     "DELETE FROM volume_reports WHERE novel_id=?1 AND upto_chapter >= ?2",
                     params![novel_id, gap],
                 )?;
+                conn.execute(
+                    "DELETE FROM book_reports WHERE novel_id=?1 AND kind='finish'",
+                    params![novel_id],
+                )?;
             }
             conn.execute(
                 "DELETE FROM volume_summaries WHERE novel_id=?1 AND upto_chapter > ?2",
@@ -1754,6 +1824,10 @@ impl Db {
             conn.execute(
                 "DELETE FROM volume_reports WHERE novel_id=?1 AND upto_chapter > ?2",
                 params![novel_id, new_total],
+            )?;
+            conn.execute(
+                "DELETE FROM book_reports WHERE novel_id=?1 AND kind='finish'",
+                params![novel_id],
             )?;
             // 章号已整体重排：重建本书检索索引（索引里存的是旧章号）
             Self::reindex_novel_locked(conn, novel_id)?;
@@ -1960,6 +2034,10 @@ impl Db {
             "DELETE FROM volume_reports WHERE novel_id=?1 AND upto_chapter > ?2",
             params![novel_id, after],
         )?;
+        conn.execute(
+            "DELETE FROM book_reports WHERE novel_id=?1 AND kind='finish'",
+            params![novel_id],
+        )?;
         Self::reindex_novel_locked(&conn, novel_id)?;
         Ok(n)
     }
@@ -1993,6 +2071,10 @@ impl Db {
         conn.execute(
             "DELETE FROM volume_reports WHERE novel_id=?1 AND upto_chapter > ?2",
             params![novel_id, after],
+        )?;
+        conn.execute(
+            "DELETE FROM book_reports WHERE novel_id=?1 AND kind='finish'",
+            params![novel_id],
         )?;
         Ok(n)
     }

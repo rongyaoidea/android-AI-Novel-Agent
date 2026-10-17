@@ -279,9 +279,13 @@ fn maybe_chain_auto(engine: &Arc<Engine>, novel_id: &str) -> anyhow::Result<()> 
             stage: "done".into(),
             message: format!("自动连载完成：已达到目标 {target} 章"),
         });
+        // 完本收尾：读者审查只在完本时自动执行（全局审校 + 卷末体检补齐 + 读者审查报告）
+        if let Err(e) = spawn_finish_book(engine.clone(), novel_id, false) {
+            tracing::warn!("finish book spawn failed: {e:#}");
+        }
         return Ok(());
     }
-    // 预算护栏
+    // 预算护栏：超限不关开关，转入「待机」，下个自然月自动恢复
     let settings = engine.db.pipeline_settings().unwrap_or_default();
     if settings.monthly_budget_tokens > 0 {
         let used = engine
@@ -289,17 +293,19 @@ fn maybe_chain_auto(engine: &Arc<Engine>, novel_id: &str) -> anyhow::Result<()> 
             .usage_total_since(&crate::api::month_start_local())
             .unwrap_or(0);
         if used >= settings.monthly_budget_tokens {
-            engine.db.set_novel_auto_continue(novel_id, false)?;
+            engine.mark_budget_wait(novel_id);
             engine.hub.publish(novel_id, EngineEvent::Stage {
                 stage: "budget".into(),
                 message: format!(
-                    "本月 Token 预算已达上限（{used}/{budget}），自动连载已暂停",
+                    "本月 Token 预算已达上限（{used}/{budget}）：转入待机，下个自然月自动恢复连载（也可调大预算后手动继续）",
                     budget = settings.monthly_budget_tokens
                 ),
             });
+            schedule_budget_resume(engine, novel_id);
             return Ok(());
         }
     }
+    engine.clear_budget_wait(novel_id);
     let next = auto_batch_target(&engine.db, novel_id, target, settings.batch())?;
     tracing::info!("auto-continue: 启动下一批（至第 {next} 章）");
     engine.hub.publish(novel_id, EngineEvent::Stage {
@@ -308,6 +314,150 @@ fn maybe_chain_auto(engine: &Arc<Engine>, novel_id: &str) -> anyhow::Result<()> 
     });
     spawn(engine.clone(), novel_id, next)?;
     Ok(())
+}
+
+/// 失败重试的退避表（秒）：1 / 5 / 15 分钟，最多 3 次
+const RETRY_DELAYS_SECS: [u64; 3] = [60, 300, 900];
+
+/// 第 attempt 次重试的等待秒数（None = 已用尽）
+fn retry_delay_secs(attempt: u32) -> Option<u64> {
+    if attempt == 0 {
+        return None;
+    }
+    RETRY_DELAYS_SECS.get((attempt - 1) as usize).copied()
+}
+
+/// 运行失败后的自动重试（仅自动连载体）：退避重跑该批；用尽后关闭自动连载并提示。
+/// 重试前会复查开关/停止/达标/运行中/审校中/预算待机等条件。
+fn maybe_retry_after_failure(engine: &Arc<Engine>, novel_id: &str) {
+    let Ok(Some(novel)) = engine.db.get_novel(novel_id) else {
+        return;
+    };
+    if !novel.auto_continue {
+        return;
+    }
+    if !engine.mark_retry_scheduled(novel_id) {
+        return; // 已有排期
+    }
+    let attempt = engine.bump_retry_attempt(novel_id);
+    let Some(delay) = retry_delay_secs(attempt) else {
+        engine.clear_retry(novel_id);
+        let _ = engine.db.set_novel_auto_continue(novel_id, false);
+        engine.hub.publish(novel_id, EngineEvent::Stage {
+            stage: "auto".into(),
+            message: "自动连载：连续 3 次失败，已停止自动重试并关闭开关（修好模型/网络后点「自动连载」可继续）".into(),
+        });
+        return;
+    };
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "auto".into(),
+        message: format!(
+            "自动连载：本批失败，{} 分钟后自动重试（第 {attempt}/3 次，断点续写）",
+            delay / 60
+        ),
+    });
+    let engine2 = engine.clone();
+    let nid = novel_id.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        engine2.unmark_retry_scheduled(&nid);
+        // 重试前复查：开关仍在、未停止、未达标、没有进行中的运行/审校、不在预算待机
+        let Ok(Some(novel)) = engine2.db.get_novel(&nid) else {
+            return;
+        };
+        if !novel.auto_continue || engine2.stop_requested(&nid) || engine2.is_budget_waiting(&nid) {
+            return;
+        }
+        if novel.target_chapters > 0 {
+            let done = done_through(&engine2.db, &nid).unwrap_or(0);
+            if done >= novel.target_chapters {
+                return;
+            }
+        }
+        if let Ok(Some(run)) = engine2.db.latest_run(&nid) {
+            if run.status == "running" {
+                return;
+            }
+        }
+        if engine2.is_reviewing(&nid) {
+            return; // 审校结束后由审校任务续批（G3）
+        }
+        let batch = engine2
+            .db
+            .pipeline_settings()
+            .map(|s| s.batch())
+            .unwrap_or(10);
+        match run_batch_end(&engine2.db, &nid, batch) {
+            Ok(end) => {
+                if let Err(e) = spawn(engine2.clone(), &nid, end) {
+                    tracing::warn!("auto retry spawn failed: {e:#}");
+                }
+            }
+            Err(e) => tracing::warn!("auto retry compute failed: {e:#}"),
+        }
+    });
+}
+
+/// 预算待机：睡到下个自然月自动恢复（期间每 6 小时复查一次；应用重启后待机态丢失，需手动点一次继续）
+fn schedule_budget_resume(engine: &Arc<Engine>, novel_id: &str) {
+    if !engine.mark_budget_resume_scheduled(novel_id) {
+        return;
+    }
+    let engine2 = engine.clone();
+    let nid = novel_id.to_string();
+    tokio::spawn(async move {
+        loop {
+            let now = chrono::Local::now();
+            let until = (next_month_start_local(now) - now)
+                .to_std()
+                .unwrap_or(std::time::Duration::from_secs(3600));
+            let sleep_for = until.min(std::time::Duration::from_secs(6 * 3600));
+            if !sleep_for.is_zero() {
+                tokio::time::sleep(sleep_for).await;
+            }
+            let Ok(Some(novel)) = engine2.db.get_novel(&nid) else {
+                engine2.unmark_budget_resume_scheduled(&nid);
+                engine2.clear_budget_wait(&nid);
+                return;
+            };
+            if !novel.auto_continue {
+                engine2.unmark_budget_resume_scheduled(&nid);
+                engine2.clear_budget_wait(&nid);
+                return;
+            }
+            let budget = engine2
+                .db
+                .pipeline_settings()
+                .unwrap_or_default()
+                .monthly_budget_tokens;
+            let used = engine2
+                .db
+                .usage_total_since(&crate::api::month_start_local())
+                .unwrap_or(0);
+            if budget > 0 && used >= budget {
+                continue; // 还没跨月或仍未恢复：继续等
+            }
+            engine2.unmark_budget_resume_scheduled(&nid);
+            engine2.clear_budget_wait(&nid);
+            engine2.hub.publish(&nid, EngineEvent::Stage {
+                stage: "auto".into(),
+                message: "预算待机结束：自动恢复连载".into(),
+            });
+            let _ = maybe_chain_auto(&engine2, &nid);
+            return;
+        }
+    });
+}
+
+/// 下个自然月起点（本地时区 00:05，留 5 分钟缓冲）
+fn next_month_start_local(now: chrono::DateTime<chrono::Local>) -> chrono::DateTime<chrono::Local> {
+    use chrono::{Datelike, TimeZone};
+    let (y, m) = (now.year(), now.month());
+    let (ny, nm) = if m >= 12 { (y + 1, 1) } else { (y, m + 1) };
+    chrono::Local
+        .with_ymd_and_hms(ny, nm, 1, 0, 5, 0)
+        .single()
+        .unwrap_or(now)
 }
 
 /// 等待「手动停止」信号（250ms 轮询；与流式生成共享 select，实现中途中断）
@@ -364,6 +514,8 @@ pub fn spawn(engine: Arc<Engine>, novel_id: &str, chapters: i64) -> anyhow::Resu
             let _ = engine2.db.update_run(&rid, "failed", "failed", 0, Some(&msg));
             let _ = engine2.db.set_novel_status(&nid, "failed");
             engine2.hub.publish(&nid, EngineEvent::RunFailed { run_id: rid, error: msg });
+            // 无人值守：自动连载体失败后退避重试（用尽则关闭并提示）
+            maybe_retry_after_failure(&engine2, &nid);
         }
     });
     Ok(run_id)
@@ -872,7 +1024,8 @@ async fn run_inner(
         run_id: run_id.to_string(),
     });
 
-    // 自动连载：达标/超预算/手动停止则在此收尾，否则启动下一批
+    // 自动连载：达标/超预算/手动停止则在此收尾，否则启动下一批（成功一轮 → 失败重试计数清零）
+    engine.clear_retry(novel_id);
     maybe_chain_auto(&engine, novel_id)?;
     Ok(())
 }
@@ -1105,16 +1258,13 @@ async fn generate_volume_summary(
     Ok(())
 }
 
-/// 卷末体检（每卷一次 LLM 调用）：卷摘要 + 逐章概览（强度/钩型/字数/摘要）+ 未回收伏笔 + 本地文体统计。
-/// 报告存 volume_reports（「书籍体检」里查看）；失败不阻断创作。
-async fn generate_volume_review(
+/// 卷末体检（单次调用；去重与「修复→复检」闭环在 generate_volume_review 包装层）。
+/// 卷摘要 + 逐章概览（强度/钩型/字数/摘要）+ 未回收伏笔 + 本地文体统计 → 报告存 volume_reports。
+async fn volume_review_once(
     engine: &Arc<Engine>,
     novel_id: &str,
     volume_idx: i64,
 ) -> anyhow::Result<()> {
-    if engine.db.has_volume_report(novel_id, volume_idx)? {
-        return Ok(());
-    }
     let from = (volume_idx - 1) * VOLUME_SPAN + 1;
     let to = volume_idx * VOLUME_SPAN;
     let metas = engine.db.list_chapter_metas(novel_id)?;
@@ -1233,6 +1383,93 @@ async fn generate_volume_review(
     Ok(())
 }
 
+/// 卷末体检（含自我优化闭环）：体检 → 高/中危发现定向修复 → 复检重出报告（一轮）。
+/// 已有报告则跳过（章节改动会让报告失效，届时自动重跑）。
+async fn generate_volume_review(
+    engine: &Arc<Engine>,
+    novel_id: &str,
+    volume_idx: i64,
+) -> anyhow::Result<()> {
+    if engine.db.has_volume_report(novel_id, volume_idx)? {
+        return Ok(());
+    }
+    volume_review_once(engine, novel_id, volume_idx).await?;
+    // 自我优化：把体检发现的高/中危问题定向修复（复用全局审校修复管线），然后复检重出报告
+    let settings = engine.db.pipeline_settings().unwrap_or_default();
+    if !settings.auto_fix_global {
+        return Ok(());
+    }
+    let report = engine
+        .db
+        .list_volume_reports(novel_id)?
+        .into_iter()
+        .find(|(v, _, _)| *v == volume_idx)
+        .map(|(_, _, js)| js)
+        .unwrap_or_default();
+    let findings = extract_json_object(&report)
+        .and_then(|v| v["findings"].as_array().cloned())
+        .unwrap_or_default();
+    let targets: Vec<GlobalIssue> = findings
+        .iter()
+        .filter_map(|f| {
+            let severity = f["severity"].as_str().unwrap_or("low").to_string();
+            if severity != "high" && severity != "medium" {
+                return None;
+            }
+            let chapters: Vec<i64> = f["chapters"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+                .unwrap_or_default();
+            if chapters.is_empty() {
+                return None;
+            }
+            Some(GlobalIssue {
+                severity,
+                note: f["note"].as_str().unwrap_or("").trim().to_string(),
+                affected_chapters: chapters,
+                suggestion: f["suggestion"].as_str().unwrap_or("").trim().to_string(),
+                status: "open".into(),
+                is_new: false,
+            })
+        })
+        .take(2)
+        .collect();
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let style_id = engine
+        .db
+        .get_novel(novel_id)?
+        .map(|n| n.style_preset)
+        .unwrap_or_default();
+    let style = crate::styles::find(&style_id);
+    let ov = engine.prompt_overrides();
+    let mut fixed = 0usize;
+    for issue in &targets {
+        if engine.stop_requested(novel_id) {
+            break;
+        }
+        if fix_chapter_by_global_issue(engine, novel_id, issue, style, &ov)
+            .await
+            .unwrap_or(false)
+        {
+            fixed += 1;
+        }
+    }
+    if fixed > 0 {
+        // 复检：重出本卷报告（反映修复后的最新情况）
+        engine.db.delete_volume_report(novel_id, volume_idx)?;
+        if let Err(e) = volume_review_once(engine, novel_id, volume_idx).await {
+            tracing::warn!("volume re-review {volume_idx} failed: {e:#}");
+        }
+        engine.hub.publish(novel_id, EngineEvent::Stage {
+            stage: "extract".into(),
+            message: format!("第 {volume_idx} 卷体检：自动修复 {fixed} 处并复检完成"),
+        });
+    }
+    Ok(())
+}
+
 /// 补写缺失的卷级摘要：覆盖「第 20/40… 章由人工或单章接口完成」导致跳过边界触发的情况。
 async fn maybe_fill_volume_summaries(
     engine: &Arc<Engine>,
@@ -1266,6 +1503,193 @@ async fn maybe_fill_volume_summaries(
         }
     }
     Ok(made)
+}
+
+// ---------- 读者视角评审与完本收尾 ----------
+
+/// 读者视角评审（一次 LLM 调用）：指定区间的目标 / 摘要 / 章末三行 → (覆盖章数, 评审 JSON)。
+/// 供 API 手动调用与完本收尾复用；「读者审查」只在完本收尾里自动执行（写作过程中不打扰）。
+pub async fn reader_review_once(
+    engine: &Arc<Engine>,
+    novel_id: &str,
+    from: i64,
+    to: i64,
+    golden: bool,
+) -> anyhow::Result<(usize, serde_json::Value)> {
+    let novel = engine
+        .db
+        .get_novel(novel_id)?
+        .ok_or_else(|| anyhow::anyhow!("novel not found: {novel_id}"))?;
+    let from = from.max(1);
+    let to = to.max(from).min(from + 19);
+    let mut text = String::new();
+    let mut included = 0usize;
+    for idx in from..=to {
+        let Some(ch) = engine.db.get_chapter(novel_id, idx)? else {
+            continue;
+        };
+        if ch.status != "done" || ch.content.trim().is_empty() {
+            continue;
+        }
+        let tail = ch
+            .content
+            .lines()
+            .rev()
+            .filter(|l| !l.trim().is_empty())
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary: String = ch.summary.trim().chars().take(60).collect();
+        text.push_str(&format!(
+            "【第{}章 {}】目标：{}\n摘要：{}\n章末三行：\n{}\n\n",
+            ch.idx, ch.title, ch.goal, summary, tail
+        ));
+        included += 1;
+    }
+    if included == 0 {
+        anyhow::bail!("该区间还没有已写正文的章节");
+    }
+    let brief = Brief {
+        title: novel.title.clone(),
+        genre: novel.genre.clone(),
+        logline: novel.logline.clone(),
+        protagonist: novel.protagonist.clone(),
+        style: novel.style.clone(),
+        worldview: novel.worldview.clone(),
+    };
+    let settings = engine.llm_settings()?;
+    let llm = Llm::new(settings.clone());
+    let ov = engine.prompt_overrides();
+    let (sys, usr) = crate::prompts::reader_review_prompt(
+        &brief,
+        from,
+        to,
+        golden,
+        &text,
+        crate::styles::find(&novel.style_preset),
+        &ov,
+    );
+    let out = llm.complete(&sys, &usr).await?;
+    record_usage(
+        &engine.db,
+        Some(novel_id),
+        None,
+        "reader_review",
+        &settings,
+        &out.usage,
+    );
+    let result = extract_json_object(&out.text)
+        .ok_or_else(|| anyhow::anyhow!("读者评审输出不是 JSON（可重试一次）"))?;
+    Ok((included, result))
+}
+
+/// 完本收尾（自动：目标达成时触发；或手动重跑）：
+/// 巡检 → 全局审校（自动定向修复）→ 卷摘要/卷末体检补齐（含修复复检）→
+/// 读者审查（黄金三章 + 每 20 章分块）→ 完本报告存 book_reports。
+/// 返回是否已启动（false = 已收尾过或已有审校/收尾在进行）。
+pub fn spawn_finish_book(engine: Arc<Engine>, novel_id: &str, force: bool) -> anyhow::Result<bool> {
+    if !force && engine.db.has_book_report(novel_id, "finish").unwrap_or(false) {
+        return Ok(false); // 已收尾过（章节改动会让报告失效，届时自动重跑）
+    }
+    if !engine.begin_review(novel_id) {
+        return Ok(false); // 已有审校/收尾在进行：跳过
+    }
+    let slot = ReviewSlot {
+        engine: engine.clone(),
+        novel_id: novel_id.to_string(),
+    };
+    let nid = novel_id.to_string();
+    tokio::spawn(async move {
+        let _slot = slot;
+        if let Err(e) = finish_book_inner(&engine, &nid).await {
+            tracing::warn!("finish book failed: {e:#}");
+            engine.hub.publish(&nid, EngineEvent::Stage {
+                stage: "done".into(),
+                message: format!("完本收尾失败：{e:#}"),
+            });
+        }
+    });
+    Ok(true)
+}
+
+async fn finish_book_inner(engine: &Arc<Engine>, novel_id: &str) -> anyhow::Result<()> {
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "finish".into(),
+        message: "完本收尾：开工巡检与状态整理…".into(),
+    });
+    let _ = maintain_novel(engine, novel_id, 3, 1).await;
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "finish".into(),
+        message: "完本收尾：全局审校（含自动定向修复）…".into(),
+    });
+    let _ = global_review_and_fix(engine, novel_id, 3).await;
+    let last_done = engine
+        .db
+        .list_chapter_metas(novel_id)
+        .map(|cs| {
+            cs.iter()
+                .filter(|c| c.status == "done")
+                .map(|c| c.idx)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let _ = maybe_fill_volume_summaries(engine, novel_id, last_done).await;
+    // 读者审查：黄金三章 + 每 20 章分块（只在完本时自动执行）
+    let mut golden: Option<serde_json::Value> = None;
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
+    if last_done >= 1 {
+        if last_done >= 3 {
+            engine.hub.publish(novel_id, EngineEvent::Stage {
+                stage: "finish".into(),
+                message: "完本收尾：读者审查（黄金三章）…".into(),
+            });
+            match reader_review_once(engine, novel_id, 1, 3, true).await {
+                Ok((_n, v)) => golden = Some(v),
+                Err(e) => tracing::warn!("finish golden reader review failed: {e:#}"),
+            }
+        }
+        let mut from = 1i64;
+        while from <= last_done {
+            let to = (from + 19).min(last_done);
+            engine.hub.publish(novel_id, EngineEvent::Stage {
+                stage: "finish".into(),
+                message: format!("完本收尾：读者审查 第 {from}~{to} 章…"),
+            });
+            match reader_review_once(engine, novel_id, from, to, false).await {
+                Ok((_n, mut v)) => {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("from".into(), serde_json::json!(from));
+                        o.insert("to".into(), serde_json::json!(to));
+                    }
+                    blocks.push(v);
+                }
+                Err(e) => tracing::warn!("finish reader review {from}-{to} failed: {e:#}"),
+            }
+            from = to + 1;
+        }
+    }
+    let blocks_n = blocks.len();
+    let report = serde_json::json!({
+        "finished_at": chrono::Local::now().to_rfc3339(),
+        "chapters": last_done,
+        "golden": golden,
+        "blocks": blocks,
+    });
+    engine
+        .db
+        .upsert_book_report(novel_id, "finish", &serde_json::to_string(&report)?)?;
+    engine.db.set_novel_status(novel_id, "finished")?;
+    engine.hub.publish(novel_id, EngineEvent::Stage {
+        stage: "done".into(),
+        message: format!(
+            "完本收尾完成：读者审查已生成（{last_done} 章；黄金三章 + {blocks_n} 个分块），书籍体检 → 完本报告查看"
+        ),
+    });
+    Ok(())
 }
 
 // ---------- 章节版本历史与 AI 复原 ----------
@@ -1893,6 +2317,9 @@ pub fn spawn_global_review(engine: Arc<Engine>, novel_id: &str) -> anyhow::Resul
                 });
             }
         }
+        // G3：审校收尾后释放名额，若自动连载仍未达标则自动续批
+        drop(_slot);
+        let _ = maybe_chain_auto(&engine, &nid);
     });
     Ok(())
 }
@@ -2507,7 +2934,10 @@ pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i
             .iter()
             .any(|f| f.status == "open");
         if !has_open_foreshadow {
-            return Ok(0); // slot drop → 释放名额
+            // G3：没有待处理章节时直接释放名额，并检查自动连载续批
+            drop(slot);
+            let _ = maybe_chain_auto(&engine, novel_id);
+            return Ok(0);
         }
     }
     let total = targets.len() as i64;
@@ -2597,6 +3027,9 @@ pub fn spawn_review_all(engine: Arc<Engine>, novel_id: &str) -> anyhow::Result<i
             stage: "done".into(),
             message,
         });
+        // G3：审校收尾后释放名额，若自动连载仍未达标则自动续批
+        drop(_slot);
+        let _ = maybe_chain_auto(&engine, &nid);
     });
     Ok(total)
 }
@@ -2873,6 +3306,25 @@ mod tests {
             "应提示同型强钩连发：{w2:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_backoff_schedule_and_month_boundary() {
+        // 退避表：1/5/15 分钟，最多 3 次
+        assert_eq!(retry_delay_secs(0), None);
+        assert_eq!(retry_delay_secs(1), Some(60));
+        assert_eq!(retry_delay_secs(2), Some(300));
+        assert_eq!(retry_delay_secs(3), Some(900));
+        assert_eq!(retry_delay_secs(4), None);
+        // 跨月起点：12 月 → 次年 1 月 1 日 00:05
+        use chrono::{Datelike, TimeZone, Timelike};
+        let dec = chrono::Local.with_ymd_and_hms(2026, 12, 15, 10, 0, 0).single().unwrap();
+        let next = next_month_start_local(dec);
+        assert_eq!((next.year(), next.month(), next.day()), (2027, 1, 1));
+        assert_eq!((next.hour(), next.minute()), (0, 5));
+        let mar = chrono::Local.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).single().unwrap();
+        let next2 = next_month_start_local(mar);
+        assert_eq!((next2.year(), next2.month()), (2026, 4));
     }
 
     #[test]
