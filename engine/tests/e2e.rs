@@ -3771,3 +3771,173 @@ async fn custom_style_create_use_and_fingerprint() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 总纲与设定（创作中途可改）：PUT /api/novels/:id/outline → 只改提供字段 + 空值校验 + 未写章节按新总纲重规划
+#[tokio::test]
+async fn novel_outline_edit_mid_creation() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ainovel-test-outline-edit-{stamp}"));
+    let engine = Engine::new(AppConfig::for_data_dir(dir.clone())).unwrap();
+    engine.db.set_llm_settings(&LlmSettings::default()).unwrap();
+    let app = api::build_router(engine.clone());
+
+    // 建书 + 写完首批 2 章
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/novels")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"idea": "深海鲸歌研究者的独白", "chapters": 2}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let novel_id = json_body(resp).await["novel_id"].as_str().unwrap().to_string();
+    wait_run_done(app.clone(), &novel_id).await;
+
+    let get_novel = |app: axum::Router, novel_id: String| async move {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/novels/{novel_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        json_body(resp).await
+    };
+    let before = get_novel(app.clone(), novel_id.clone()).await;
+    let genre_before = before["novel"]["genre"].as_str().unwrap_or("").to_string();
+
+    // 只改书名/卖点/总纲 → 未提供字段保持原值
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/novels/{novel_id}/outline"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "title": "鲸歌新章",
+                        "logline": "新卖点：冰海之下藏着回应",
+                        "book_outline": "新总纲：主角北上追声，终局在冰海。"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let after = get_novel(app.clone(), novel_id.clone()).await;
+    assert_eq!(after["novel"]["title"], "鲸歌新章");
+    assert_eq!(after["novel"]["logline"], "新卖点：冰海之下藏着回应");
+    assert!(
+        after["novel"]["book_outline"].as_str().unwrap_or("").contains("冰海"),
+        "总纲应已更新：{}",
+        after["novel"]["book_outline"]
+    );
+    assert_eq!(
+        after["novel"]["genre"].as_str().unwrap_or(""),
+        genre_before,
+        "未提供字段应保持原值"
+    );
+    // 已写章节不受影响：仍是 2 章 done
+    let done2 = after["chapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["status"] == "done")
+        .count();
+    assert_eq!(done2, 2);
+
+    // 空总纲 / 空书名 → 400
+    for body in [
+        serde_json::json!({"book_outline": "   "}),
+        serde_json::json!({"title": "  "}),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/novels/{novel_id}/outline"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    // 继续创作：目标提到 4 章 → 未写章节按新总纲重规划（滚动规划窗口用新设定）
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/novels/{novel_id}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"target_chapters": 4}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/novels/{novel_id}/run"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    wait_run_done(app.clone(), &novel_id).await;
+    let finalv = get_novel(app.clone(), novel_id.clone()).await;
+    let chapters = finalv["chapters"].as_array().unwrap();
+    assert_eq!(
+        chapters.iter().filter(|c| c["status"] == "done").count(),
+        4,
+        "改总纲后应继续写到 4 章：{finalv}"
+    );
+    assert!(
+        chapters.iter().any(|c| c["idx"] == 3 && c["status"] == "done"),
+        "第 3 章应按新总纲重新规划并写完"
+    );
+
+    // 不存在的书 → 404
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/novels/no-such-book/outline")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"book_outline": "总纲"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

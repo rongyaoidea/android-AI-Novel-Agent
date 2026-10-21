@@ -112,6 +112,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/api/novels", get(list_novels).post(create_novel))
         .route("/api/clarify", post(clarify_idea))
         .route("/api/novels/:id", get(get_novel).patch(patch_novel).delete(delete_novel))
+        .route("/api/novels/:id/outline", axum::routing::put(update_novel_settings))
         .route("/api/novels/:id/search", get(search_novel))
         .route("/api/novels/:id/stop", post(stop_novel))
         .route("/api/novels/:id/chapters", post(insert_chapter))
@@ -1090,6 +1091,68 @@ async fn patch_novel(
     if let Some(auto) = b.auto_continue {
         e.db.set_novel_auto_continue(&id, auto).map_err(err)?;
     }
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(Deserialize)]
+struct NovelSettingsBody {
+    title: Option<String>,
+    genre: Option<String>,
+    logline: Option<String>,
+    protagonist: Option<String>,
+    style: Option<String>,
+    worldview: Option<String>,
+    book_outline: Option<String>,
+}
+
+/// 创作中途修改总纲/设定：只改提供的字段；未写章节在下一批规划时按新总纲重新生成，
+/// 已写章节、卷摘要与体检报告均不受影响（内容一致性快照规则不变更）。
+async fn update_novel_settings(
+    State(e): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(b): Json<NovelSettingsBody>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    let Some(mut n) = e.db.get_novel(&id).map_err(err)? else {
+        return Err(not_found("novel"));
+    };
+    if let Some(t) = b.title.as_deref() {
+        let t = t.trim();
+        if t.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "书名不能为空".to_string()));
+        }
+        n.title = t.to_string();
+    }
+    if let Some(v) = b.genre.as_deref() {
+        n.genre = v.trim().to_string();
+    }
+    if let Some(v) = b.logline.as_deref() {
+        n.logline = v.trim().to_string();
+    }
+    if let Some(v) = b.protagonist.as_deref() {
+        n.protagonist = v.trim().to_string();
+    }
+    if let Some(v) = b.style.as_deref() {
+        n.style = v.trim().to_string();
+    }
+    if let Some(v) = b.worldview.as_deref() {
+        n.worldview = v.to_string();
+    }
+    if let Some(v) = b.book_outline.as_deref() {
+        let t = v.trim();
+        if t.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "总纲不能为空".to_string()));
+        }
+        n.book_outline = t.to_string();
+    }
+    e.db.update_novel_settings(&id, &n).map_err(err)?;
+    // 活动流提示（SSE）：让「何时生效」可感知
+    e.hub.publish(
+        &id,
+        crate::pipeline::EngineEvent::Stage {
+            stage: "settings".into(),
+            message: "总纲与设定已更新：对之后的章节规划与正文生效；已写章节不变".into(),
+        },
+    );
     Ok(Json(json!({"ok": true})))
 }
 

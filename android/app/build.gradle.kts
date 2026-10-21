@@ -15,8 +15,8 @@ android {
         applicationId = "com.ainovel.engine"
         minSdk = 29
         targetSdk = 35
-        versionCode = 28
-        versionName = "0.16.0"
+        versionCode = 29
+        versionName = "0.17.0"
         ndk {
             abiFilters += listOf("arm64-v8a")
         }

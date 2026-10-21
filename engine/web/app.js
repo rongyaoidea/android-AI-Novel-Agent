@@ -461,7 +461,62 @@ function openOutline(item) {
     $("#outline-backdrop").hidden = true;
     location.hash = `#/novel/${n.id}`;
   };
+  $("#outline-edit").onclick = () => {
+    $("#outline-backdrop").hidden = true;
+    openOutlineEdit(n);
+  };
   $("#outline-backdrop").hidden = false;
+}
+
+/**
+ * 编辑总纲与设定（创作中途可改）：
+ * 只影响之后的章节规划与正文——已写章节、卷摘要与体检报告不变；
+ * 未写章节在下一批开写时按新总纲重新规划。
+ */
+function openOutlineEdit(n) {
+  openForm({
+    title: "编辑总纲与设定",
+    fields: [
+      { name: "title", label: "书名", value: n.title || "" },
+      { name: "genre", label: "题材", value: n.genre || "", placeholder: "例如：都市悬疑" },
+      { name: "logline", label: "一句话卖点", value: n.logline || "", type: "textarea", rows: 2 },
+      { name: "protagonist", label: "主角设定", value: n.protagonist || "", type: "textarea", rows: 3 },
+      { name: "style", label: "写法基调", value: n.style || "", type: "textarea", rows: 2 },
+      { name: "worldview", label: "世界观", value: n.worldview || "", type: "textarea", rows: 5 },
+      {
+        name: "book_outline",
+        label: "全书走向（总纲）·只影响之后的规划与正文，已写章节不变",
+        value: n.book_outline || "",
+        type: "textarea",
+        rows: 8,
+        placeholder: "主角从哪里出发，经过哪些阶段，走向什么终局",
+      },
+    ],
+    onSubmit: async (v) => {
+      const title = (v.title || "").trim();
+      if (!title) throw new Error("书名不能为空");
+      const outline = (v.book_outline || "").trim();
+      if (!outline) throw new Error("总纲不能为空");
+      const changed = {
+        title,
+        genre: (v.genre || "").trim(),
+        logline: (v.logline || "").trim(),
+        protagonist: (v.protagonist || "").trim(),
+        style: (v.style || "").trim(),
+        worldview: v.worldview ?? "",
+        book_outline: outline,
+      };
+      await apiSend(`/api/novels/${n.id}/outline`, "PUT", changed);
+      // 刷新工作台与书架的本地状态
+      if (state.novelId === n.id && state.novel?.novel) {
+        Object.assign(state.novel.novel, changed);
+        renderNovel();
+      }
+      state.shelfItems = [];
+      loadShelf().catch(() => {});
+      toast("总纲与设定已更新：对之后的章节规划与正文生效");
+    },
+  });
 }
 
 function bindOutline() {
@@ -1818,6 +1873,12 @@ function bindNovel() {
     }
   };
   $("#novel-health").onclick = () => openHealth().catch((err) => toast(err.message, true));
+
+  $("#novel-outline").onclick = () => {
+    const n = state.novel?.novel || { id: state.novelId };
+    if (!n.id) return;
+    openOutlineEdit(n);
+  };
   $("#health-close").onclick = () => { $("#health-backdrop").hidden = true; };
   $("#health-fill").onclick = () => fillMissing().catch((err) => toast(err.message, true));
   $("#readerv-run").onclick = () => runReaderReview();

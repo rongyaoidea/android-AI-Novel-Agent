@@ -637,6 +637,16 @@ impl Db {
         Ok(())
     }
 
+    /// 创作中途修改总纲/设定：调用方已把未提供的字段填回原值，这里整体落库
+    pub fn update_novel_settings(&self, id: &str, n: &crate::models::Novel) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE novels SET title=?2, genre=?3, logline=?4, protagonist=?5, style=?6, worldview=?7, book_outline=?8, updated_at=?9 WHERE id=?1",
+            params![id, n.title, n.genre, n.logline, n.protagonist, n.style, n.worldview, n.book_outline, now()],
+        )?;
+        Ok(())
+    }
+
     /// 保存立项澄清问答（JSON 数组字符串）
     pub fn set_novel_clarify(&self, id: &str, clarify_json: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
